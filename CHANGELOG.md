@@ -62,6 +62,7 @@ Bottom level categories:
 - On drivers that serialize shader compilation, also destroy shader modules and create, read and destroy pipeline caches under the same lock, and destroy a pipeline's temporary shader modules when its creation fails.
 - Fix crash on older Vulkan drivers when `poolSizeCount == 0`. By @lucasmerlin in [#10124](https://github.com/gfx-rs/wgpu/pull/10124).
 - Fall back to image robustness when robustness2 reports no robust image access. By @raphlinus in [#10291](https://github.com/gfx-rs/wgpu/pull/10291).
+- Recover from `VK_ERROR_FRAGMENTED_POOL` and `VK_ERROR_OUT_OF_POOL_MEMORY` when allocating descriptor sets by resetting or retiring the offending pool and retrying on the next available (or a freshly created) pool instead of panicking. By @beicause in [#10264](https://github.com/gfx-rs/wgpu/pull/10264).
 
 #### naga
 
