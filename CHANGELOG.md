@@ -50,6 +50,10 @@ Bottom level categories:
 
 ### Bug Fixes
 
+#### General
+
+- Fix a use after free of a mapped buffer when its device is lost or destroyed. By @uael in [#10593](https://github.com/gfx-rs/wgpu/pull/10593).
+
 #### Metal
 
 - Make texture atomics visible to later passes on drivers that otherwise read the value from before them, such as Apple's paravirtual GPU.
