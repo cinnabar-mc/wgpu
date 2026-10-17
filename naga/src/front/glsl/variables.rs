@@ -403,6 +403,51 @@ impl Frontend {
                     })
                 }
             }
+            // GLSL 4.20 allows swizzling scalars with their single component
+            // (`f.x`, `f.rr`, `f.sss`).
+            TypeInner::Scalar(_)
+                if (1..=4).contains(&name.len())
+                    && ['x', 'r', 's'].iter().any(|&c| name.chars().all(|n| n == c)) =>
+            {
+                let size = match name.len() {
+                    1 => {
+                        return match pos {
+                            ExprPos::Rhs if is_pointer => ctx.add_expression(
+                                Expression::Load {
+                                    pointer: expression,
+                                },
+                                meta,
+                            ),
+                            _ => Ok(expression),
+                        };
+                    }
+                    2 => VectorSize::Bi,
+                    3 => VectorSize::Tri,
+                    _ => VectorSize::Quad,
+                };
+                if let ExprPos::Lhs = pos {
+                    return Err(Error {
+                        kind: ErrorKind::SemanticError(
+                            format!(
+                                "swizzle cannot have duplicate components in left-hand-side expression for \"{name:?}\""
+                            )
+                            .into(),
+                        ),
+                        meta,
+                    });
+                }
+                let value = if is_pointer {
+                    ctx.add_expression(
+                        Expression::Load {
+                            pointer: expression,
+                        },
+                        meta,
+                    )?
+                } else {
+                    expression
+                };
+                ctx.add_expression(Expression::Splat { size, value }, meta)
+            }
             _ => Err(Error {
                 kind: ErrorKind::SemanticError(
                     format!("Can't lookup field on this type \"{name}\"").into(),
