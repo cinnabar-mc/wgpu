@@ -572,11 +572,18 @@ impl<'a> Context<'a> {
                     // Don't try to generate `AccessIndex` if in a LHS position, since it
                     // wouldn't produce a pointer.
                     ExprPos::Lhs => None,
-                    _ => self
-                        .module
-                        .to_ctx()
-                        .get_const_val_from(index, &self.expressions)
-                        .ok(),
+                    _ => {
+                        // Constant expressions live in the module's arena.
+                        let arena = if self.is_const {
+                            &self.module.global_expressions
+                        } else {
+                            &self.expressions
+                        };
+                        self.module
+                            .to_ctx()
+                            .get_const_val_from(index, arena)
+                            .ok()
+                    }
                 };
 
                 let base = self
@@ -1049,6 +1056,12 @@ impl<'a> Context<'a> {
 
                     var.expr
                 }
+                // A constant expression indexes the constant itself; `var.expr`
+                // lives in a function's arena.
+                ExprPos::AccessBase { .. } if self.is_const && var.constant.is_some() => {
+                    let (constant, _) = var.constant.unwrap();
+                    self.add_expression(Expression::Constant(constant), meta)?
+                }
                 ExprPos::AccessBase { constant_index } => {
                     // If the index isn't constant all accesses backed by a constant base need
                     // to be done through a proxy local variable, since constants have a non
@@ -1110,6 +1123,40 @@ impl<'a> Context<'a> {
             // The ternary operator is defined to only evaluate one of the two possible
             // expressions which means that it's behavior is that of an `if` statement,
             // and it's merely syntactic sugar for it.
+            HirExprKind::Conditional {
+                condition,
+                accept,
+                reject,
+            } if ExprPos::Lhs != pos && self.is_const => {
+                // In a constant expression the condition is known, so the
+                // conditional is the selected operand, converted to the type
+                // both operands share. A runtime `if` can't exist here.
+                let (condition, condition_meta) =
+                    self.lower_expect_inner(stmt, frontend, condition, ExprPos::Rhs)?;
+                let (mut accept, accept_meta) =
+                    self.lower_expect_inner(stmt, frontend, accept, pos)?;
+                let (mut reject, reject_meta) =
+                    self.lower_expect_inner(stmt, frontend, reject, pos)?;
+                self.binary_implicit_conversion(
+                    &mut accept,
+                    accept_meta,
+                    &mut reject,
+                    reject_meta,
+                )?;
+                match self[condition] {
+                    Expression::Literal(Literal::Bool(true)) => accept,
+                    Expression::Literal(Literal::Bool(false)) => reject,
+                    _ => {
+                        return Err(Error {
+                            kind: ErrorKind::SemanticError(
+                                "Condition of a constant conditional must be a constant bool"
+                                    .into(),
+                            ),
+                            meta: condition_meta,
+                        })
+                    }
+                }
+            }
             HirExprKind::Conditional {
                 condition,
                 accept,
