@@ -21,7 +21,7 @@ vec4 builtins() {
     int s1_ = (true ? 1 : 0);
     vec4 s2_ = (true ? v_f32_one : v_f32_zero);
     vec4 s3_ = vec4(1.0, 1.0, 1.0, 1.0);
-    vec4 m1_ = mix(v_f32_zero, v_f32_one, v_f32_half);
+    vec4 m1_ = vec4(0.5, 0.5, 0.5, 0.5);
     vec4 m2_ = mix(v_f32_zero, v_f32_one, 0.1);
     float b1_ = intBitsToFloat(1);
     vec4 b2_ = intBitsToFloat(v_i32_one);

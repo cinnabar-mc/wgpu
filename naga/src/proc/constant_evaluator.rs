@@ -1765,6 +1765,34 @@ impl<'a> ConstantEvaluator<'a> {
                     }])),
                 })
             }
+            crate::MathFunction::Mix => {
+                component_wise_float!(
+                    self,
+                    span,
+                    [arg, arg1.unwrap(), arg2.unwrap()],
+                    |x, y, a| {
+                        let mut one = a;
+                        one.set_one();
+                        Ok([x * (one - a) + y * a])
+                    }
+                )
+                .map_err(|e| not_implemented_shape(e, fun))
+            }
+            crate::MathFunction::SmoothStep => {
+                component_wise_float!(
+                    self,
+                    span,
+                    [arg, arg1.unwrap(), arg2.unwrap()],
+                    |edge0, edge1, x| {
+                        let mut one = x;
+                        one.set_one();
+                        let t = ((x - edge0) / (edge1 - edge0)).max(one - one).min(one);
+                        let two = one + one;
+                        Ok([t * t * (two + one - two * t)])
+                    }
+                )
+                .map_err(|e| not_implemented_shape(e, fun))
+            }
             crate::MathFunction::Sqrt => {
                 component_wise_float!(self, span, [arg], |e| {
                     if e >= Zero::zero() {
@@ -1961,6 +1989,11 @@ impl<'a> ConstantEvaluator<'a> {
                 })?;
                 result.register_as_evaluated_expr(self, span)
             }
+            crate::MathFunction::Inverse
+            | crate::MathFunction::Transpose
+            | crate::MathFunction::Determinant => self
+                .matrix_function(fun, arg, span)
+                .map_err(|e| not_implemented_shape(e, fun)),
 
             // unimplemented
             crate::MathFunction::Modf
@@ -1970,11 +2003,6 @@ impl<'a> ConstantEvaluator<'a> {
             | crate::MathFunction::FaceForward
             | crate::MathFunction::Reflect
             | crate::MathFunction::Refract
-            | crate::MathFunction::Mix
-            | crate::MathFunction::SmoothStep
-            | crate::MathFunction::Inverse
-            | crate::MathFunction::Transpose
-            | crate::MathFunction::Determinant
             | crate::MathFunction::QuantizeToF16
             | crate::MathFunction::ExtractBits
             | crate::MathFunction::InsertBits
@@ -2031,6 +2059,151 @@ impl<'a> ConstantEvaluator<'a> {
         };
 
         self.register_evaluated_expr(Expression::Literal(result), span)
+    }
+
+    /// `inverse`, `transpose` and `determinant` of a constant float matrix.
+    ///
+    /// The components are evaluated in `f64` and converted back to the matrix's
+    /// scalar type.
+    fn matrix_function(
+        &mut self,
+        fun: crate::MathFunction,
+        arg: Handle<Expression>,
+        span: Span,
+    ) -> Result<Handle<Expression>, ConstantEvaluatorError> {
+        let arg = self.eval_zero_value_and_splat(arg, span)?;
+        let Expression::Compose { ty, ref components } = self.expressions[arg] else {
+            return Err(ConstantEvaluatorError::InvalidMathArg);
+        };
+        let TypeInner::Matrix {
+            columns,
+            rows,
+            scalar,
+        } = self.types[ty].inner
+        else {
+            return Err(ConstantEvaluatorError::InvalidMathArg);
+        };
+        let (nc, nr) = (columns as usize, rows as usize);
+        // `m[c][r]`: column `c`, row `r`.
+        let mut m = [[0f64; 4]; 4];
+        for (c, &column) in components.iter().enumerate().take(nc) {
+            let Expression::Compose {
+                ty: column_ty,
+                components: ref column_components,
+            } = self.expressions[column]
+            else {
+                return Err(ConstantEvaluatorError::InvalidMathArg);
+            };
+            let values = crate::proc::flatten_compose(
+                column_ty,
+                column_components,
+                self.expressions,
+                self.types,
+            );
+            for (r, component) in values.enumerate().take(nr) {
+                m[c][r] = match self.expressions[component] {
+                    Expression::Literal(Literal::F16(v)) => f64::from(v),
+                    Expression::Literal(Literal::F32(v)) => f64::from(v),
+                    Expression::Literal(Literal::F64(v) | Literal::AbstractFloat(v)) => v,
+                    _ => return Err(ConstantEvaluatorError::InvalidMathArg),
+                };
+            }
+        }
+        let name = match fun {
+            crate::MathFunction::Inverse => "inverse",
+            crate::MathFunction::Transpose => "transpose",
+            _ => "determinant",
+        };
+        let literal = |v: f64| -> Result<Literal, ConstantEvaluatorError> {
+            if !v.is_finite() {
+                return Err(ConstantEvaluatorError::Overflow(name.into()));
+            }
+            Ok(match scalar {
+                crate::Scalar::F16 => Literal::F16(f16::from_f64(v)),
+                crate::Scalar::F32 => Literal::F32(v as f32),
+                crate::Scalar::F64 => Literal::F64(v),
+                _ => Literal::AbstractFloat(v),
+            })
+        };
+
+        if fun == crate::MathFunction::Transpose {
+            let mut t = [[0f64; 4]; 4];
+            for (c, column) in m.iter().enumerate().take(nc) {
+                for (r, &v) in column.iter().enumerate().take(nr) {
+                    t[r][c] = v;
+                }
+            }
+            return self.matrix_from_columns(&t, rows, columns, scalar, literal, span);
+        }
+        if nc != nr {
+            return Err(ConstantEvaluatorError::InvalidMathArg);
+        }
+        let det = determinant(&m, nc);
+        if fun == crate::MathFunction::Determinant {
+            let det = literal(det)?;
+            return self.register_evaluated_expr(Expression::Literal(det), span);
+        }
+        if det == 0.0 {
+            return Err(ConstantEvaluatorError::InvalidMathArgValue(name.into()));
+        }
+        // inverse(M)[c][r] = cofactor(M, r, c) / det(M), which is the
+        // transposed cofactor matrix (the adjugate) scaled by 1 / det.
+        let mut inv = [[0f64; 4]; 4];
+        for (c, column) in inv.iter_mut().enumerate().take(nc) {
+            for (r, v) in column.iter_mut().enumerate().take(nr) {
+                let sign = if (r + c) % 2 == 0 { 1.0 } else { -1.0 };
+                *v = sign * determinant(&minor(&m, r, c, nc), nc - 1) / det;
+            }
+        }
+        self.matrix_from_columns(&inv, columns, rows, scalar, literal, span)
+    }
+
+    /// Registers the `columns`×`rows` matrix `m[c][r]` as an evaluated `Compose`.
+    fn matrix_from_columns(
+        &mut self,
+        m: &[[f64; 4]; 4],
+        columns: crate::VectorSize,
+        rows: crate::VectorSize,
+        scalar: crate::Scalar,
+        literal: impl Fn(f64) -> Result<Literal, ConstantEvaluatorError>,
+        span: Span,
+    ) -> Result<Handle<Expression>, ConstantEvaluatorError> {
+        let column_ty = self.types.insert(
+            Type {
+                name: None,
+                inner: TypeInner::Vector { size: rows, scalar },
+            },
+            span,
+        );
+        let matrix_ty = self.types.insert(
+            Type {
+                name: None,
+                inner: TypeInner::Matrix {
+                    columns,
+                    rows,
+                    scalar,
+                },
+            },
+            span,
+        );
+        let mut column_exprs = Vec::with_capacity(columns as usize);
+        for column in m.iter().take(columns as usize) {
+            let mut components = Vec::with_capacity(rows as usize);
+            for &v in column.iter().take(rows as usize) {
+                let lit = literal(v)?;
+                components.push(self.register_evaluated_expr(Expression::Literal(lit), span)?);
+            }
+            let expr = Expression::Compose {
+                ty: column_ty,
+                components,
+            };
+            column_exprs.push(self.register_evaluated_expr(expr, span)?);
+        }
+        let expr = Expression::Compose {
+            ty: matrix_ty,
+            components: column_exprs,
+        };
+        self.register_evaluated_expr(expr, span)
     }
 
     /// Vector cross product.
@@ -4029,6 +4202,49 @@ impl TryFromAbstract<i64> for f16 {
         }
         Ok(f.unwrap())
     }
+}
+
+/// Reports argument shapes a constant evaluation of `fun` doesn't handle (mixed
+/// scalar and vector arguments, non-constant parts) as not implemented, so that
+/// function bodies keep the call as a runtime expression.
+fn not_implemented_shape(
+    error: ConstantEvaluatorError,
+    fun: crate::MathFunction,
+) -> ConstantEvaluatorError {
+    match error {
+        ConstantEvaluatorError::InvalidMathArg => {
+            ConstantEvaluatorError::NotImplemented(format!("{fun:?} built-in function"))
+        }
+        e => e,
+    }
+}
+
+/// Determinant of the leading `n`×`n` block of `m`, by cofactor expansion.
+fn determinant(m: &[[f64; 4]; 4], n: usize) -> f64 {
+    match n {
+        0 => 1.0,
+        1 => m[0][0],
+        2 => m[0][0] * m[1][1] - m[1][0] * m[0][1],
+        _ => {
+            let mut det = 0.0;
+            for c in 0..n {
+                let sign = if c % 2 == 0 { 1.0 } else { -1.0 };
+                det += sign * m[c][0] * determinant(&minor(m, c, 0, n), n - 1);
+            }
+            det
+        }
+    }
+}
+
+/// The leading `n`×`n` block of `m` without column `col` and row `row`.
+fn minor(m: &[[f64; 4]; 4], col: usize, row: usize, n: usize) -> [[f64; 4]; 4] {
+    let mut out = [[0f64; 4]; 4];
+    for (oc, c) in (0..n).filter(|&c| c != col).enumerate() {
+        for (or, r) in (0..n).filter(|&r| r != row).enumerate() {
+            out[oc][or] = m[c][r];
+        }
+    }
+    out
 }
 
 fn cross_product<T>(a: [T; 3], b: [T; 3]) -> [T; 3]
