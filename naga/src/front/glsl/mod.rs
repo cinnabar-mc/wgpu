@@ -184,6 +184,10 @@ pub struct Frontend {
     layouter: Layouter,
 
     errors: Vec<Error>,
+
+    /// Globals and struct fields accessed with `atomic*` functions, whose
+    /// scalar types become atomic once parsing is done.
+    atomic_upgrades: crate::front::atomic_upgrade::Upgrades,
 }
 
 impl Frontend {
@@ -197,6 +201,7 @@ impl Frontend {
         self.global_variables.clear();
         self.entry_args.clear();
         self.layouter.clear();
+        self.atomic_upgrades = Default::default();
     }
 
     /// Parses a shader either outputting a shader [`Module`] or a list of
