@@ -188,6 +188,13 @@ impl<'source> ParsingContext<'source> {
                 if let FunctionKind::Call(handle) = decl.kind {
                     if decl.defined && decl.parameters.is_empty() {
                         frontend.add_entry_point(handle, ctx)?;
+                        let upgrades = core::mem::take(&mut frontend.atomic_upgrades);
+                        if !upgrades.is_empty() {
+                            module.upgrade_atomics(&upgrades).map_err(|e| Error {
+                                kind: ErrorKind::SemanticError(alloc::format!("{e}").into()),
+                                meta: Span::default(),
+                            })?;
+                        }
                         return Ok(module);
                     }
                 }

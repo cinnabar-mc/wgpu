@@ -8,7 +8,7 @@ use core::iter;
 
 use super::{
     ast::*,
-    builtins::{inject_builtin, sampled_to_depth},
+    builtins::{inject_builtin, sampled_to_depth, MacroCall},
     context::{Context, ExprPos, StmtContext},
     error::{Error, ErrorKind},
     types::scalar_components,
@@ -772,6 +772,13 @@ impl Frontend {
             if parameter_info.qualifier.is_lhs() {
                 // Reprocess argument in LHS position
                 let (handle, meta) = ctx.lower_expect_inner(stmt, self, *expr, ExprPos::Lhs)?;
+
+                // Atomic built-ins operate on the memory itself, never on a copy.
+                if let FunctionKind::Macro(MacroCall::Atomic(_) | MacroCall::AtomicCompSwap) = kind
+                {
+                    arguments.push(handle);
+                    continue;
+                }
 
                 self.process_lhs_argument(
                     ctx,
