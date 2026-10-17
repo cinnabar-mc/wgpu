@@ -22,7 +22,7 @@ pub use keyword_set::{CaseInsensitiveKeywordSet, KeywordSet};
 pub use layouter::{Alignment, LayoutError, LayoutErrorInner, Layouter, TypeLayout};
 pub use namer::{EntryPointIndex, ExternalTextureNameKey, NameKey, Namer};
 pub use overloads::{Conclusion, MissingSpecialType, OverloadSet, Rule};
-pub use terminator::ensure_block_returns;
+pub use terminator::{ensure_block_returns, ensure_block_returns_value};
 use thiserror::Error;
 pub use type_methods::{
     concrete_int_scalars, min_max_float_representable_by, vector_size_str, vector_sizes,
