@@ -13,7 +13,7 @@ fn builtins() -> vec4<f32> {
     let s1_ = select(0i, 1i, true);
     let s2_ = select(v_f32_zero, v_f32_one, true);
     let s3_ = vec4<f32>(1f, 1f, 1f, 1f);
-    let m1_ = mix(v_f32_zero, v_f32_one, v_f32_half);
+    let m1_ = vec4<f32>(0.5f, 0.5f, 0.5f, 0.5f);
     let m2_ = mix(v_f32_zero, v_f32_one, 0.1f);
     let b1_ = bitcast<f32>(1i);
     let b2_ = bitcast<vec4<f32>>(v_i32_one);
