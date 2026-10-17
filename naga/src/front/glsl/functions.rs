@@ -16,9 +16,9 @@ use super::{
     Frontend, Result,
 };
 use crate::{
-    front::glsl::types::type_power, proc::ensure_block_returns, AddressSpace, Block, EntryPoint,
-    Expression, Function, FunctionArgument, FunctionResult, Handle, Literal, LocalVariable, Scalar,
-    ScalarKind, Span, Statement, StructMember, Type, TypeInner,
+    front::glsl::types::type_power, proc::ensure_block_returns_value, AddressSpace, Block,
+    EntryPoint, Expression, Function, FunctionArgument, FunctionResult, Handle, Literal,
+    LocalVariable, Scalar, ScalarKind, Span, Statement, StructMember, Type, TypeInner,
 };
 
 /// Struct detailing a store operation that must happen after a function call
@@ -1103,7 +1103,21 @@ impl Frontend {
         result: Option<FunctionResult>,
         meta: Span,
     ) {
-        ensure_block_returns(&mut ctx.body);
+        // GLSL leaves the value undefined when control reaches the end of a
+        // function with a return type; return the zero value there.
+        let result_ty = result.as_ref().map(|result| result.ty);
+        let mut zero = None;
+        ensure_block_returns_value(&mut ctx.body, &mut || {
+            let ty = result_ty?;
+            Some(*zero.get_or_insert_with(|| {
+                let expr = ctx
+                    .expressions
+                    .append(Expression::ZeroValue(ty), Default::default());
+                ctx.local_expression_kind_tracker
+                    .insert(expr, crate::proc::ExpressionKind::Const);
+                expr
+            }))
+        });
 
         let void = result.is_none();
 
