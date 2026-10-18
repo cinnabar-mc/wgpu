@@ -312,13 +312,29 @@ impl<'a> Context<'a> {
         self.symbol_table.add(name, var)
     }
 
-    /// Add function argument to current scope
+    /// Adds a native argument and retains its declared source parameter restrictions.
     pub fn add_function_arg(
         &mut self,
         name_meta: Option<(String, Span)>,
         ty: Handle<Type>,
-        qualifier: ParameterQualifier,
+        type_meta: Span,
+        info: ParameterInfo,
     ) -> Result<()> {
+        if info.storage_access.is_some() || info.restrict {
+            let access = info.storage_access.unwrap_or(crate::StorageAccess::empty());
+            if !matches!(self.module.types[ty].inner,
+                TypeInner::Image { class: crate::ImageClass::Storage { access: native, .. }, .. }
+                if native.contains(access))
+            {
+                return Err(Error {
+                    kind: ErrorKind::SemanticError(
+                        "Image parameter memory qualifiers require compatible native access".into(),
+                    ),
+                    meta: type_meta,
+                });
+            }
+        }
+        let qualifier = info.qualifier;
         let index = self.arguments.len();
         let mut arg = FunctionArgument {
             name: name_meta.as_ref().map(|&(ref name, _)| name.clone()),
@@ -348,10 +364,7 @@ impl<'a> Context<'a> {
 
         self.arguments.push(arg);
 
-        self.parameters_info.push(ParameterInfo {
-            qualifier,
-            depth: false,
-        });
+        self.parameters_info.push(info);
 
         if let Some((name, meta)) = name_meta {
             let expr = self.add_expression(Expression::FunctionArgument(index as u32), meta)?;

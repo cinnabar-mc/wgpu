@@ -270,6 +270,34 @@ impl Context<'_> {
             .inner_with(&self.module.types)
     }
 
+    /// Returns native image access narrowed by its originating source parameter.
+    pub(crate) fn image_access(&self, expr: Handle<Expression>) -> Option<crate::StorageAccess> {
+        let TypeInner::Image {
+            class: ImageClass::Storage { access, .. },
+            ..
+        } = *self.get_type(expr)
+        else {
+            return None;
+        };
+        let mut origin = expr;
+        loop {
+            match self[origin] {
+                Expression::Access { base, .. } | Expression::AccessIndex { base, .. } => {
+                    origin = base
+                }
+                Expression::FunctionArgument(index) => {
+                    return Some(
+                        access
+                            & self.parameters_info[index as usize]
+                                .storage_access
+                                .unwrap_or(access),
+                    );
+                }
+                _ => return Some(access),
+            }
+        }
+    }
+
     /// Gets the type for the result of the `expr` expression
     ///
     /// Automatically grows the [`typifier`] to `expr` so calling

@@ -31,6 +31,8 @@ mod error;
 mod functions;
 mod lex;
 mod offset;
+#[cfg(test)]
+mod parameter_tests;
 mod parser;
 #[cfg(test)]
 mod parser_tests;

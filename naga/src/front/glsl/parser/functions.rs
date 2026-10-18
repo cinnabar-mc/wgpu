@@ -5,7 +5,7 @@ use crate::front::glsl::Span;
 use crate::Literal;
 use crate::{
     front::glsl::{
-        ast::ParameterQualifier,
+        ast::{ParameterInfo, ParameterQualifier},
         context::Context,
         parser::ParsingContext,
         token::{Token, TokenValue},
@@ -18,23 +18,90 @@ use crate::{
 impl ParsingContext<'_> {
     pub fn peek_parameter_qualifier(&mut self, frontend: &mut Frontend) -> bool {
         self.peek(frontend).is_some_and(|t| match t.value {
-            TokenValue::In | TokenValue::Out | TokenValue::InOut | TokenValue::Const => true,
+            TokenValue::In
+            | TokenValue::Out
+            | TokenValue::InOut
+            | TokenValue::Const
+            | TokenValue::MemoryQualifier(_)
+            | TokenValue::Restrict => true,
             _ => false,
         })
     }
 
-    /// Returns the parsed `ParameterQualifier` or `ParameterQualifier::In`
-    pub fn parse_parameter_qualifier(&mut self, frontend: &mut Frontend) -> ParameterQualifier {
-        if self.peek_parameter_qualifier(frontend) {
-            match self.bump(frontend).unwrap().value {
-                TokenValue::In => ParameterQualifier::In,
-                TokenValue::Out => ParameterQualifier::Out,
-                TokenValue::InOut => ParameterQualifier::InOut,
-                TokenValue::Const => ParameterQualifier::Const,
+    /// Parses parameter direction, constness and source image memory restrictions.
+    pub fn parse_parameter_qualifier(&mut self, frontend: &mut Frontend) -> ParameterInfo {
+        let mut direction = None;
+        let mut constant = None;
+        let mut restrict = false;
+        let mut storage_access = None;
+        while self.peek_parameter_qualifier(frontend) {
+            let token = self.bump(frontend).unwrap();
+            match token.value {
+                TokenValue::Const => {
+                    if constant.replace(token.meta).is_some() {
+                        frontend.errors.push(Error {
+                            kind: ErrorKind::SemanticError(
+                                "Repeated const parameter qualifier".into(),
+                            ),
+                            meta: token.meta,
+                        });
+                    }
+                }
+                TokenValue::MemoryQualifier(access) => {
+                    if let Err(error) = super::types::apply_memory_qualifier(
+                        &mut storage_access,
+                        access,
+                        token.meta,
+                    ) {
+                        frontend.errors.push(error);
+                    }
+                }
+                TokenValue::Restrict => {
+                    if restrict {
+                        frontend.errors.push(Error {
+                            kind: ErrorKind::SemanticError(
+                                "Repeated restrict parameter qualifier".into(),
+                            ),
+                            meta: token.meta,
+                        });
+                    }
+                    restrict = true;
+                }
+                TokenValue::In | TokenValue::Out | TokenValue::InOut => {
+                    let qualifier = match token.value {
+                        TokenValue::In => ParameterQualifier::In,
+                        TokenValue::Out => ParameterQualifier::Out,
+                        TokenValue::InOut => ParameterQualifier::InOut,
+                        _ => unreachable!(),
+                    };
+                    if direction.replace(qualifier).is_some() {
+                        frontend.errors.push(Error {
+                            kind: ErrorKind::SemanticError("Multiple parameter directions".into()),
+                            meta: token.meta,
+                        });
+                    }
+                }
                 _ => unreachable!(),
             }
-        } else {
-            ParameterQualifier::In
+        }
+        let qualifier = direction.unwrap_or(ParameterQualifier::In);
+        if let Some(meta) = constant {
+            if qualifier.is_lhs() {
+                frontend.errors.push(Error {
+                    kind: ErrorKind::SemanticError("Const parameters must be inputs".into()),
+                    meta,
+                });
+            }
+        }
+        ParameterInfo {
+            qualifier: if constant.is_some() {
+                ParameterQualifier::Const
+            } else {
+                qualifier
+            },
+            storage_access: storage_access.map(|(access, _)| access),
+            restrict,
+            depth: false,
         }
     }
 
@@ -633,23 +700,23 @@ impl ParsingContext<'_> {
         loop {
             if self.peek_type_name(frontend) || self.peek_parameter_qualifier(frontend) {
                 let qualifier = self.parse_parameter_qualifier(frontend);
-                let mut ty = self.parse_type_non_void(frontend, ctx)?.0;
+                let (mut ty, type_meta) = self.parse_type_non_void(frontend, ctx)?;
 
                 match self.expect_peek(frontend)?.value {
                     TokenValue::Comma => {
                         self.bump(frontend)?;
-                        ctx.add_function_arg(None, ty, qualifier)?;
+                        ctx.add_function_arg(None, ty, type_meta, qualifier)?;
                         continue;
                     }
                     TokenValue::RightParen => {
-                        ctx.add_function_arg(None, ty, qualifier)?;
+                        ctx.add_function_arg(None, ty, type_meta, qualifier)?;
                         break;
                     }
                     TokenValue::Identifier(_) => {
                         let mut name = self.expect_ident(frontend)?;
                         self.parse_array_specifier(frontend, ctx, &mut name.1, &mut ty)?;
 
-                        ctx.add_function_arg(Some(name), ty, qualifier)?;
+                        ctx.add_function_arg(Some(name), ty, type_meta, qualifier)?;
 
                         if self.bump_if(frontend, TokenValue::Comma).is_some() {
                             continue;

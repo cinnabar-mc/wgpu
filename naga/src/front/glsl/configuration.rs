@@ -494,6 +494,85 @@ mod regressions {
     }
 
     #[test]
+    fn configured_native_definitions_retain_builtin_candidates() {
+        let configuration = Configuration {
+            opaque_types: alloc::vec![OpaqueType {
+                name: "Plane".into(),
+                logical_name: "sourcePlane".into(),
+                inner: TypeInner::Image {
+                    dim: ImageDimension::D2,
+                    arrayed: false,
+                    class: ImageClass::Sampled {
+                        kind: ScalarKind::Float,
+                        multi: false
+                    },
+                },
+            }],
+            functions: alloc::vec![FunctionAlias {
+                name: "family".into(),
+                builtin: "texture".into(),
+                result_splat: None,
+            }],
+        };
+        for prototype in ["", "vec4 family(texture2D t,vec2 p);"] {
+            let source = alloc::format!(
+                r#"#version 450
+                layout(binding=0) uniform Plane plane;
+                layout(binding=1) uniform texture2D nativePlane;
+                layout(binding=2) uniform sampler filtering;
+                {prototype}
+                vec4 family(texture2D t,vec2 p) {{ return vec4(2.0); }}
+                layout(location=0) out vec4 color;
+                void main() {{ color=family(nativePlane,vec2(0))+family(sampler2D(plane,filtering),vec2(0)); }}
+            "#
+            );
+            let (module, _) = parse(&source, &configuration);
+            assert!(module
+                .functions
+                .iter()
+                .any(
+                    |(_, function)| function.expressions.iter().any(|(_, expression)| matches!(
+                        expression,
+                        crate::Expression::ImageSample { .. }
+                    ))
+                ));
+        }
+    }
+
+    #[test]
+    fn configured_depth_overrides_win_native_conversion_ties() {
+        let configuration = Configuration {
+            opaque_types: alloc::vec![OpaqueType {
+                name: "Tex".into(),
+                logical_name: "sourceTexture".into(),
+                inner: TypeInner::Image {
+                    dim: ImageDimension::D2,
+                    arrayed: false,
+                    class: ImageClass::Sampled {
+                        kind: ScalarKind::Float,
+                        multi: false
+                    },
+                },
+            }],
+            functions: alloc::vec![FunctionAlias {
+                name: "family".into(),
+                builtin: "texture".into(),
+                result_splat: None,
+            }],
+        };
+        parse(
+            r#"#version 450
+            layout(binding=0) uniform Tex source;
+            layout(binding=1) uniform samplerShadow comparison;
+            vec4 family(Tex t,vec3 p) { return vec4(texture(sampler2DShadow(t,comparison),p)); }
+            layout(location=0) out vec4 color;
+            void main() { color=family(sampler2DShadow(source,comparison),ivec3(0)); }
+        "#,
+            &configuration,
+        );
+    }
+
+    #[test]
     fn configured_opaque_overloads_match_complete_native_access() {
         let accesses = [
             StorageAccess::LOAD,
@@ -580,7 +659,7 @@ mod regressions {
                     float choose({ty} image) {{ return texture(sampler2DShadow(image,comparison),vec3(0.5)); }}
                     float nested({ty} image) {{ return choose(image); }}
                     layout(location=0) out vec4 color;
-                    void main() {{ color=vec4(nested(source)); }}
+                    void main() {{ color=vec4(nested(source)+nested(source)+choose(source)); }}
                 "#
                 );
                 let (module, _) = parse(&source, &configuration);

@@ -585,9 +585,9 @@ impl Frontend {
         let declaration = self.lookup_function.get(&name).unwrap();
 
         // Possibly contains the overload to be used in the call
-        let mut maybe_overload: Option<&Overload> = None;
+        let mut maybe_overload: Option<CallCandidate<'_>> = None;
         // Every viable overload with the conversions each argument needs to call it
-        let mut candidates: Vec<(&Overload, Vec<Conversion>)> = Vec::new();
+        let mut candidates: Vec<CallCandidate<'_>> = Vec::new();
 
         // Iterate over all the available overloads to select either an exact match or a
         // overload which has suitable implicit conversions
@@ -602,6 +602,7 @@ impl Frontend {
 
             // Stores whether the current overload matches exactly the function call
             let mut exact = true;
+            let mut native_match = true;
             // The conversions each argument needs to call the current overload
             let mut conversions = Vec::with_capacity(args.len());
 
@@ -634,18 +635,6 @@ impl Frontend {
                 };
                 let call_arg_ty = call_arg_ty.as_ref();
 
-                if !overload.internal
-                    && super::configuration::logical_type(
-                        &self.logical_types,
-                        ctx.module,
-                        *overload_parameter,
-                    )
-                    .is_some()
-                    && overload_param_ty != call_arg_ty
-                {
-                    continue 'outer;
-                }
-
                 log::trace!(
                     "Testing parameter {i}\n\tOverload = {overload_param_ty:?}\n\tCall = {call_arg_ty:?}"
                 );
@@ -658,7 +647,7 @@ impl Frontend {
                         class:
                             crate::ImageClass::Storage {
                                 format: overload_format,
-                                ..
+                                access: overload_access,
                             },
                         dim: overload_dim,
                         arrayed: overload_arrayed,
@@ -667,7 +656,7 @@ impl Frontend {
                         class:
                             crate::ImageClass::Storage {
                                 format: call_format,
-                                ..
+                                access: call_access,
                             },
                         dim: call_dim,
                         arrayed: call_arrayed,
@@ -685,6 +674,8 @@ impl Frontend {
                     if !(good_size && good_format) {
                         continue 'outer;
                     }
+
+                    native_match &= overload.internal || overload_access == call_access;
 
                     // Access is diagnosed only after the complete overload is selected.
                     // The images satisfy the conditions to be considered as an exact match
@@ -733,13 +724,21 @@ impl Frontend {
 
             // Registered physical variants may coexist with a generic native candidate.
             // Preserve the matching source definition when it overrides that candidate.
+            let candidate = CallCandidate {
+                overload,
+                conversions,
+                native_match,
+            };
             if exact {
-                if maybe_overload.is_none_or(|previous| previous.internal && !overload.internal) {
-                    maybe_overload = Some(overload);
+                if maybe_overload
+                    .as_ref()
+                    .is_none_or(|previous| candidate.prefers(previous, ctx.module))
+                {
+                    maybe_overload = Some(candidate);
                 }
                 candidates.clear();
             } else if maybe_overload.is_none() {
-                candidates.push((overload, conversions));
+                candidates.push(candidate);
             }
         }
 
@@ -747,11 +746,12 @@ impl Frontend {
         // that is better than every other viable overload: one that needs a better
         // conversion for at least one argument and a worse one for none.
         if !candidates.is_empty() {
-            let best = candidates.iter().position(|&(source, ref a)| {
-                candidates.iter().all(|&(other, ref b)| {
-                    core::ptr::eq(a, b)
-                        || is_better_overload(a, b)
-                        || (a == b && overrides_builtin(ctx.module, source, other))
+            let best = candidates.iter().position(|candidate| {
+                candidates.iter().all(|other| {
+                    core::ptr::eq(candidate, other)
+                        || is_better_overload(&candidate.conversions, &other.conversions)
+                        || (candidate.conversions == other.conversions
+                            && candidate.prefers(other, ctx.module))
                 })
             });
 
@@ -766,13 +766,23 @@ impl Frontend {
 
             // In case of ambiguity still pick an overload so that parsing continues and
             // further errors are collected.
-            maybe_overload = Some(candidates[best.unwrap_or(0)].0);
+            maybe_overload = Some(candidates.swap_remove(best.unwrap_or(0)));
         }
 
-        let overload = maybe_overload.ok_or_else(|| Error {
+        let candidate = maybe_overload.ok_or_else(|| Error {
             kind: ErrorKind::SemanticError(format!("Unknown function '{name}'").into()),
             meta,
         })?;
+
+        if !candidate.native_match {
+            self.errors.push(Error {
+                kind: ErrorKind::SemanticError(
+                    "Image argument has no matching native parameter variant".into(),
+                ),
+                meta,
+            });
+        }
+        let overload = candidate.overload;
 
         let parameters_info = overload.parameters_info.clone();
         let parameters = overload.parameters.clone();
@@ -821,6 +831,8 @@ impl Frontend {
                 &ctx.module.types[*parameter].inner,
                 ctx.get_type(call_argument.0),
             ) {
+                let required = parameter_info.storage_access.unwrap_or(required);
+                let provided = ctx.image_access(call_argument.0).unwrap_or(provided);
                 if !provided.contains(required) {
                     self.errors.push(Error {
                         kind: ErrorKind::SemanticError(format!("'{name}': image needs {required:?} access but only {provided:?} was provided").into()),
@@ -1144,7 +1156,7 @@ impl Frontend {
         };
 
         'outer: for decl in declaration.overloads.iter_mut() {
-            if parameters.len() != decl.parameters.len() {
+            if decl.internal || parameters.len() != decl.parameters.len() {
                 continue;
             }
 
@@ -1164,6 +1176,23 @@ impl Frontend {
                 }
             }
 
+            if decl
+                .parameters_info
+                .iter()
+                .zip(&parameters_info)
+                .any(|(old, new)| {
+                    old.qualifier != new.qualifier
+                        || old.storage_access != new.storage_access
+                        || old.restrict != new.restrict
+                })
+            {
+                return self.errors.push(Error {
+                    kind: ErrorKind::SemanticError(
+                        "Function parameter qualifiers must match the declaration".into(),
+                    ),
+                    meta,
+                });
+            }
             if decl.defined {
                 return self.errors.push(Error {
                     kind: ErrorKind::SemanticError("Function already defined".into()),
@@ -1172,7 +1201,6 @@ impl Frontend {
             }
 
             decl.defined = true;
-            decl.internal = false;
             decl.void = void;
             decl.parameters = parameters;
             decl.parameters_info = parameters_info;
@@ -1626,18 +1654,46 @@ const fn overload_argument_type(ty: &TypeInner, depth: bool) -> Option<Cow<'_, T
     }
 }
 
-/// Recognizes a source definition of a native signature without copying builtin tables.
-fn overrides_builtin(module: &crate::Module, source: &Overload, builtin: &Overload) -> bool {
-    !source.internal
-        && builtin.internal
-        && source.parameters.len() == builtin.parameters.len()
+/// A source/value match and the concrete native compatibility of its image arguments.
+struct CallCandidate<'a> {
+    overload: &'a Overload,
+    conversions: Vec<Conversion>,
+    native_match: bool,
+}
+
+impl CallCandidate<'_> {
+    /// Prefers source declarations, then native-compatible views of the same source signature.
+    fn prefers(&self, other: &Self, module: &crate::Module) -> bool {
+        !self.overload.internal
+            && (other.overload.internal || (self.native_match && !other.native_match))
+            && same_overload_signature(module, self.overload, other.overload)
+    }
+}
+
+/// Compares prospective signatures while accepting generic formats only for native builtins.
+fn same_overload_signature(module: &crate::Module, source: &Overload, builtin: &Overload) -> bool {
+    let generic_formats = builtin.internal;
+    source.parameters.len() == builtin.parameters.len()
         && source
             .parameters
             .iter()
             .zip(&builtin.parameters)
-            .all(|(source, builtin)| {
-                let source = &module.types[*source].inner;
-                let builtin = &module.types[*builtin].inner;
+            .enumerate()
+            .all(|(index, (source_type, builtin_type))| {
+                let Some(source) = overload_argument_type(
+                    &module.types[*source_type].inner,
+                    source.parameters_info[index].depth,
+                ) else {
+                    return false;
+                };
+                let Some(builtin) = overload_argument_type(
+                    &module.types[*builtin_type].inner,
+                    builtin.parameters_info[index].depth,
+                ) else {
+                    return false;
+                };
+                let source = source.as_ref();
+                let builtin = builtin.as_ref();
                 match (source, builtin) {
                     (
                         &TypeInner::Image {
@@ -1650,7 +1706,12 @@ fn overrides_builtin(module: &crate::Module, source: &Overload, builtin: &Overlo
                             arrayed: ba,
                             class: crate::ImageClass::Storage { format: bf, .. },
                         },
-                    ) => a == b && aa == ba && Scalar::from(af) == Scalar::from(bf),
+                    ) => {
+                        a == b
+                            && aa == ba
+                            && (af == bf
+                                || (generic_formats && Scalar::from(af) == Scalar::from(bf)))
+                    }
                     _ => source == builtin,
                 }
             })

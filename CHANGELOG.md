@@ -54,6 +54,7 @@ Bottom level categories:
 
 - Retain resources passed to unused helper parameters, preserve scalar and unnamed function prototypes, and keep rejected shadow overloads from changing resource types.
 - Use native storage-image access when emitting Metal and GLSL helper parameters.
+- Preserve GLSL image parameter memory restrictions independently of native resource access.
 
 - Round GLSL texture gather array layers before converting them to integers.
 - Convert GLSL double `frexp` exponents to the 32-bit output parameter type.

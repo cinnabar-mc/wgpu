@@ -10,8 +10,29 @@ use crate::{
         token::{Token, TokenValue},
         Error, ErrorKind, Frontend, Result,
     },
-    AddressSpace, ArraySize, Handle, Span, Type, TypeInner,
+    AddressSpace, ArraySize, Handle, Span, StorageAccess, Type, TypeInner,
 };
+
+/// Combines distinct memory qualifiers and rejects repetition at the source token.
+pub(super) fn apply_memory_qualifier(
+    current: &mut Option<(StorageAccess, Span)>,
+    access: StorageAccess,
+    meta: Span,
+) -> Result<()> {
+    let load_store = StorageAccess::LOAD | StorageAccess::STORE;
+    let storage_access = current.get_or_insert((load_store, Span::default()));
+    if !storage_access.0.contains(!access & load_store) {
+        return Err(Error {
+            kind: ErrorKind::SemanticError(
+                "The same memory qualifier can only be used once".into(),
+            ),
+            meta,
+        });
+    }
+    storage_access.0 &= access;
+    storage_access.1.subsume(meta);
+    Ok(())
+}
 
 impl ParsingContext<'_> {
     /// Parses an optional array_specifier returning whether or not it's present
@@ -236,7 +257,7 @@ impl ParsingContext<'_> {
                         }
                         TokenValue::Buffer => {
                             StorageQualifier::AddressSpace(AddressSpace::Storage {
-                                access: crate::StorageAccess::LOAD | crate::StorageAccess::STORE,
+                                access: StorageAccess::LOAD | StorageAccess::STORE,
                             })
                         }
                         _ => unreachable!(),
@@ -282,22 +303,11 @@ impl ParsingContext<'_> {
                     qualifiers.precision = Some((p, token.meta));
                 }
                 TokenValue::MemoryQualifier(access) => {
-                    let load_store = crate::StorageAccess::LOAD | crate::StorageAccess::STORE;
-                    let storage_access = qualifiers
-                        .storage_access
-                        .get_or_insert((load_store, Span::default()));
-
-                    if !storage_access.0.contains(!access & load_store) {
-                        frontend.errors.push(Error {
-                            kind: ErrorKind::SemanticError(
-                                "The same memory qualifier can only be used once".into(),
-                            ),
-                            meta: token.meta,
-                        })
+                    if let Err(error) =
+                        apply_memory_qualifier(&mut qualifiers.storage_access, access, token.meta)
+                    {
+                        frontend.errors.push(error);
                     }
-
-                    storage_access.0 &= access;
-                    storage_access.1.subsume(token.meta);
                 }
                 TokenValue::Restrict => continue,
                 _ => unreachable!(),

@@ -41,6 +41,8 @@ impl Module {
             ));
             parameters_info.push(ParameterInfo {
                 qualifier: ParameterQualifier::In,
+                storage_access: None,
+                restrict: false,
                 depth: false,
             });
         }
