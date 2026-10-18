@@ -729,10 +729,10 @@ impl Frontend {
         // that is better than every other viable overload: one that needs a better
         // conversion for at least one argument and a worse one for none.
         if !candidates.is_empty() {
-            let best = candidates.iter().position(|(_, a)| {
+            let best = candidates.iter().position(|&(_, ref a)| {
                 candidates
                     .iter()
-                    .all(|(_, b)| core::ptr::eq(a, b) || is_better_overload(a, b))
+                    .all(|&(_, ref b)| core::ptr::eq(a, b) || is_better_overload(a, b))
             });
 
             if best.is_none() {

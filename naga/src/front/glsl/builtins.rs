@@ -1760,6 +1760,7 @@ pub enum MacroCall {
 impl MacroCall {
     /// Adds the necessary expressions and statements to the passed body and
     /// finally returns the final expression with the correct result
+    #[allow(clippy::large_stack_frames)] // TODO(https://github.com/gfx-rs/wgpu/issues/9456)
     pub fn call(
         &self,
         frontend: &mut Frontend,
@@ -2573,12 +2574,12 @@ impl Frontend {
             }
             Expression::AccessIndex { base, index } => {
                 let ty = self.record_atomic_access(ctx, base, meta)?;
-                match &ctx.module.types[ty].inner {
-                    TypeInner::Struct { members, .. } => {
+                match ctx.module.types[ty].inner {
+                    TypeInner::Struct { ref members, .. } => {
                         self.atomic_upgrades.insert_field(ty, index as usize);
                         Ok(members[index as usize].ty)
                     }
-                    TypeInner::Array { base, .. } => Ok(*base),
+                    TypeInner::Array { base, .. } => Ok(base),
                     _ => Err(unsupported("a vector or matrix component")),
                 }
             }

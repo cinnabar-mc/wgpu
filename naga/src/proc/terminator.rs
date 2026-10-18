@@ -20,23 +20,30 @@ pub fn ensure_block_returns_value(
 ) {
     use crate::Statement as S;
     match block.last_mut() {
-        Some(S::Block(b)) => {
+        Some(&mut S::Block(ref mut b)) => {
             ensure_block_returns_value(b, value);
         }
-        Some(S::If { accept, reject, .. }) => {
+        Some(&mut S::If {
+            condition: _,
+            ref mut accept,
+            ref mut reject,
+        }) => {
             ensure_block_returns_value(accept, value);
             ensure_block_returns_value(reject, value);
         }
-        Some(S::Switch { cases, .. }) => {
+        Some(&mut S::Switch {
+            selector: _,
+            ref mut cases,
+        }) => {
             for case in cases.iter_mut() {
                 if !case.fall_through {
                     ensure_block_returns_value(&mut case.body, value);
                 }
             }
         }
-        Some(S::Break | S::Continue | S::Return { .. } | S::Kill) => (),
+        Some(&mut (S::Break | S::Continue | S::Return { .. } | S::Kill)) => (),
         Some(
-            S::Emit(_)
+            &mut (S::Emit(_)
             | S::Loop { .. }
             | S::Store { .. }
             | S::ImageStore { .. }
@@ -51,7 +58,7 @@ pub fn ensure_block_returns_value(
             | S::ControlBarrier(_)
             | S::MemoryBarrier(_)
             | S::CooperativeStore { .. }
-            | S::RayPipelineFunction(_),
+            | S::RayPipelineFunction(_)),
         )
         | None => block.push(S::Return { value: value() }, Default::default()),
     }

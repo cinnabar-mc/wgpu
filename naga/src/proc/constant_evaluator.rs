@@ -1783,7 +1783,7 @@ impl<'a> ConstantEvaluator<'a> {
                 |edge0, edge1, x| {
                     let mut one = x;
                     one.set_one();
-                    let t = ((x - edge0) / (edge1 - edge0)).max(one - one).min(one);
+                    let t = ((x - edge0) / (edge1 - edge0)).max(Zero::zero()).min(one);
                     let two = one + one;
                     Ok([t * t * (two + one - two * t)])
                 }

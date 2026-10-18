@@ -3203,7 +3203,7 @@ impl<'a, W: fmt::Write> super::Writer<'a, W> {
             Mf::Unpack4x8unorm => Function::Unpack4x8unorm,
             Mf::Unpack4xI8 => Function::Unpack4xI8,
             Mf::Unpack4xU8 => Function::Unpack4xU8,
-            _ => return Err(Error::Unimplemented(format!("write_expr_math {fun:?}"))),
+            Mf::Outer => return Err(Error::Unimplemented(format!("write_expr_math {fun:?}"))),
         };
 
         match fun {
