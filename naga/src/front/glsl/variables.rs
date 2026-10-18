@@ -249,8 +249,19 @@ impl Frontend {
         name: &str,
         meta: Span,
     ) -> Result<Handle<Expression>> {
+        // A column or component of a matrix or vector reached through a pointer
+        // (`M[0]`, `v[1]`) resolves to a `ValuePointer`; select on it like on the
+        // vector or scalar it points to.
+        let pointee;
         let (ty, is_pointer) = match *ctx.resolve_type(expression, meta)? {
             TypeInner::Pointer { base, .. } => (&ctx.module.types[base].inner, true),
+            TypeInner::ValuePointer { size, scalar, .. } => {
+                pointee = match size {
+                    Some(size) => TypeInner::Vector { size, scalar },
+                    None => TypeInner::Scalar(scalar),
+                };
+                (&pointee, true)
+            }
             ref ty => (ty, false),
         };
         match *ty {
