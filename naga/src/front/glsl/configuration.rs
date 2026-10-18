@@ -100,7 +100,7 @@ impl Frontend {
 }
 
 /// Returns a registered source identity through native array and pointer shells.
-fn logical_type<'a>(
+pub(super) fn logical_type<'a>(
     types: &'a crate::FastHashMap<String, String>,
     module: &Module,
     mut ty: Handle<Type>,
@@ -491,6 +491,116 @@ mod regressions {
         .validate(&module)
         .unwrap();
         (module, info)
+    }
+
+    #[test]
+    fn configured_opaque_overloads_match_complete_native_access() {
+        let accesses = [
+            StorageAccess::LOAD,
+            StorageAccess::LOAD | StorageAccess::STORE,
+            StorageAccess::STORE,
+        ];
+        let configuration = Configuration {
+            opaque_types: ["Read", "ReadWrite", "Write"]
+                .into_iter()
+                .zip(accesses)
+                .map(|(name, access)| OpaqueType {
+                    name: name.into(),
+                    logical_name: "image2D".into(),
+                    inner: TypeInner::Image {
+                        dim: ImageDimension::D2,
+                        arrayed: false,
+                        class: ImageClass::Storage {
+                            format: StorageFormat::Rgba8Unorm,
+                            access,
+                        },
+                    },
+                })
+                .collect(),
+            ..Configuration::default()
+        };
+        for reverse in [false, true] {
+            let mut definitions = [
+                "float choose(Read s) { return 1.0; }",
+                "float choose(ReadWrite s) { return 2.0; }",
+                "float choose(Write s) { return 3.0; }",
+            ];
+            if reverse {
+                definitions.reverse();
+            }
+            let definitions = definitions.concat();
+            let source = alloc::format!(
+                r#"#version 450
+                layout(binding=0,rgba8) readonly uniform Read source;
+                layout(binding=1,rgba8) uniform ReadWrite mixed;
+                layout(binding=2,rgba8) writeonly uniform Write target;
+                {definitions}
+                layout(location=0) out vec4 color;
+                void main() {{ color=vec4(choose(source)+choose(mixed)+choose(target)); }}
+            "#
+            );
+            parse(&source, &configuration);
+        }
+    }
+
+    #[test]
+    fn configured_depth_promotion_retains_source_signatures() {
+        for configured in [true, false] {
+            let configuration = Configuration {
+                opaque_types: if configured {
+                    alloc::vec![OpaqueType {
+                        name: "Tex".into(),
+                        logical_name: "sourceTexture".into(),
+                        inner: TypeInner::Image {
+                            dim: ImageDimension::D2,
+                            arrayed: false,
+                            class: ImageClass::Sampled {
+                                kind: ScalarKind::Float,
+                                multi: false,
+                            },
+                        },
+                    }]
+                } else {
+                    Vec::new()
+                },
+                ..Configuration::default()
+            };
+            let ty = if configured { "Tex" } else { "texture2D" };
+            for prototype in [false, true] {
+                let declaration = if prototype {
+                    alloc::format!("float choose({ty});")
+                } else {
+                    String::new()
+                };
+                let source = alloc::format!(
+                    r#"#version 450
+                    layout(binding=0) uniform {ty} source;
+                    layout(binding=1) uniform samplerShadow comparison;
+                    {declaration}
+                    float choose({ty} image) {{ return texture(sampler2DShadow(image,comparison),vec3(0.5)); }}
+                    float nested({ty} image) {{ return choose(image); }}
+                    layout(location=0) out vec4 color;
+                    void main() {{ color=vec4(nested(source)); }}
+                "#
+                );
+                let (module, _) = parse(&source, &configuration);
+                for (_, function) in module.functions.iter() {
+                    for argument in &function.arguments {
+                        let argument_type = &module.types[argument.ty];
+                        if matches!(argument_type.inner, TypeInner::Image { .. }) {
+                            assert_eq!(argument_type.name.as_deref(), configured.then_some("Tex"));
+                            assert!(matches!(
+                                argument_type.inner,
+                                TypeInner::Image {
+                                    class: ImageClass::Depth { .. },
+                                    ..
+                                }
+                            ));
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]

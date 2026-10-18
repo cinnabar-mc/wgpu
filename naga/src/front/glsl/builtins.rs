@@ -2473,8 +2473,7 @@ impl Frontend {
     }
 }
 
-/// Helper function to cast a expression holding a sampled image to a
-/// depth image.
+/// Converts image storage to depth while preserving its source type identity.
 pub fn sampled_to_depth(
     ctx: &mut Context,
     image: Handle<Expression>,
@@ -2487,7 +2486,6 @@ pub fn sampled_to_depth(
         Expression::FunctionArgument(i) => {
             // Mark the function argument as carrying a depth texture
             ctx.parameters_info[i as usize].depth = true;
-            // NOTE: We need to later also change the parameter type
             &mut ctx.arguments[i as usize].ty
         }
         _ => {
@@ -2509,7 +2507,7 @@ pub fn sampled_to_depth(
             ImageClass::Sampled { multi, .. } => {
                 *ty = ctx.module.types.insert(
                     Type {
-                        name: None,
+                        name: ctx.module.types[*ty].name.clone(),
                         inner: TypeInner::Image {
                             dim,
                             arrayed,
@@ -2532,15 +2530,6 @@ pub fn sampled_to_depth(
             meta,
         }),
     };
-
-    // Copy the handle to allow borrowing the `ctx` again
-    let ty = *ty;
-
-    // If the image was passed through a function argument we also need to change
-    // the corresponding parameter
-    if let Expression::FunctionArgument(i) = ctx[image] {
-        ctx.parameters[i as usize] = ty;
-    }
 }
 
 bitflags::bitflags! {

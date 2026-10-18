@@ -620,13 +620,31 @@ impl Frontend {
                     continue 'outer;
                 }
 
-                let overload_param_ty = &ctx.module.types[*overload_parameter].inner;
+                let Some(overload_param_ty) = overload_argument_type(
+                    &ctx.module.types[*overload_parameter].inner,
+                    parameter_info.depth,
+                ) else {
+                    continue 'outer;
+                };
+                let overload_param_ty = overload_param_ty.as_ref();
                 let Some(call_arg_ty) =
                     overload_argument_type(ctx.get_type(call_argument.0), parameter_info.depth)
                 else {
                     continue 'outer;
                 };
                 let call_arg_ty = call_arg_ty.as_ref();
+
+                if !overload.internal
+                    && super::configuration::logical_type(
+                        &self.logical_types,
+                        ctx.module,
+                        *overload_parameter,
+                    )
+                    .is_some()
+                    && overload_param_ty != call_arg_ty
+                {
+                    continue 'outer;
+                }
 
                 log::trace!(
                     "Testing parameter {i}\n\tOverload = {overload_param_ty:?}\n\tCall = {call_arg_ty:?}"
