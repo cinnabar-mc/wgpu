@@ -573,8 +573,6 @@ impl Frontend {
             .map_or(name.as_str(), |alias| alias.builtin.as_str())
             .to_string();
         let result_splat = builtin_alias.and_then(|alias| alias.result_splat);
-        let configured_family =
-            builtin_alias.is_some() || !self.configuration.opaque_types.is_empty();
 
         // Initiate the declaration if it wasn't previously initialized and inject builtins
         let declaration = self.lookup_function.entry(name.clone()).or_insert_with(|| {
@@ -722,9 +720,6 @@ impl Frontend {
                     maybe_overload = Some(overload);
                 }
                 candidates.clear();
-                if !configured_family {
-                    break;
-                }
             } else if maybe_overload.is_none() {
                 candidates.push((overload, conversions));
             }
@@ -738,9 +733,7 @@ impl Frontend {
                 candidates.iter().all(|&(other, ref b)| {
                     core::ptr::eq(a, b)
                         || is_better_overload(a, b)
-                        || (configured_family
-                            && a == b
-                            && overrides_builtin(ctx.module, source, other))
+                        || (a == b && overrides_builtin(ctx.module, source, other))
                 })
             });
 
@@ -1142,7 +1135,7 @@ impl Frontend {
                 let old_inner = &module.types[*old_parameter].inner;
 
                 if new_inner != old_inner
-                    || !super::configuration::same_declared_type(
+                    || !super::configuration::same_logical_type(
                         logical_types,
                         module,
                         *new_parameter,
@@ -1240,7 +1233,7 @@ impl Frontend {
                 let old_inner = &module.types[*old_parameter].inner;
 
                 if new_inner != old_inner
-                    || !super::configuration::same_declared_type(
+                    || !super::configuration::same_logical_type(
                         logical_types,
                         module,
                         *new_parameter,

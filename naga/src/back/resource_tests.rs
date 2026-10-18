@@ -84,6 +84,23 @@ fn resource_parameters_emit_with_native_access() {
         .unwrap()
         .write()
         .unwrap();
+        for (name, parameters) in [
+            ("copy", &["readonly image2D", "writeonly image2D"][..]),
+            ("nested", &["readonly image2D", "writeonly image2D"][..]),
+            ("update", &["image2D"][..]),
+            ("noop", &["writeonly image2D", "sampler2D"][..]),
+        ] {
+            let prefix = format!("void {name}(");
+            let signature = text.lines().find(|line| line.starts_with(&prefix)).unwrap();
+            let parameter_types: alloc::vec::Vec<_> = signature[prefix.len()..]
+                .split(')')
+                .next()
+                .unwrap()
+                .split(", ")
+                .map(|parameter| parameter.rsplit_once(' ').unwrap().0)
+                .collect();
+            assert_eq!(parameter_types, parameters, "{signature}");
+        }
     }
     #[cfg(hlsl_out)]
     {

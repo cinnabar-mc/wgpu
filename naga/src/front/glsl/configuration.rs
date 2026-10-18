@@ -118,26 +118,8 @@ fn logical_type<'a>(
     }
 }
 
-/// Compares registered identities and physical types while accepting native builtin types.
+/// Compares source identities before the caller checks physical type compatibility.
 pub(super) fn same_logical_type(
-    types: &crate::FastHashMap<String, String>,
-    module: &Module,
-    a: Handle<Type>,
-    b: Handle<Type>,
-) -> bool {
-    match (
-        logical_type(types, module, a),
-        logical_type(types, module, b),
-    ) {
-        (Some(left), Some(right)) => {
-            left == right && module.types[a].inner == module.types[b].inner
-        }
-        _ => true,
-    }
-}
-
-/// Separates registered source declarations from synthetic native builtin signatures.
-pub(super) fn same_declared_type(
     types: &crate::FastHashMap<String, String>,
     module: &Module,
     a: Handle<Type>,
@@ -509,6 +491,89 @@ mod regressions {
         .validate(&module)
         .unwrap();
         (module, info)
+    }
+
+    #[test]
+    fn configured_opaque_overloads_distinguish_registered_and_native_types() {
+        let configuration = Configuration {
+            opaque_types: alloc::vec![OpaqueType {
+                name: "Plane".into(),
+                logical_name: "sampler2D".into(),
+                inner: TypeInner::Image {
+                    dim: ImageDimension::D2,
+                    arrayed: false,
+                    class: ImageClass::Sampled {
+                        kind: ScalarKind::Float,
+                        multi: false,
+                    },
+                },
+            }],
+            ..Configuration::default()
+        };
+        for registered_first in [false, true] {
+            let registered = "float choose(Plane s) { return 1.0; }";
+            let native = "float choose(texture2D s) { return 2.0; }";
+            let definitions = if registered_first {
+                alloc::format!("{registered}{native}")
+            } else {
+                alloc::format!("{native}{registered}")
+            };
+            let source = alloc::format!(
+                r#"#version 450
+                layout(binding=0) uniform Plane plane;
+                layout(binding=1) uniform texture2D nativePlane;
+                {definitions}
+                layout(location=0) out vec4 color;
+                void main() {{ color=vec4(choose(plane)+choose(nativePlane)); }}
+            "#
+            );
+            let (module, _) = parse(&source, &configuration);
+            let main = module
+                .functions
+                .iter()
+                .find(|&(_, function)| function.name.as_deref() == Some("main"))
+                .unwrap()
+                .1;
+            let parameter_names: Vec<_> = main
+                .body
+                .iter()
+                .filter_map(|statement| match *statement {
+                    crate::Statement::Call { function, .. } => {
+                        let ty = module.functions[function].arguments[0].ty;
+                        Some(module.types[ty].name.as_deref())
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(parameter_names, [Some("Plane"), None]);
+        }
+    }
+
+    #[test]
+    fn default_prototypes_override_native_conversion_ties() {
+        for prototype in ["float sin(float x);", "float sin(float);"] {
+            let source = alloc::format!(
+                r#"#version 450
+                {prototype}
+                float sin(float x) {{ return x; }}
+                layout(location=0) out vec4 color;
+                void main() {{ color=vec4(sin(1)); }}
+            "#
+            );
+            let (module, _) = parse(&source, &Configuration::default());
+            assert!(!module
+                .functions
+                .iter()
+                .any(
+                    |(_, function)| function.expressions.iter().any(|(_, expression)| matches!(
+                        expression,
+                        crate::Expression::Math {
+                            fun: crate::MathFunction::Sin,
+                            ..
+                        }
+                    ))
+                ));
+        }
     }
 
     #[test]
