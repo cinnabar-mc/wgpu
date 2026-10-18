@@ -1,4 +1,5 @@
 use alloc::{
+    borrow::Cow,
     format,
     string::{String, ToString},
     vec,
@@ -567,11 +568,7 @@ impl Frontend {
         let mut variations =
             builtin_required_variations(args.iter().map(|&(expr, _)| ctx.get_type(expr)));
 
-        let builtin_alias = self
-            .configuration
-            .functions
-            .iter()
-            .find(|alias| alias.name == name);
+        let builtin_alias = self.builtin_alias(&name);
         let builtin_name = builtin_alias
             .map_or(name.as_str(), |alias| alias.builtin.as_str())
             .to_string();
@@ -624,17 +621,13 @@ impl Frontend {
                     continue 'outer;
                 }
 
-                // If the image is used in the overload as a depth texture convert it
-                // before comparing, otherwise exact matches wouldn't be reported
-                if parameter_info.depth {
-                    sampled_to_depth(ctx, call_argument.0, call_argument.1, &mut self.errors);
-                    ctx.invalidate_expression(call_argument.0, call_argument.1)?
-                }
-
-                ctx.typifier_grow(call_argument.0, call_argument.1)?;
-
                 let overload_param_ty = &ctx.module.types[*overload_parameter].inner;
-                let call_arg_ty = ctx.get_type(call_argument.0);
+                let Some(call_arg_ty) =
+                    overload_argument_type(ctx.get_type(call_argument.0), parameter_info.depth)
+                else {
+                    continue 'outer;
+                };
+                let call_arg_ty = call_arg_ty.as_ref();
 
                 log::trace!(
                     "Testing parameter {i}\n\tOverload = {overload_param_ty:?}\n\tCall = {call_arg_ty:?}"
@@ -784,6 +777,19 @@ impl Frontend {
             .zip(raw_args)
             .zip(&parameters)
         {
+            if parameter_info.depth
+                && matches!(
+                    *ctx.get_type(call_argument.0),
+                    TypeInner::Image {
+                        class: crate::ImageClass::Sampled { .. },
+                        ..
+                    }
+                )
+            {
+                sampled_to_depth(ctx, call_argument.0, call_argument.1, &mut self.errors);
+                ctx.invalidate_expression(call_argument.0, call_argument.1)?;
+                ctx.typifier_grow(call_argument.0, call_argument.1)?;
+            }
             if let (
                 &TypeInner::Image {
                     class:
@@ -1090,11 +1096,7 @@ impl Frontend {
                 .map(|&arg| &ctx.module.types[arg].inner),
         );
 
-        let builtin_alias = self
-            .configuration
-            .functions
-            .iter()
-            .find(|alias| alias.name == name);
+        let builtin_alias = self.builtin_alias(&name);
         let builtin_name = builtin_alias
             .map_or(name.as_str(), |alias| alias.builtin.as_str())
             .to_string();
@@ -1199,11 +1201,7 @@ impl Frontend {
                 .map(|&arg| &ctx.module.types[arg].inner),
         );
 
-        let builtin_alias = self
-            .configuration
-            .functions
-            .iter()
-            .find(|alias| alias.name == name);
+        let builtin_alias = self.builtin_alias(&name);
         let builtin_name = builtin_alias
             .map_or(name.as_str(), |alias| alias.builtin.as_str())
             .to_string();
@@ -1232,7 +1230,7 @@ impl Frontend {
         };
 
         'outer: for decl in declaration.overloads.iter() {
-            if parameters.len() != decl.parameters.len() {
+            if decl.internal || parameters.len() != decl.parameters.len() {
                 continue;
             }
 
@@ -1259,14 +1257,22 @@ impl Frontend {
         }
 
         let handle = module.functions.append(function, meta);
-        declaration.overloads.push(Overload {
-            parameters,
-            parameters_info,
-            kind: FunctionKind::Call(handle),
-            defined: false,
-            internal: false,
-            void,
-        });
+        let position = declaration
+            .overloads
+            .iter()
+            .position(|overload| overload.internal)
+            .unwrap_or(declaration.overloads.len());
+        declaration.overloads.insert(
+            position,
+            Overload {
+                parameters,
+                parameters_info,
+                kind: FunctionKind::Call(handle),
+                defined: false,
+                internal: false,
+                void,
+            },
+        );
     }
 
     /// Create a Naga [`EntryPoint`] that calls the GLSL `main` function.
@@ -1582,6 +1588,29 @@ impl Context<'_> {
         }
 
         Ok(())
+    }
+}
+
+/// Computes a candidate's depth view without changing any resource or parameter type.
+const fn overload_argument_type(ty: &TypeInner, depth: bool) -> Option<Cow<'_, TypeInner>> {
+    if !depth {
+        return Some(Cow::Borrowed(ty));
+    }
+    match *ty {
+        TypeInner::Image {
+            dim,
+            arrayed,
+            class: crate::ImageClass::Sampled { multi, .. },
+        } => Some(Cow::Owned(TypeInner::Image {
+            dim,
+            arrayed,
+            class: crate::ImageClass::Depth { multi },
+        })),
+        TypeInner::Image {
+            class: crate::ImageClass::Depth { .. },
+            ..
+        } => Some(Cow::Borrowed(ty)),
+        _ => None,
     }
 }
 

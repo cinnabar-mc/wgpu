@@ -52,6 +52,8 @@ Bottom level categories:
 
 #### naga
 
+- Retain resources passed to unused helper parameters, preserve scalar and unnamed function prototypes, and keep rejected shadow overloads from changing resource types.
+
 - Round GLSL texture gather array layers before converting them to integers.
 - Convert GLSL double `frexp` exponents to the 32-bit output parameter type.
 - Preserve SPIR-V `ModfStruct` and `FrexpStruct` result types when storing whole structs.

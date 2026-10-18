@@ -38,9 +38,14 @@ pub struct FunctionAlias {
 impl Frontend {
     /// Registers handle-free opaque aliases in this parse's type arena.
     pub(super) fn register_types(&mut self, module: &mut Module) -> Result<()> {
-        let mut functions = crate::FastHashSet::default();
-        for alias in &self.configuration.functions {
-            if alias.name.is_empty() || alias.builtin.is_empty() || !functions.insert(&alias.name) {
+        for (index, alias) in self.configuration.functions.iter().enumerate() {
+            if alias.name.is_empty()
+                || alias.builtin.is_empty()
+                || self
+                    .function_aliases
+                    .insert(alias.name.clone(), index)
+                    .is_some()
+            {
                 return Err(Error {
                     kind: ErrorKind::SemanticError("invalid builtin family registration".into()),
                     meta: Span::default(),
@@ -74,6 +79,13 @@ impl Frontend {
                 .insert(alias.name.clone(), alias.logical_name.clone());
         }
         Ok(())
+    }
+
+    /// Looks up a validated builtin family without scanning unrelated source declarations.
+    pub(super) fn builtin_alias(&self, name: &str) -> Option<&FunctionAlias> {
+        self.function_aliases
+            .get(name)
+            .map(|&index| &self.configuration.functions[index])
     }
 
     /// Keeps distinct registered source identities out of one user overload signature.
@@ -471,5 +483,197 @@ mod shadow_tests {
             .validate(&module)
             .unwrap();
         }
+    }
+}
+
+#[cfg(test)]
+mod regressions {
+    use super::*;
+    use crate::{
+        ImageClass, ImageDimension, ScalarKind, ShaderStage, StorageAccess, StorageFormat,
+    };
+
+    /// Parses a configured fragment and returns validation data for its observable uses.
+    fn parse(source: &str, configuration: &Configuration) -> (Module, crate::valid::ModuleInfo) {
+        let module = Frontend::default()
+            .parse_with_configuration(
+                &super::super::Options::from(ShaderStage::Fragment),
+                source,
+                configuration,
+            )
+            .unwrap_or_else(|error| panic!("{}", error.emit_to_string(source)));
+        let info = crate::valid::Validator::new(
+            crate::valid::ValidationFlags::all(),
+            crate::valid::Capabilities::all(),
+        )
+        .validate(&module)
+        .unwrap();
+        (module, info)
+    }
+
+    #[test]
+    fn configured_unused_resource_arguments_keep_query_without_reads() {
+        let configuration = Configuration {
+            opaque_types: alloc::vec![
+                OpaqueType {
+                    name: "Plane".into(),
+                    logical_name: "sampler2D".into(),
+                    inner: TypeInner::Image {
+                        dim: ImageDimension::D2,
+                        arrayed: false,
+                        class: ImageClass::Sampled {
+                            kind: ScalarKind::Float,
+                            multi: false
+                        },
+                    }
+                },
+                OpaqueType {
+                    name: "Output".into(),
+                    logical_name: "image2D".into(),
+                    inner: TypeInner::Image {
+                        dim: ImageDimension::D2,
+                        arrayed: false,
+                        class: ImageClass::Storage {
+                            format: StorageFormat::Rgba8Unorm,
+                            access: StorageAccess::STORE
+                        },
+                    }
+                },
+            ],
+            ..Configuration::default()
+        };
+        let (module, info) = parse(
+            r#"#version 450
+            layout(binding=0) uniform Plane source;
+            layout(binding=1,rgba8) writeonly uniform Output outputImage;
+            layout(binding=2) uniform sampler filtering;
+            void noop(Plane a,Output b,sampler c) {}
+            layout(location=0) out vec4 color;
+            void main() { noop(source,outputImage,filtering); color=vec4(1.0); }
+        "#,
+            &configuration,
+        );
+        for (handle, global) in module.global_variables.iter() {
+            if global.binding.is_some() {
+                assert_eq!(
+                    info.get_entry_point(0)[handle],
+                    crate::valid::GlobalUse::QUERY
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn configured_rejected_shadow_candidates_do_not_retype_call_arguments() {
+        let configuration = Configuration {
+            opaque_types: alloc::vec![OpaqueType {
+                name: "Unused".into(),
+                logical_name: "sampler2D".into(),
+                inner: TypeInner::Image {
+                    dim: ImageDimension::D2,
+                    arrayed: false,
+                    class: ImageClass::Sampled {
+                        kind: ScalarKind::Float,
+                        multi: false
+                    },
+                },
+            }],
+            ..Configuration::default()
+        };
+        parse(
+            r#"#version 450
+            layout(binding=0) uniform texture2D source;
+            layout(binding=3) uniform texture2D depthSource;
+            layout(binding=1) uniform sampler filtering;
+            layout(binding=2) uniform samplerShadow comparison;
+            float choose(texture2D s,vec2 p) { return texture(sampler2D(s,filtering),p).x; }
+            float choose(texture2D s,float p) { return texture(sampler2DShadow(s,comparison),vec3(p)); }
+            layout(location=0) out vec4 color;
+            void main() { color=vec4(choose(source,vec2(0.5))+choose(depthSource,0.5)); }
+        "#,
+            &configuration,
+        );
+    }
+
+    #[test]
+    fn configured_scalar_prototypes_can_override_native_signatures() {
+        let configuration = Configuration {
+            functions: alloc::vec![FunctionAlias {
+                name: "family".into(),
+                builtin: "sin".into(),
+                result_splat: None
+            }],
+            ..Configuration::default()
+        };
+        for prototype in ["float family(float x);", "float family(float);"] {
+            let source = alloc::format!(
+                r#"#version 450
+                {prototype}
+                float family(float x) {{ return x; }}
+                layout(location=0) out vec4 color;
+                void main() {{ color=vec4(family(0.5)); }}
+            "#
+            );
+            parse(&source, &configuration);
+        }
+    }
+}
+
+#[cfg(test)]
+mod unnamed_prototype_tests {
+    use super::*;
+    use crate::{ImageClass, ImageDimension, ScalarKind, ShaderStage};
+
+    #[test]
+    fn configured_unnamed_prototypes_retain_distinct_opaque_types() {
+        let configuration = Configuration {
+            opaque_types: alloc::vec![
+                OpaqueType {
+                    name: "Plane".into(),
+                    logical_name: "sampler2D".into(),
+                    inner: TypeInner::Image {
+                        dim: ImageDimension::D2,
+                        arrayed: false,
+                        class: ImageClass::Sampled {
+                            kind: ScalarKind::Float,
+                            multi: false
+                        },
+                    }
+                },
+                OpaqueType {
+                    name: "Depth".into(),
+                    logical_name: "sampler2DShadow".into(),
+                    inner: TypeInner::Image {
+                        dim: ImageDimension::D2,
+                        arrayed: false,
+                        class: ImageClass::Depth { multi: false },
+                    }
+                },
+            ],
+            ..Configuration::default()
+        };
+        let source = r#"#version 450
+            layout(binding=0) uniform Plane plane;
+            layout(binding=1) uniform Depth depth;
+            float choose(Plane);
+            float choose(Depth);
+            float choose(Plane s) { return 1.0; }
+            float choose(Depth s) { return 2.0; }
+            layout(location=0) out vec4 color;
+            void main() { color=vec4(choose(plane)+choose(depth)); }
+        "#;
+        let module = Frontend::default()
+            .parse_with_configuration(
+                &super::super::Options::from(ShaderStage::Fragment),
+                source,
+                &configuration,
+            )
+            .unwrap_or_else(|error| panic!("{}", error.emit_to_string(source)));
+        crate::valid::Validator::new(
+            crate::valid::ValidationFlags::all(),
+            crate::valid::Capabilities::all(),
+        )
+        .validate(&module)
+        .unwrap();
     }
 }

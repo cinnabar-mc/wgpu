@@ -641,6 +641,10 @@ impl ParsingContext<'_> {
                         ctx.add_function_arg(None, ty, qualifier)?;
                         continue;
                     }
+                    TokenValue::RightParen => {
+                        ctx.add_function_arg(None, ty, qualifier)?;
+                        break;
+                    }
                     TokenValue::Identifier(_) => {
                         let mut name = self.expect_ident(frontend)?;
                         self.parse_array_specifier(frontend, ctx, &mut name.1, &mut ty)?;

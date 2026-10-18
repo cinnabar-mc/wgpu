@@ -1127,7 +1127,8 @@ impl FunctionInfo {
                             .argument_uses
                             .get(index)
                             .copied()
-                            .unwrap_or(GlobalUse::empty());
+                            .filter(|usage| !usage.is_empty())
+                            .unwrap_or(GlobalUse::QUERY);
                         let _ = self.add_ref_impl(argument, usage);
                     }
                     //Note: the result is validated by the Validator, not here

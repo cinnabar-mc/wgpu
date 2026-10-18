@@ -169,6 +169,7 @@ impl Default for ShaderMetadata {
 pub struct Frontend {
     meta: ShaderMetadata,
     configuration: Configuration,
+    function_aliases: FastHashMap<String, usize>,
     logical_types: FastHashMap<String, String>,
 
     lookup_function: FastHashMap<String, FunctionDeclaration>,
@@ -190,6 +191,7 @@ impl Frontend {
         self.lookup_function.clear();
         self.lookup_type.clear();
         self.logical_types.clear();
+        self.function_aliases.clear();
         self.global_variables.clear();
         self.entry_args.clear();
         self.layouter.clear();
