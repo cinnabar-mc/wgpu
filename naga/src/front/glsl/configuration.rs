@@ -595,37 +595,103 @@ mod regressions {
         );
     }
 
+    /// Keeps source calls invariant across prospective image views and prototype orders.
     #[test]
     fn configured_depth_projection_overrides_preserve_source_preference() {
-        let mut configuration = sampled_configuration(true);
-        configuration.functions.push(FunctionAlias {
-            name: "family".into(),
-            builtin: "textureProj".into(),
-            result_splat: None,
-        });
-        for prototype in ["float family(Tex t,vec4 p);", ""] {
-            let source = alloc::format!(
-                r#"#version 450
-                layout(binding=0) uniform Tex source;
-                layout(binding=1) uniform samplerShadow comparison;
-                layout(binding=2) uniform sampler filtering;
-                {prototype}
-                float family(Tex t,vec4 p) {{ return textureProj(sampler2DShadow(t,comparison),p); }}
-                layout(location=0) out vec4 color;
-                void main() {{ color=vec4(family(sampler2D(source,filtering),vec4(0.5)))+vec4(family(sampler2D(source,filtering),ivec4(1))); }}
-            "#
-            );
-            let (module, _) = parse(&source, &configuration);
-            let main = module
-                .functions
-                .iter()
-                .find(|&(_, f)| f.name.as_deref() == Some("main"))
-                .unwrap()
-                .1;
-            assert_eq!(main.expressions.iter().filter(|&(_, expression)| matches!(
-                expression,
-                crate::Expression::CallResult(callee) if module.functions[*callee].name.as_deref() == Some("family")
-            )).count(), 2, "source override lost with prototype={prototype:?}");
+        for configured in [true, false] {
+            for aliased_family in [true, false] {
+                let mut configuration = sampled_configuration(configured);
+                let ty = if configured { "Tex" } else { "texture2D" };
+                let family = if aliased_family {
+                    "family"
+                } else {
+                    "textureProj"
+                };
+                if aliased_family {
+                    configuration.functions.push(FunctionAlias {
+                        name: family.into(),
+                        builtin: "textureProj".into(),
+                        result_splat: None,
+                    });
+                }
+                for prototype in 0..4 {
+                    let declaration = alloc::format!("float {family}({ty} t,vec4 p);");
+                    let before = match prototype {
+                        1 => declaration.clone(),
+                        2 => declaration.repeat(2),
+                        _ => String::new(),
+                    };
+                    let after = if prototype == 3 {
+                        declaration.as_str()
+                    } else {
+                        ""
+                    };
+                    for uses_depth in [false, true] {
+                        for shadow_argument in [false, true] {
+                            for numeric_conversion in [false, true] {
+                                let body = if uses_depth {
+                                    if aliased_family {
+                                        "return textureProj(sampler2DShadow(t,comparison),p);"
+                                    } else {
+                                        "return texture(sampler2DShadow(t,comparison),vec3(0.5));"
+                                    }
+                                } else {
+                                    "return 7.0;"
+                                };
+                                let argument = if shadow_argument {
+                                    "sampler2DShadow(source,comparison)"
+                                } else {
+                                    "sampler2D(source,filtering)"
+                                };
+                                let value = if numeric_conversion {
+                                    "ivec4(1)"
+                                } else {
+                                    "vec4(0.5)"
+                                };
+                                let source = alloc::format!(
+                                    r#"#version 450
+                                    layout(binding=0) uniform {ty} source;
+                                    layout(binding=1) uniform samplerShadow comparison;
+                                    layout(binding=2) uniform sampler filtering;
+                                    {before}
+                                    float {family}({ty} t,vec4 p) {{ {body} }}
+                                    {after}
+                                    layout(location=0) out vec4 color;
+                                    void main() {{ color=vec4({family}({argument},{value})); }}
+                                "#
+                                );
+                                let (module, _) = parse(&source, &configuration);
+                                let (callee, function) = module
+                                    .functions
+                                    .iter()
+                                    .find(|&(_, function)| function.name.as_deref() == Some(family))
+                                    .unwrap();
+                                let main = module
+                                    .functions
+                                    .iter()
+                                    .find(|&(_, function)| function.name.as_deref() == Some("main"))
+                                    .unwrap()
+                                    .1;
+                                assert!(
+                                    main.expressions.iter().any(|(_, expression)| matches!(
+                                        *expression,
+                                        crate::Expression::CallResult(handle) if handle == callee
+                                    )),
+                                    "source override lost: configured={configured}, family={family}, prototype={prototype}, uses_depth={uses_depth}, shadow={shadow_argument}, conversion={numeric_conversion}"
+                                );
+                                if !uses_depth {
+                                    assert!(function.body.iter().any(|statement| matches!(
+                                        *statement,
+                                        crate::Statement::Return { value: Some(value) }
+                                            if matches!(function.expressions[value],
+                                                crate::Expression::Literal(crate::Literal::F32(7.0)))
+                                    )));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 

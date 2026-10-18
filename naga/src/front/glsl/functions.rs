@@ -621,26 +621,12 @@ impl Frontend {
                     continue 'outer;
                 }
 
-                let depth = parameter_info.depth
-                    || (!overload.internal
-                        && matches!(
-                            ctx.get_type(call_argument.0),
-                            TypeInner::Image {
-                                class: crate::ImageClass::Depth { .. },
-                                ..
-                            }
-                        ));
-                let Some(overload_param_ty) =
-                    overload_argument_type(&ctx.module.types[*overload_parameter].inner, depth)
+                let Some((overload_param_ty, call_arg_ty)) =
+                    overload_argument_types(ctx.module, overload, i, ctx.get_type(call_argument.0))
                 else {
                     continue 'outer;
                 };
                 let overload_param_ty = overload_param_ty.as_ref();
-                let Some(call_arg_ty) =
-                    overload_argument_type(ctx.get_type(call_argument.0), depth)
-                else {
-                    continue 'outer;
-                };
                 let call_arg_ty = call_arg_ty.as_ref();
 
                 log::trace!(
@@ -740,7 +726,7 @@ impl Frontend {
             if exact {
                 if maybe_overload
                     .as_ref()
-                    .is_none_or(|previous| candidate.prefers(previous, ctx.module))
+                    .is_none_or(|previous| candidate.prefers(previous, ctx, &args))
                 {
                     maybe_overload = Some(candidate);
                 }
@@ -759,7 +745,7 @@ impl Frontend {
                     core::ptr::eq(candidate, other)
                         || is_better_overload(&candidate.conversions, &other.conversions)
                         || (candidate.conversions == other.conversions
-                            && candidate.prefers(other, ctx.module))
+                            && candidate.prefers(other, ctx, &args))
                 })
             });
 
@@ -1774,12 +1760,31 @@ impl ImageVariable {
     }
 }
 
-/// Computes a candidate's depth view without changing any resource or parameter type.
-fn overload_argument_type(ty: &TypeInner, depth: bool) -> Option<Cow<'_, TypeInner>> {
-    if !depth {
-        return Some(Cow::Borrowed(ty));
+/// Derives both prospective native views from a declared parameter and the actual argument.
+fn overload_argument_types<'a>(
+    module: &'a crate::Module,
+    overload: &Overload,
+    index: usize,
+    argument: &'a TypeInner,
+) -> Option<(Cow<'a, TypeInner>, Cow<'a, TypeInner>)> {
+    let parameter = &module.types[overload.parameters[index]].inner;
+    let depth = overload.parameters_info[index].depth
+        || (!overload.internal
+            && matches!(
+                argument,
+                TypeInner::Image {
+                    class: crate::ImageClass::Depth { .. },
+                    ..
+                }
+            ));
+    if depth {
+        Some((
+            Cow::Owned(super::types::image_depth_type(parameter)?),
+            Cow::Owned(super::types::image_depth_type(argument)?),
+        ))
+    } else {
+        Some((Cow::Borrowed(parameter), Cow::Borrowed(argument)))
     }
-    super::types::image_depth_type(ty).map(Cow::Owned)
 }
 
 /// Checks repeated source declarations without replacing the stored result or definition.
@@ -1831,15 +1836,26 @@ struct CallCandidate<'a> {
 
 impl CallCandidate<'_> {
     /// Prefers source declarations, then native-compatible views of the same source signature.
-    fn prefers(&self, other: &Self, module: &crate::Module) -> bool {
+    fn prefers(
+        &self,
+        other: &Self,
+        ctx: &Context,
+        arguments: &[(Handle<Expression>, Span)],
+    ) -> bool {
         !self.overload.internal
             && (other.overload.internal || (self.native_match && !other.native_match))
-            && same_overload_signature(module, self.overload, other.overload)
+            && same_overload_signature(ctx, self.overload, other.overload, arguments)
     }
 }
 
 /// Compares declared signatures first, then native views with generic builtin formats.
-fn same_overload_signature(module: &crate::Module, source: &Overload, builtin: &Overload) -> bool {
+fn same_overload_signature(
+    ctx: &Context,
+    source: &Overload,
+    builtin: &Overload,
+    arguments: &[(Handle<Expression>, Span)],
+) -> bool {
+    let module = &ctx.module;
     let generic_formats = builtin.internal;
     source.parameters.len() == builtin.parameters.len()
         && source
@@ -1851,16 +1867,13 @@ fn same_overload_signature(module: &crate::Module, source: &Overload, builtin: &
                 if module.types[*source_type].inner == module.types[*builtin_type].inner {
                     return true;
                 }
-                let Some(source) = overload_argument_type(
-                    &module.types[*source_type].inner,
-                    source.parameters_info[index].depth,
-                ) else {
+                let argument = ctx.get_type(arguments[index].0);
+                let Some((source, _)) = overload_argument_types(module, source, index, argument)
+                else {
                     return false;
                 };
-                let Some(builtin) = overload_argument_type(
-                    &module.types[*builtin_type].inner,
-                    builtin.parameters_info[index].depth,
-                ) else {
+                let Some((builtin, _)) = overload_argument_types(module, builtin, index, argument)
+                else {
                     return false;
                 };
                 let source = source.as_ref();
