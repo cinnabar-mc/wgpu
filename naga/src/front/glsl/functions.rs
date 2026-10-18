@@ -1199,9 +1199,20 @@ impl Frontend {
                     meta,
                 });
             }
+            if let FunctionKind::Call(handle) = decl.kind {
+                if module.functions[handle].result.as_ref().map(|r| r.ty)
+                    != function.result.as_ref().map(|r| r.ty)
+                {
+                    return self.errors.push(Error {
+                        kind: ErrorKind::SemanticError(
+                            "Function return type must match the declaration".into(),
+                        ),
+                        meta,
+                    });
+                }
+            }
 
             decl.defined = true;
-            decl.void = void;
             decl.parameters = parameters;
             decl.parameters_info = parameters_info;
             match decl.kind {

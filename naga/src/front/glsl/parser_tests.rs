@@ -652,6 +652,45 @@ fn constants() {
     assert!(constants.next().is_none());
 }
 
+/// Checks return-type agreement when a definition replaces its prototype.
+#[test]
+fn prototype_return_types() {
+    let mut accepted = Vec::new();
+    for (declaration, definition) in [
+        ("float f();", "void f() {}"),
+        ("void f();", "float f() { return 1.0; }"),
+        ("float f();", "int f() { return 1; }"),
+    ] {
+        let source =
+            alloc::format!("#version 450\n{declaration}\n{definition}\nvoid main() {{ f(); }}");
+        match Frontend::default().parse(&Options::from(ShaderStage::Fragment), &source) {
+            Ok(_) => accepted.push(declaration),
+            Err(error) => assert!(
+                error.emit_to_string(&source).contains("return type"),
+                "{error}"
+            ),
+        }
+    }
+    assert!(
+        accepted.is_empty(),
+        "conflicting returns accepted: {accepted:?}"
+    );
+    for (result, body) in [("void", ""), ("float", "return 1.0;")] {
+        let source = alloc::format!(
+            "#version 450\n{result} f();\nvoid forward() {{ f(); }}\n{result} f() {{ {body} }}\nvoid main() {{ forward(); f(); }}"
+        );
+        let module = Frontend::default()
+            .parse(&Options::from(ShaderStage::Fragment), &source)
+            .unwrap();
+        crate::valid::Validator::new(
+            crate::valid::ValidationFlags::all(),
+            crate::valid::Capabilities::all(),
+        )
+        .validate(&module)
+        .unwrap();
+    }
+}
+
 #[test]
 fn function_overloading() {
     let mut frontend = Frontend::default();
