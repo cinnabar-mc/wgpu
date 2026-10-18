@@ -71,7 +71,6 @@ impl<W: Write> Writer<W> {
                 .expect("intersection ty should be there for intersection function"),
             gctx: module.to_ctx(),
             names: &self.names,
-            access: crate::StorageAccess::empty(),
             first_time: false,
         };
         let mut base_level = back::Level(1);
@@ -256,7 +255,6 @@ impl<W: Write> Writer<W> {
                         .expect("ray desc is required as an argument so should be there"),
                     gctx: context.expression.module.to_ctx(),
                     names: &self.names,
-                    access: crate::StorageAccess::empty(),
                     first_time: false,
                 };
 

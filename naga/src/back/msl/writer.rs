@@ -188,7 +188,6 @@ pub(super) struct TypeContext<'a> {
     pub handle: Handle<crate::Type>,
     pub gctx: proc::GlobalCtx<'a>,
     pub names: &'a FastHashMap<NameKey, String>,
-    pub access: crate::StorageAccess,
     pub first_time: bool,
 }
 
@@ -323,22 +322,21 @@ impl Display for TypeContext<'_> {
                         };
                         ("depth", msaa_str, scalar, access)
                     }
-                    crate::ImageClass::Storage { format, .. } => {
-                        let access = if self
-                            .access
+                    crate::ImageClass::Storage { format, access } => {
+                        let access = if access
                             .contains(crate::StorageAccess::LOAD | crate::StorageAccess::STORE)
                         {
                             "read_write"
-                        } else if self.access.contains(crate::StorageAccess::STORE) {
+                        } else if access.contains(crate::StorageAccess::STORE) {
                             "write"
-                        } else if self.access.contains(crate::StorageAccess::LOAD) {
+                        } else if access.contains(crate::StorageAccess::LOAD) {
                             "read"
                         } else {
                             log::warn!(
                                 "Storage access for {:?} (name '{}'): {:?}",
                                 self.handle,
                                 ty.name.as_deref().unwrap_or_default(),
-                                self.access
+                                access
                             );
                             unreachable!("module is not valid");
                         };
@@ -416,30 +414,10 @@ impl TypedGlobalVariable<'_> {
         let var = &self.module.global_variables[self.handle];
         let name = &self.names[&NameKey::GlobalVariable(self.handle)];
 
-        let storage_access = match var.space {
-            crate::AddressSpace::Storage { access } => access,
-            _ => match self.module.types[var.ty].inner {
-                crate::TypeInner::Image {
-                    class: crate::ImageClass::Storage { access, .. },
-                    ..
-                } => access,
-                crate::TypeInner::BindingArray { base, .. } => {
-                    match self.module.types[base].inner {
-                        crate::TypeInner::Image {
-                            class: crate::ImageClass::Storage { access, .. },
-                            ..
-                        } => access,
-                        _ => crate::StorageAccess::default(),
-                    }
-                }
-                _ => crate::StorageAccess::default(),
-            },
-        };
         let ty_name = TypeContext {
             handle: var.ty,
             gctx: self.module.to_ctx(),
             names: self.names,
-            access: storage_access,
             first_time: false,
         };
 
@@ -1153,7 +1131,6 @@ impl<W: Write> Writer<W> {
                 handle: ty,
                 gctx: context.module.to_ctx(),
                 names: &self.names,
-                access: crate::StorageAccess::empty(),
                 first_time: false,
             };
             write!(
@@ -2046,7 +2023,6 @@ impl<W: Write> Writer<W> {
                     handle: ty,
                     gctx: module.to_ctx(),
                     names: &self.names,
-                    access: crate::StorageAccess::empty(),
                     first_time: false,
                 };
                 write!(self.out, "{ty_name} {{}}")?;
@@ -2056,7 +2032,6 @@ impl<W: Write> Writer<W> {
                     handle: ty,
                     gctx: module.to_ctx(),
                     names: &self.names,
-                    access: crate::StorageAccess::empty(),
                     first_time: false,
                 };
                 write!(self.out, "{ty_name}")?;
@@ -3799,7 +3774,6 @@ impl<W: Write> Writer<W> {
                     handle: ty_handle,
                     gctx: context.module.to_ctx(),
                     names: &self.names,
-                    access: crate::StorageAccess::empty(),
                     first_time: false,
                 };
                 write!(self.out, "{ty_name}")?;
@@ -4749,7 +4723,6 @@ impl<W: Write> Writer<W> {
                         handle: base,
                         gctx: module.to_ctx(),
                         names: &self.names,
-                        access: crate::StorageAccess::empty(),
                         first_time: false,
                     };
 
@@ -4804,7 +4777,6 @@ impl<W: Write> Writer<W> {
                                     handle: member.ty,
                                     gctx: module.to_ctx(),
                                     names: &self.names,
-                                    access: crate::StorageAccess::empty(),
                                     first_time: false,
                                 };
                                 writeln!(
@@ -4843,7 +4815,6 @@ impl<W: Write> Writer<W> {
                         handle,
                         gctx: module.to_ctx(),
                         names: &self.names,
-                        access: crate::StorageAccess::empty(),
                         first_time: true,
                     };
                     writeln!(self.out, "typedef {ty_name} {name};")?;
@@ -4942,7 +4913,6 @@ template <typename A>
                 handle: constant.ty,
                 gctx: module.to_ctx(),
                 names: &self.names,
-                access: crate::StorageAccess::empty(),
                 first_time: false,
             };
             let name = &self.names[&NameKey::Constant(handle)];
@@ -7000,7 +6970,6 @@ template <typename A>
                         handle: result.ty,
                         gctx: module.to_ctx(),
                         names: &self.names,
-                        access: crate::StorageAccess::empty(),
                         first_time: false,
                     };
                     write!(self.out, "{ty_name}")?;
@@ -7017,7 +6986,6 @@ template <typename A>
                     handle: arg.ty,
                     gctx: module.to_ctx(),
                     names: &self.names,
-                    access: crate::StorageAccess::empty(),
                     first_time: false,
                 };
                 let separator = separate(
@@ -7324,7 +7292,6 @@ template <typename A>
                         handle: ty,
                         gctx: module.to_ctx(),
                         names: &self.names,
-                        access: crate::StorageAccess::empty(),
                         first_time: false,
                     };
                     let resolved = options.resolve_local_binding(binding, in_mode)?;
@@ -7408,7 +7375,6 @@ template <typename A>
                             handle: ty,
                             gctx: module.to_ctx(),
                             names: &self.names,
-                            access: crate::StorageAccess::empty(),
                             first_time: true,
                         };
                         let binding = binding.ok_or_else(|| {
@@ -7558,7 +7524,6 @@ template <typename A>
                     handle: ty,
                     gctx: module.to_ctx(),
                     names: &self.names,
-                    access: crate::StorageAccess::empty(),
                     first_time: false,
                 };
 
@@ -7916,7 +7881,6 @@ template <typename A>
                         handle: module.global_variables[handle].ty,
                         gctx: module.to_ctx(),
                         names: &self.names,
-                        access: crate::StorageAccess::empty(),
                         first_time: false,
                     };
                     writeln!(
@@ -8254,7 +8218,6 @@ template <typename A>
                                 handle: arg.ty,
                                 gctx: module.to_ctx(),
                                 names: &self.names,
-                                access: crate::StorageAccess::empty(),
                                 first_time: false,
                             };
                             writeln!(
