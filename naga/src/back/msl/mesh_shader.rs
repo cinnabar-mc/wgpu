@@ -77,7 +77,6 @@ impl<W: core::fmt::Write> super::Writer<W> {
                     handle: member.ty,
                     gctx: module.to_ctx(),
                     names: &self.names,
-                    access: crate::StorageAccess::empty(),
                     first_time: true,
                 };
                 let binding = member

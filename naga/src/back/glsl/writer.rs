@@ -1267,20 +1267,13 @@ impl<'a, W: Write> Writer<'a, W> {
         self.write_slice(&arguments, |this, _, &(i, arg)| {
             // Write the argument type
             match this.module.types[arg.ty].inner {
-                // We treat images separately because they might require
-                // writing the storage format
                 TypeInner::Image {
                     dim,
                     arrayed,
                     class,
                 } => {
-                    // Write the storage format if needed
-                    if let TypeInner::Image {
-                        class: crate::ImageClass::Storage { format, .. },
-                        ..
-                    } = this.module.types[arg.ty].inner
-                    {
-                        write!(this.out, "layout({}) ", glsl_storage_format(format)?)?;
+                    if let crate::ImageClass::Storage { access, .. } = class {
+                        this.write_storage_access(access)?;
                     }
 
                     // write the type

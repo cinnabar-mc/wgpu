@@ -25,6 +25,10 @@ pub struct GlobalLookup {
 #[derive(Debug, Clone)]
 pub struct ParameterInfo {
     pub qualifier: ParameterQualifier,
+    /// Source memory restrictions, independent of the argument's native image type.
+    pub storage_access: Option<StorageAccess>,
+    /// Source restrict qualification retained for prototype agreement.
+    pub restrict: bool,
     /// Whether the parameter should be treated as a depth image instead of a
     /// sampled image.
     pub depth: bool,

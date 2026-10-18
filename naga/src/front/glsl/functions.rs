@@ -1,4 +1,5 @@
 use alloc::{
+    borrow::Cow,
     format,
     string::{String, ToString},
     vec,
@@ -567,20 +568,26 @@ impl Frontend {
         let mut variations =
             builtin_required_variations(args.iter().map(|&(expr, _)| ctx.get_type(expr)));
 
+        let builtin_alias = self.builtin_alias(&name);
+        let builtin_name = builtin_alias
+            .map_or(name.as_str(), |alias| alias.builtin.as_str())
+            .to_string();
+        let result_splat = builtin_alias.and_then(|alias| alias.result_splat);
+
         // Initiate the declaration if it wasn't previously initialized and inject builtins
         let declaration = self.lookup_function.entry(name.clone()).or_insert_with(|| {
             variations |= BuiltinVariations::STANDARD;
             Default::default()
         });
-        inject_builtin(declaration, ctx.module, &name, variations);
+        inject_builtin(declaration, ctx.module, &builtin_name, variations);
 
         // Borrow again but without mutability, at this point a declaration is guaranteed
         let declaration = self.lookup_function.get(&name).unwrap();
 
         // Possibly contains the overload to be used in the call
-        let mut maybe_overload = None;
+        let mut maybe_overload: Option<CallCandidate<'_>> = None;
         // Every viable overload with the conversions each argument needs to call it
-        let mut candidates: Vec<(&Overload, Vec<Conversion>)> = Vec::new();
+        let mut candidates: Vec<CallCandidate<'_>> = Vec::new();
 
         // Iterate over all the available overloads to select either an exact match or a
         // overload which has suitable implicit conversions
@@ -595,6 +602,7 @@ impl Frontend {
 
             // Stores whether the current overload matches exactly the function call
             let mut exact = true;
+            let mut native_match = true;
             // The conversions each argument needs to call the current overload
             let mut conversions = Vec::with_capacity(args.len());
 
@@ -602,17 +610,24 @@ impl Frontend {
                 let call_argument = &args[i];
                 let parameter_info = &overload.parameters_info[i];
 
-                // If the image is used in the overload as a depth texture convert it
-                // before comparing, otherwise exact matches wouldn't be reported
-                if parameter_info.depth {
-                    sampled_to_depth(ctx, call_argument.0, call_argument.1, &mut self.errors);
-                    ctx.invalidate_expression(call_argument.0, call_argument.1)?
+                if !overload.internal
+                    && ctx
+                        .get_type_resolution(call_argument.0)
+                        .handle()
+                        .is_some_and(|call_type| {
+                            !self.same_logical_type(ctx.module, *overload_parameter, call_type)
+                        })
+                {
+                    continue 'outer;
                 }
 
-                ctx.typifier_grow(call_argument.0, call_argument.1)?;
-
-                let overload_param_ty = &ctx.module.types[*overload_parameter].inner;
-                let call_arg_ty = ctx.get_type(call_argument.0);
+                let Some((overload_param_ty, call_arg_ty)) =
+                    overload_argument_types(ctx.module, overload, i, ctx.get_type(call_argument.0))
+                else {
+                    continue 'outer;
+                };
+                let overload_param_ty = overload_param_ty.as_ref();
+                let call_arg_ty = call_arg_ty.as_ref();
 
                 log::trace!(
                     "Testing parameter {i}\n\tOverload = {overload_param_ty:?}\n\tCall = {call_arg_ty:?}"
@@ -654,21 +669,9 @@ impl Frontend {
                         continue 'outer;
                     }
 
-                    // While storage access mismatch is an error it isn't one that causes
-                    // the overload matching to fail so we defer the error and consider
-                    // that the images match exactly
-                    if !call_access.contains(overload_access) {
-                        self.errors.push(Error {
-                            kind: ErrorKind::SemanticError(
-                                format!(
-                                    "'{name}': image needs {overload_access:?} access but only {call_access:?} was provided"
-                                )
-                                .into(),
-                            ),
-                            meta,
-                        });
-                    }
+                    native_match &= overload.internal || overload_access == call_access;
 
+                    // Access is diagnosed only after the complete overload is selected.
                     // The images satisfy the conditions to be considered as an exact match
                     conversions.push(Conversion::Exact);
                     continue;
@@ -713,26 +716,37 @@ impl Frontend {
                 exact = false;
             }
 
-            // The overload matches exactly the function call so there's no ambiguity (since
-            // repeated overload aren't allowed) and the current overload is selected, no
-            // further querying is needed.
+            // Registered physical variants may coexist with a generic native candidate.
+            // Preserve the matching source definition when it overrides that candidate.
+            let candidate = CallCandidate {
+                overload,
+                conversions,
+                native_match,
+            };
             if exact {
-                maybe_overload = Some(overload);
+                if maybe_overload
+                    .as_ref()
+                    .is_none_or(|previous| candidate.prefers(previous, ctx, &args))
+                {
+                    maybe_overload = Some(candidate);
+                }
                 candidates.clear();
-                break;
+            } else if maybe_overload.is_none() {
+                candidates.push(candidate);
             }
-
-            candidates.push((overload, conversions));
         }
 
         // Without an exact match, the GLSL rules (4.60 § 6.1) select the overload
         // that is better than every other viable overload: one that needs a better
         // conversion for at least one argument and a worse one for none.
         if !candidates.is_empty() {
-            let best = candidates.iter().position(|(_, a)| {
-                candidates
-                    .iter()
-                    .all(|(_, b)| core::ptr::eq(a, b) || is_better_overload(a, b))
+            let best = candidates.iter().position(|candidate| {
+                candidates.iter().all(|other| {
+                    core::ptr::eq(candidate, other)
+                        || is_better_overload(&candidate.conversions, &other.conversions)
+                        || (candidate.conversions == other.conversions
+                            && candidate.prefers(other, ctx, &args))
+                })
             });
 
             if best.is_none() {
@@ -746,13 +760,23 @@ impl Frontend {
 
             // In case of ambiguity still pick an overload so that parsing continues and
             // further errors are collected.
-            maybe_overload = Some(candidates[best.unwrap_or(0)].0);
+            maybe_overload = Some(candidates.swap_remove(best.unwrap_or(0)));
         }
 
-        let overload = maybe_overload.ok_or_else(|| Error {
+        let candidate = maybe_overload.ok_or_else(|| Error {
             kind: ErrorKind::SemanticError(format!("Unknown function '{name}'").into()),
             meta,
         })?;
+
+        if !candidate.native_match {
+            self.errors.push(Error {
+                kind: ErrorKind::SemanticError(
+                    "Image argument has no matching native parameter variant".into(),
+                ),
+                meta,
+            });
+        }
+        let overload = candidate.overload;
 
         let parameters_info = overload.parameters_info.clone();
         let parameters = overload.parameters.clone();
@@ -769,6 +793,47 @@ impl Frontend {
             .zip(raw_args)
             .zip(&parameters)
         {
+            if parameter_info.depth
+                && matches!(
+                    *ctx.get_type(call_argument.0),
+                    TypeInner::Image {
+                        class: crate::ImageClass::Sampled { .. },
+                        ..
+                    }
+                )
+            {
+                sampled_to_depth(ctx, call_argument.0, call_argument.1, &mut self.errors);
+                ctx.invalidate_expression(call_argument.0, call_argument.1)?;
+                ctx.typifier_grow(call_argument.0, call_argument.1)?;
+            }
+            if let (
+                &TypeInner::Image {
+                    class:
+                        crate::ImageClass::Storage {
+                            access: required, ..
+                        },
+                    ..
+                },
+                &TypeInner::Image {
+                    class:
+                        crate::ImageClass::Storage {
+                            access: provided, ..
+                        },
+                    ..
+                },
+            ) = (
+                &ctx.module.types[*parameter].inner,
+                ctx.get_type(call_argument.0),
+            ) {
+                let required = parameter_info.storage_access.unwrap_or(required);
+                let provided = ctx.image_access(call_argument.0).unwrap_or(provided);
+                if !provided.contains(required) {
+                    self.errors.push(Error {
+                        kind: ErrorKind::SemanticError(format!("'{name}': image needs {required:?} access but only {provided:?} was provided").into()),
+                        meta,
+                    });
+                }
+            }
             if parameter_info.qualifier.is_lhs() {
                 // Reprocess argument in LHS position
                 let (handle, meta) = ctx.lower_expect_inner(stmt, self, *expr, ExprPos::Lhs)?;
@@ -825,7 +890,13 @@ impl Frontend {
             // Builtins with `out` parameters (`modf`, `frexp`) store to their
             // arguments, which may also need proxy writes.
             FunctionKind::Macro(builtin) => {
-                builtin.call(self, ctx, arguments.as_mut_slice(), meta)?
+                let result = builtin.call(self, ctx, arguments.as_mut_slice(), meta)?;
+                match (result, result_splat) {
+                    (Some(value), Some(size)) => {
+                        Some(ctx.add_expression(Expression::Splat { size, value }, meta)?)
+                    }
+                    _ => result,
+                }
             }
         };
 
@@ -1043,12 +1114,18 @@ impl Frontend {
                 .map(|&arg| &ctx.module.types[arg].inner),
         );
 
+        let builtin_alias = self.builtin_alias(&name);
+        let builtin_name = builtin_alias
+            .map_or(name.as_str(), |alias| alias.builtin.as_str())
+            .to_string();
+
         // Initiate the declaration if it wasn't previously initialized and inject builtins
+        let logical_types = &self.logical_types;
         let declaration = self.lookup_function.entry(name.clone()).or_insert_with(|| {
             variations |= BuiltinVariations::STANDARD;
             Default::default()
         });
-        inject_builtin(declaration, ctx.module, &name, variations);
+        inject_builtin(declaration, ctx.module, &builtin_name, variations);
 
         let Context {
             expressions,
@@ -1073,7 +1150,7 @@ impl Frontend {
         };
 
         'outer: for decl in declaration.overloads.iter_mut() {
-            if parameters.len() != decl.parameters.len() {
+            if decl.internal || parameters.len() != decl.parameters.len() {
                 continue;
             }
 
@@ -1081,7 +1158,14 @@ impl Frontend {
                 let new_inner = &module.types[*new_parameter].inner;
                 let old_inner = &module.types[*old_parameter].inner;
 
-                if new_inner != old_inner {
+                if new_inner != old_inner
+                    || !super::configuration::same_logical_type(
+                        logical_types,
+                        module,
+                        *new_parameter,
+                        *old_parameter,
+                    )
+                {
                     continue 'outer;
                 }
             }
@@ -1092,16 +1176,24 @@ impl Frontend {
                     meta,
                 });
             }
+            if let Err(error) =
+                check_source_declaration(decl, &function, &parameters_info, module, meta)
+            {
+                return self.errors.push(error);
+            }
 
             decl.defined = true;
+            decl.parameters = parameters;
             decl.parameters_info = parameters_info;
             match decl.kind {
-                FunctionKind::Call(handle) => *module.functions.get_mut(handle) = function,
+                FunctionKind::Call(handle) => {
+                    *module.functions.get_mut(handle) = function;
+                }
                 FunctionKind::Macro(_) => {
                     let handle = module.functions.append(function, meta);
-                    decl.kind = FunctionKind::Call(handle)
+                    decl.kind = FunctionKind::Call(handle);
                 }
-            }
+            };
             return;
         }
 
@@ -1114,6 +1206,84 @@ impl Frontend {
             internal: false,
             void,
         });
+    }
+
+    /// Unifies native image views across selected calls, including pending global calls.
+    pub(crate) fn resolve_depth_calls(&mut self, ctx: &mut Context) -> Result<()> {
+        let mut edges: crate::FastHashMap<ImageVariable, Vec<ImageVariable>> =
+            crate::FastHashMap::default();
+        let mut connect = |caller, expressions: &crate::Arena<Expression>, body: &Block| {
+            visit_calls(body, &mut |callee, arguments| {
+                for (index, &argument) in arguments.iter().enumerate() {
+                    let formal = ImageVariable::Argument(callee, index as u32);
+                    let Some(actual) =
+                        ImageVariable::from_expression(&expressions[argument], caller)
+                    else {
+                        continue;
+                    };
+                    if [actual, formal].iter().all(|node| {
+                        super::types::image_depth_type(&ctx.module.types[node.ty(ctx.module)].inner)
+                            .is_some()
+                    }) {
+                        edges.entry(actual).or_default().push(formal);
+                        edges.entry(formal).or_default().push(actual);
+                    }
+                }
+            });
+        };
+        for (handle, function) in ctx.module.functions.iter() {
+            connect(Some(handle), &function.expressions, &function.body);
+        }
+        connect(None, &ctx.expressions, &ctx.body);
+
+        let mut pending: Vec<_> = edges
+            .keys()
+            .copied()
+            .filter(|node| {
+                matches!(
+                    ctx.module.types[node.ty(ctx.module)].inner,
+                    TypeInner::Image {
+                        class: crate::ImageClass::Depth { .. },
+                        ..
+                    }
+                )
+            })
+            .collect();
+        let mut depth_variables = crate::FastHashSet::default();
+        while let Some(node) = pending.pop() {
+            if !depth_variables.insert(node) {
+                continue;
+            }
+            let ty = node.ty(ctx.module);
+            let meta = ctx.module.types.get_span(ty);
+            let depth = super::types::promote_depth_type(&mut ctx.module.types, ty, meta)?;
+            match node {
+                ImageVariable::Global(handle) => {
+                    ctx.module.global_variables.get_mut(handle).ty = depth
+                }
+                ImageVariable::Argument(function, index) => {
+                    ctx.module.functions.get_mut(function).arguments[index as usize].ty = depth;
+                }
+            }
+            if let Some(neighbors) = edges.get(&node) {
+                pending.extend(neighbors.iter().copied());
+            }
+        }
+        for declaration in self.lookup_function.values_mut() {
+            for overload in &mut declaration.overloads {
+                if let FunctionKind::Call(function) = overload.kind {
+                    for (index, parameter) in overload.parameters_info.iter_mut().enumerate() {
+                        parameter.depth |= depth_variables
+                            .contains(&ImageVariable::Argument(function, index as u32));
+                    }
+                }
+            }
+        }
+        if !depth_variables.is_empty() {
+            ctx.typifier.reset();
+            ctx.const_typifier.reset();
+        }
+        Ok(())
     }
 
     pub(crate) fn add_prototype(
@@ -1132,12 +1302,18 @@ impl Frontend {
                 .map(|&arg| &ctx.module.types[arg].inner),
         );
 
+        let builtin_alias = self.builtin_alias(&name);
+        let builtin_name = builtin_alias
+            .map_or(name.as_str(), |alias| alias.builtin.as_str())
+            .to_string();
+
         // Initiate the declaration if it wasn't previously initialized and inject builtins
+        let logical_types = &self.logical_types;
         let declaration = self.lookup_function.entry(name.clone()).or_insert_with(|| {
             variations |= BuiltinVariations::STANDARD;
             Default::default()
         });
-        inject_builtin(declaration, ctx.module, &name, variations);
+        inject_builtin(declaration, ctx.module, &builtin_name, variations);
 
         let Context {
             arguments,
@@ -1155,7 +1331,7 @@ impl Frontend {
         };
 
         'outer: for decl in declaration.overloads.iter() {
-            if parameters.len() != decl.parameters.len() {
+            if decl.internal || parameters.len() != decl.parameters.len() {
                 continue;
             }
 
@@ -1163,26 +1339,43 @@ impl Frontend {
                 let new_inner = &module.types[*new_parameter].inner;
                 let old_inner = &module.types[*old_parameter].inner;
 
-                if new_inner != old_inner {
+                if new_inner != old_inner
+                    || !super::configuration::same_logical_type(
+                        logical_types,
+                        module,
+                        *new_parameter,
+                        *old_parameter,
+                    )
+                {
                     continue 'outer;
                 }
             }
 
-            return self.errors.push(Error {
-                kind: ErrorKind::SemanticError("Prototype already defined".into()),
-                meta,
-            });
+            if let Err(error) =
+                check_source_declaration(decl, &function, &parameters_info, module, meta)
+            {
+                self.errors.push(error);
+            }
+            return;
         }
 
         let handle = module.functions.append(function, meta);
-        declaration.overloads.push(Overload {
-            parameters,
-            parameters_info,
-            kind: FunctionKind::Call(handle),
-            defined: false,
-            internal: false,
-            void,
-        });
+        let position = declaration
+            .overloads
+            .iter()
+            .position(|overload| overload.internal)
+            .unwrap_or(declaration.overloads.len());
+        declaration.overloads.insert(
+            position,
+            Overload {
+                parameters,
+                parameters_info,
+                kind: FunctionKind::Call(handle),
+                defined: false,
+                internal: false,
+                void,
+            },
+        );
     }
 
     /// Create a Naga [`EntryPoint`] that calls the GLSL `main` function.
@@ -1499,6 +1692,213 @@ impl Context<'_> {
 
         Ok(())
     }
+}
+
+/// Visits selected calls in nested blocks without following the call graph recursively.
+fn visit_calls(block: &Block, visit: &mut impl FnMut(Handle<Function>, &[Handle<Expression>])) {
+    for statement in block.iter() {
+        match *statement {
+            Statement::Call {
+                function,
+                ref arguments,
+                ..
+            } => visit(function, arguments),
+            Statement::Block(ref block) => visit_calls(block, visit),
+            Statement::If {
+                ref accept,
+                ref reject,
+                ..
+            } => {
+                visit_calls(accept, visit);
+                visit_calls(reject, visit);
+            }
+            Statement::Switch { ref cases, .. } => {
+                for case in cases {
+                    visit_calls(&case.body, visit);
+                }
+            }
+            Statement::Loop {
+                ref body,
+                ref continuing,
+                ..
+            } => {
+                visit_calls(body, visit);
+                visit_calls(continuing, visit);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// A native resource location shared by actual arguments and selected formal parameters.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum ImageVariable {
+    Global(Handle<crate::GlobalVariable>),
+    Argument(Handle<Function>, u32),
+}
+
+impl ImageVariable {
+    /// Finds the resource location denoted by an opaque argument expression.
+    fn from_expression(expression: &Expression, caller: Option<Handle<Function>>) -> Option<Self> {
+        match *expression {
+            Expression::GlobalVariable(global) => Some(Self::Global(global)),
+            Expression::FunctionArgument(index) => {
+                caller.map(|function| Self::Argument(function, index))
+            }
+            _ => None,
+        }
+    }
+
+    /// Reads a location's committed native type without changing its declared source type.
+    fn ty(self, module: &crate::Module) -> Handle<Type> {
+        match self {
+            Self::Global(global) => module.global_variables[global].ty,
+            Self::Argument(function, index) => {
+                module.functions[function].arguments[index as usize].ty
+            }
+        }
+    }
+}
+
+/// Derives both prospective native views from a declared parameter and the actual argument.
+fn overload_argument_types<'a>(
+    module: &'a crate::Module,
+    overload: &Overload,
+    index: usize,
+    argument: &'a TypeInner,
+) -> Option<(Cow<'a, TypeInner>, Cow<'a, TypeInner>)> {
+    let parameter = &module.types[overload.parameters[index]].inner;
+    let depth = overload.parameters_info[index].depth
+        || (!overload.internal
+            && matches!(
+                argument,
+                TypeInner::Image {
+                    class: crate::ImageClass::Depth { .. },
+                    ..
+                }
+            ));
+    if depth {
+        Some((
+            Cow::Owned(super::types::image_depth_type(parameter)?),
+            Cow::Owned(super::types::image_depth_type(argument)?),
+        ))
+    } else {
+        Some((Cow::Borrowed(parameter), Cow::Borrowed(argument)))
+    }
+}
+
+/// Checks repeated source declarations without replacing the stored result or definition.
+fn check_source_declaration(
+    declaration: &Overload,
+    function: &Function,
+    parameters_info: &[ParameterInfo],
+    module: &crate::Module,
+    meta: Span,
+) -> Result<()> {
+    if declaration
+        .parameters_info
+        .iter()
+        .zip(parameters_info)
+        .any(|(old, new)| {
+            old.qualifier != new.qualifier
+                || old.storage_access != new.storage_access
+                || old.restrict != new.restrict
+        })
+    {
+        return Err(Error {
+            kind: ErrorKind::SemanticError(
+                "Function parameter qualifiers must match the declaration".into(),
+            ),
+            meta,
+        });
+    }
+    if let FunctionKind::Call(handle) = declaration.kind {
+        if module.functions[handle].result.as_ref().map(|r| r.ty)
+            != function.result.as_ref().map(|r| r.ty)
+        {
+            return Err(Error {
+                kind: ErrorKind::SemanticError(
+                    "Function return type must match the declaration".into(),
+                ),
+                meta,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// A source/value match and the concrete native compatibility of its image arguments.
+struct CallCandidate<'a> {
+    overload: &'a Overload,
+    conversions: Vec<Conversion>,
+    native_match: bool,
+}
+
+impl CallCandidate<'_> {
+    /// Prefers source declarations, then native-compatible views of the same source signature.
+    fn prefers(
+        &self,
+        other: &Self,
+        ctx: &Context,
+        arguments: &[(Handle<Expression>, Span)],
+    ) -> bool {
+        !self.overload.internal
+            && (other.overload.internal || (self.native_match && !other.native_match))
+            && same_overload_signature(ctx, self.overload, other.overload, arguments)
+    }
+}
+
+/// Compares declared signatures first, then native views with generic builtin formats.
+fn same_overload_signature(
+    ctx: &Context,
+    source: &Overload,
+    builtin: &Overload,
+    arguments: &[(Handle<Expression>, Span)],
+) -> bool {
+    let module = &ctx.module;
+    let generic_formats = builtin.internal;
+    source.parameters.len() == builtin.parameters.len()
+        && source
+            .parameters
+            .iter()
+            .zip(&builtin.parameters)
+            .enumerate()
+            .all(|(index, (source_type, builtin_type))| {
+                if module.types[*source_type].inner == module.types[*builtin_type].inner {
+                    return true;
+                }
+                let argument = ctx.get_type(arguments[index].0);
+                let Some((source, _)) = overload_argument_types(module, source, index, argument)
+                else {
+                    return false;
+                };
+                let Some((builtin, _)) = overload_argument_types(module, builtin, index, argument)
+                else {
+                    return false;
+                };
+                let source = source.as_ref();
+                let builtin = builtin.as_ref();
+                match (source, builtin) {
+                    (
+                        &TypeInner::Image {
+                            dim: a,
+                            arrayed: aa,
+                            class: crate::ImageClass::Storage { format: af, .. },
+                        },
+                        &TypeInner::Image {
+                            dim: b,
+                            arrayed: ba,
+                            class: crate::ImageClass::Storage { format: bf, .. },
+                        },
+                    ) => {
+                        a == b
+                            && aa == ba
+                            && (af == bf
+                                || (generic_formats && Scalar::from(af) == Scalar::from(bf)))
+                    }
+                    _ => source == builtin,
+                }
+            })
 }
 
 /// Helper enum containing the type of conversion need for a call

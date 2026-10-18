@@ -652,6 +652,90 @@ fn constants() {
     assert!(constants.next().is_none());
 }
 
+/// Checks return-type agreement when a definition replaces its prototype.
+#[test]
+fn prototype_return_types() {
+    let mut accepted = Vec::new();
+    for (declared, defined, body) in [
+        ("float", "void", ""),
+        ("void", "float", "return 1.0;"),
+        ("float", "int", "return 1;"),
+        ("A", "B", "return B(1.0);"),
+    ] {
+        let declaration = alloc::format!("{declared} f();");
+        let definition = alloc::format!("{defined} f() {{ {body} }}");
+        for statements in [
+            alloc::format!("{declaration}\n{definition}"),
+            alloc::format!("{definition}\n{declaration}"),
+            alloc::format!("{declaration}\n{defined} f();\n{definition}"),
+        ] {
+            let source = alloc::format!(
+                "#version 450\nstruct A {{ float x; }};\nstruct B {{ float x; }};\n{statements}\nvoid main() {{ f(); }}"
+            );
+            match Frontend::default().parse(&Options::from(ShaderStage::Fragment), &source) {
+                Ok(_) => accepted.push(statements),
+                Err(error) => assert!(
+                    error.emit_to_string(&source).contains("return type"),
+                    "{error}"
+                ),
+            }
+        }
+    }
+    assert!(
+        accepted.is_empty(),
+        "conflicting returns accepted: {accepted:?}"
+    );
+    for (result, body) in [("void", ""), ("float", "return 1.0;")] {
+        let source = alloc::format!(
+            "#version 450\n{result} f();\nvoid forward() {{ f(); }}\n{result} f() {{ {body} }}\nvoid main() {{ forward(); f(); }}"
+        );
+        let module = Frontend::default()
+            .parse(&Options::from(ShaderStage::Fragment), &source)
+            .unwrap();
+        crate::valid::Validator::new(
+            crate::valid::ValidationFlags::all(),
+            crate::valid::Capabilities::all(),
+        )
+        .validate(&module)
+        .unwrap();
+    }
+}
+
+/// Keeps compatible repeated and later prototypes linked to the same definition.
+#[test]
+fn prototype_redeclarations_preserve_definitions() {
+    for (result, body) in [
+        ("void", ""),
+        ("float", "return 1.0;"),
+        ("A", "return A(1.0);"),
+    ] {
+        for repeated in [false, true] {
+            let declaration = alloc::format!("{result} f();");
+            let earlier = if repeated { declaration.as_str() } else { "" };
+            let source = alloc::format!(
+                "#version 450\nstruct A {{ float x; }};\n{declaration}\n{earlier}\nvoid forward() {{ f(); }}\n{result} f() {{ {body} }}\n{declaration}\nvoid main() {{ forward(); f(); }}"
+            );
+            let module = Frontend::default()
+                .parse(&Options::from(ShaderStage::Fragment), &source)
+                .unwrap_or_else(|error| panic!("{}", error.emit_to_string(&source)));
+            crate::valid::Validator::new(
+                crate::valid::ValidationFlags::all(),
+                crate::valid::Capabilities::all(),
+            )
+            .validate(&module)
+            .unwrap();
+            assert_eq!(
+                module
+                    .functions
+                    .iter()
+                    .filter(|&(_, f)| f.name.as_deref() == Some("f"))
+                    .count(),
+                1
+            );
+        }
+    }
+}
+
 #[test]
 fn function_overloading() {
     let mut frontend = Frontend::default();

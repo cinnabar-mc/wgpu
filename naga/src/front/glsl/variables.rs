@@ -585,7 +585,7 @@ impl Frontend {
 
                                 ty = ctx.module.types.insert(
                                     Type {
-                                        name: None,
+                                        name: ctx.module.types[ty].name.clone(),
                                         inner: TypeInner::Image {
                                             dim,
                                             arrayed,

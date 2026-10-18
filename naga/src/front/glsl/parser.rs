@@ -167,6 +167,7 @@ impl<'source> ParsingContext<'source> {
 
     pub fn parse(&mut self, frontend: &mut Frontend) -> Result<Module> {
         let mut module = Module::default();
+        frontend.register_types(&mut module)?;
         let mut global_expression_kind_tracker = crate::proc::ExpressionKindTracker::new();
 
         // Body and expression arena for global initialization
@@ -180,6 +181,7 @@ impl<'source> ParsingContext<'source> {
         while self.peek(frontend).is_some() {
             self.parse_external_declaration(frontend, &mut ctx)?;
         }
+        frontend.resolve_depth_calls(&mut ctx)?;
 
         // Add an `EntryPoint` to `parser.module` for `main`, if a
         // suitable overload exists. Error out if we can't find one.

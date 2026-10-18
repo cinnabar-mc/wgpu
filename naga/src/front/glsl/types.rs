@@ -2,9 +2,53 @@ use alloc::format;
 
 use super::{context::Context, Error, ErrorKind, Result, Span};
 use crate::{
-    proc::ResolveContext, Expression, Handle, ImageClass, ImageDimension, Scalar, ScalarKind, Type,
-    TypeInner, VectorSize,
+    proc::{ResolveContext, TypeResolution},
+    Expression, Handle, ImageClass, ImageDimension, Scalar, ScalarKind, Type, TypeInner,
+    VectorSize,
 };
+
+/// Computes the native depth view of a floating-point texture without mutation.
+pub(super) const fn image_depth_type(ty: &TypeInner) -> Option<TypeInner> {
+    match *ty {
+        TypeInner::Image {
+            dim,
+            arrayed,
+            class:
+                ImageClass::Sampled {
+                    kind: ScalarKind::Float,
+                    multi,
+                }
+                | ImageClass::Depth { multi },
+        } => Some(TypeInner::Image {
+            dim,
+            arrayed,
+            class: ImageClass::Depth { multi },
+        }),
+        _ => None,
+    }
+}
+
+/// Commits the shared depth view while retaining the declared type name.
+pub(super) fn promote_depth_type(
+    types: &mut crate::UniqueArena<Type>,
+    ty: Handle<Type>,
+    meta: Span,
+) -> Result<Handle<Type>> {
+    let inner = image_depth_type(&types[ty].inner).ok_or_else(|| Error {
+        kind: ErrorKind::SemanticError("Not a floating-point texture".into()),
+        meta,
+    })?;
+    if inner == types[ty].inner {
+        return Ok(ty);
+    }
+    Ok(types.insert(
+        Type {
+            name: types[ty].name.clone(),
+            inner,
+        },
+        meta,
+    ))
+}
 
 pub fn parse_type(type_name: &str) -> Option<Type> {
     match type_name {
@@ -253,14 +297,48 @@ impl Context<'_> {
             })
     }
 
-    pub(crate) fn get_type(&self, expr: Handle<Expression>) -> &TypeInner {
+    /// Returns a grown expression's resolution from its active constant or runtime arena.
+    pub(crate) fn get_type_resolution(&self, expr: Handle<Expression>) -> &TypeResolution {
         let typifier = if self.is_const {
             &self.const_typifier
         } else {
             &self.typifier
         };
+        &typifier[expr]
+    }
 
-        typifier.get(expr, &self.module.types)
+    /// Returns the native type of an expression already resolved in the active arena.
+    pub(crate) fn get_type(&self, expr: Handle<Expression>) -> &TypeInner {
+        self.get_type_resolution(expr)
+            .inner_with(&self.module.types)
+    }
+
+    /// Returns native image access narrowed by its originating source parameter.
+    pub(crate) fn image_access(&self, expr: Handle<Expression>) -> Option<crate::StorageAccess> {
+        let TypeInner::Image {
+            class: ImageClass::Storage { access, .. },
+            ..
+        } = *self.get_type(expr)
+        else {
+            return None;
+        };
+        let mut origin = expr;
+        loop {
+            match self[origin] {
+                Expression::Access { base, .. } | Expression::AccessIndex { base, .. } => {
+                    origin = base
+                }
+                Expression::FunctionArgument(index) => {
+                    return Some(
+                        access
+                            & self.parameters_info[index as usize]
+                                .storage_access
+                                .unwrap_or(access),
+                    );
+                }
+                _ => return Some(access),
+            }
+        }
     }
 
     /// Gets the type for the result of the `expr` expression

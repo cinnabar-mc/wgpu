@@ -11,6 +11,9 @@ Backend functions that export shader [`Module`](super::Module)s into binary and 
 
 use alloc::string::String;
 
+#[cfg(all(test, feature = "wgsl-in"))]
+mod resource_tests;
+
 #[cfg(dot_out)]
 pub mod dot;
 #[cfg(glsl_out)]
