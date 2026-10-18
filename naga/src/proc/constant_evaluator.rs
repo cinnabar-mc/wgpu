@@ -1765,34 +1765,30 @@ impl<'a> ConstantEvaluator<'a> {
                     }])),
                 })
             }
-            crate::MathFunction::Mix => {
-                component_wise_float!(
-                    self,
-                    span,
-                    [arg, arg1.unwrap(), arg2.unwrap()],
-                    |x, y, a| {
-                        let mut one = a;
-                        one.set_one();
-                        Ok([x * (one - a) + y * a])
-                    }
-                )
-                .map_err(|e| not_implemented_shape(e, fun))
-            }
-            crate::MathFunction::SmoothStep => {
-                component_wise_float!(
-                    self,
-                    span,
-                    [arg, arg1.unwrap(), arg2.unwrap()],
-                    |edge0, edge1, x| {
-                        let mut one = x;
-                        one.set_one();
-                        let t = ((x - edge0) / (edge1 - edge0)).max(one - one).min(one);
-                        let two = one + one;
-                        Ok([t * t * (two + one - two * t)])
-                    }
-                )
-                .map_err(|e| not_implemented_shape(e, fun))
-            }
+            crate::MathFunction::Mix => component_wise_float!(
+                self,
+                span,
+                [arg, arg1.unwrap(), arg2.unwrap()],
+                |x, y, a| {
+                    let mut one = a;
+                    one.set_one();
+                    Ok([x * (one - a) + y * a])
+                }
+            )
+            .map_err(|e| not_implemented_shape(e, fun)),
+            crate::MathFunction::SmoothStep => component_wise_float!(
+                self,
+                span,
+                [arg, arg1.unwrap(), arg2.unwrap()],
+                |edge0, edge1, x| {
+                    let mut one = x;
+                    one.set_one();
+                    let t = ((x - edge0) / (edge1 - edge0)).max(one - one).min(one);
+                    let two = one + one;
+                    Ok([t * t * (two + one - two * t)])
+                }
+            )
+            .map_err(|e| not_implemented_shape(e, fun)),
             crate::MathFunction::Sqrt => {
                 component_wise_float!(self, span, [arg], |e| {
                     if e >= Zero::zero() {

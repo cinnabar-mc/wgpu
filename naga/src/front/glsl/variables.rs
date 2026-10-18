@@ -418,7 +418,9 @@ impl Frontend {
             // (`f.x`, `f.rr`, `f.sss`).
             TypeInner::Scalar(_)
                 if (1..=4).contains(&name.len())
-                    && ['x', 'r', 's'].iter().any(|&c| name.chars().all(|n| n == c)) =>
+                    && ['x', 'r', 's']
+                        .iter()
+                        .any(|&c| name.chars().all(|n| n == c)) =>
             {
                 let size = match name.len() {
                     1 => {
