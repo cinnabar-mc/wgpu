@@ -493,6 +493,29 @@ mod regressions {
         (module, info)
     }
 
+    /// Creates a float-texture source view or its ordinary native control.
+    fn sampled_configuration(configured: bool) -> Configuration {
+        Configuration {
+            opaque_types: if configured {
+                alloc::vec![OpaqueType {
+                    name: "Tex".into(),
+                    logical_name: "sourceTexture".into(),
+                    inner: TypeInner::Image {
+                        dim: ImageDimension::D2,
+                        arrayed: false,
+                        class: ImageClass::Sampled {
+                            kind: ScalarKind::Float,
+                            multi: false
+                        },
+                    },
+                }]
+            } else {
+                Vec::new()
+            },
+            ..Configuration::default()
+        }
+    }
+
     #[test]
     fn configured_native_definitions_retain_builtin_candidates() {
         let configuration = Configuration {
@@ -573,6 +596,56 @@ mod regressions {
     }
 
     #[test]
+    fn configured_depth_projection_overrides_preserve_source_preference() {
+        let mut configuration = sampled_configuration(true);
+        configuration.functions.push(FunctionAlias {
+            name: "family".into(),
+            builtin: "textureProj".into(),
+            result_splat: None,
+        });
+        for prototype in ["float family(Tex t,vec4 p);", ""] {
+            let source = alloc::format!(
+                r#"#version 450
+                layout(binding=0) uniform Tex source;
+                layout(binding=1) uniform samplerShadow comparison;
+                layout(binding=2) uniform sampler filtering;
+                {prototype}
+                float family(Tex t,vec4 p) {{ return textureProj(sampler2DShadow(t,comparison),p); }}
+                layout(location=0) out vec4 color;
+                void main() {{ color=vec4(family(sampler2D(source,filtering),vec4(0.5)))+vec4(family(sampler2D(source,filtering),ivec4(1))); }}
+            "#
+            );
+            let (module, _) = parse(&source, &configuration);
+            let main = module
+                .functions
+                .iter()
+                .find(|&(_, f)| f.name.as_deref() == Some("main"))
+                .unwrap()
+                .1;
+            assert_eq!(main.expressions.iter().filter(|&(_, expression)| matches!(
+                expression,
+                crate::Expression::CallResult(callee) if module.functions[*callee].name.as_deref() == Some("family")
+            )).count(), 2, "source override lost with prototype={prototype:?}");
+        }
+    }
+
+    #[test]
+    fn native_depth_promotion_rejects_integer_images() {
+        let source = r#"#version 450
+            layout(binding=0) uniform utexture2D source;
+            layout(binding=1) uniform samplerShadow comparison;
+            float read(texture2D t) { return texture(sampler2DShadow(t,comparison),vec3(0.5)); }
+            layout(location=0) out vec4 color;
+            void main() { color=vec4(read(source)); }
+        "#;
+        let error = Frontend::default()
+            .parse(&super::super::Options::from(ShaderStage::Fragment), source)
+            .unwrap_err()
+            .emit_to_string(source);
+        assert!(error.contains("Unknown function 'read'"), "{error}");
+    }
+
+    #[test]
     fn configured_opaque_overloads_match_complete_native_access() {
         let accesses = [
             StorageAccess::LOAD,
@@ -625,29 +698,16 @@ mod regressions {
     #[test]
     fn configured_depth_promotion_retains_source_signatures() {
         for configured in [true, false] {
-            let configuration = Configuration {
-                opaque_types: if configured {
-                    alloc::vec![OpaqueType {
-                        name: "Tex".into(),
-                        logical_name: "sourceTexture".into(),
-                        inner: TypeInner::Image {
-                            dim: ImageDimension::D2,
-                            arrayed: false,
-                            class: ImageClass::Sampled {
-                                kind: ScalarKind::Float,
-                                multi: false,
-                            },
-                        },
-                    }]
-                } else {
-                    Vec::new()
-                },
-                ..Configuration::default()
-            };
+            let configuration = sampled_configuration(configured);
             let ty = if configured { "Tex" } else { "texture2D" };
-            for prototype in [false, true] {
-                let declaration = if prototype {
-                    alloc::format!("float choose({ty});")
+            for prototype in 0..3 {
+                let declaration = if prototype != 0 {
+                    let repeated = if prototype == 2 {
+                        alloc::format!("float choose({ty});")
+                    } else {
+                        String::new()
+                    };
+                    alloc::format!("float choose({ty});\nfloat forward({ty} image,float x) {{ float value=0.0; if(x>0.0) {{value=choose(image);}} else {{value=choose(image);}} for(int i=0;i<1;i++) {{value+=choose(image);}} switch(int(x)) {{case 1:value+=choose(image);break;default:break;}} return value; }}\n{repeated}\nfloat transit({ty} image) {{ return forward(image,1); }}")
                 } else {
                     String::new()
                 };
@@ -659,8 +719,13 @@ mod regressions {
                     float choose({ty} image) {{ return texture(sampler2DShadow(image,comparison),vec3(0.5)); }}
                     float nested({ty} image) {{ return choose(image); }}
                     layout(location=0) out vec4 color;
-                    void main() {{ color=vec4(nested(source)+nested(source)+choose(source)); }}
-                "#
+                    void main() {{ color=vec4({calls}); }}
+                "#,
+                    calls = if prototype != 0 {
+                        "transit(source)+transit(source)+nested(source)+choose(source)"
+                    } else {
+                        "nested(source)+nested(source)+choose(source)"
+                    }
                 );
                 let (module, _) = parse(&source, &configuration);
                 for (_, function) in module.functions.iter() {
@@ -679,6 +744,72 @@ mod regressions {
                     }
                 }
             }
+        }
+    }
+
+    /// Resolves calls stored in the active global context after a prototype changes.
+    #[test]
+    fn configured_depth_global_initializer_callers() {
+        for configured in [true, false] {
+            let configuration = sampled_configuration(configured);
+            let ty = if configured { "Tex" } else { "texture2D" };
+            let source = alloc::format!(
+                r#"#version 450
+                layout(binding=0) uniform {ty} source;
+                layout(binding=1) uniform samplerShadow comparison;
+                float read({ty});
+                float first=read(source);
+                float second=read(source);
+                float read({ty} t) {{ return texture(sampler2DShadow(t,comparison),vec3(0.5)); }}
+                layout(location=0) out vec4 color;
+                void main() {{ color=vec4(first+second); }}
+            "#
+            );
+            let (module, _) = parse(&source, &configuration);
+            let image = module
+                .global_variables
+                .iter()
+                .find(|&(_, g)| g.name.as_deref() == Some("source"))
+                .unwrap()
+                .1;
+            assert_eq!(
+                module.types[image.ty].name.as_deref(),
+                configured.then_some("Tex")
+            );
+            assert!(matches!(
+                module.types[image.ty].inner,
+                TypeInner::Image {
+                    class: ImageClass::Depth { .. },
+                    ..
+                }
+            ));
+        }
+    }
+
+    /// Terminates requirement propagation even when invalid source forms a call cycle.
+    #[test]
+    fn configured_depth_recursive_calls_terminate() {
+        let configuration = sampled_configuration(true);
+        let source = r#"#version 450
+            layout(binding=0) uniform Tex source;
+            layout(binding=1) uniform samplerShadow comparison;
+            float read(Tex);
+            float forward(Tex t) { return read(t); }
+            float read(Tex t) { return forward(t)+texture(sampler2DShadow(t,comparison),vec3(0.5)); }
+            layout(location=0) out vec4 color;
+            void main() { color=vec4(read(source)); }
+        "#;
+        if let Ok(module) = Frontend::default().parse_with_configuration(
+            &super::super::Options::from(ShaderStage::Fragment),
+            source,
+            &configuration,
+        ) {
+            assert!(crate::valid::Validator::new(
+                crate::valid::ValidationFlags::all(),
+                crate::valid::Capabilities::all()
+            )
+            .validate(&module)
+            .is_err());
         }
     }
 

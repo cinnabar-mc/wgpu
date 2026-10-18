@@ -181,6 +181,7 @@ impl<'source> ParsingContext<'source> {
         while self.peek(frontend).is_some() {
             self.parse_external_declaration(frontend, &mut ctx)?;
         }
+        frontend.resolve_depth_calls(&mut ctx)?;
 
         // Add an `EntryPoint` to `parser.module` for `main`, if a
         // suitable overload exists. Error out if we can't find one.

@@ -56,6 +56,7 @@ Bottom level categories:
 - Use native storage-image access when emitting Metal and GLSL helper parameters.
 - Preserve GLSL image parameter memory restrictions independently of native resource access.
 - Validate repeated GLSL function declarations while retaining compatible definitions.
+- Preserve depth-texture overload selection and propagate prototype requirements to earlier callers.
 
 - Round GLSL texture gather array layers before converting them to integers.
 - Convert GLSL double `frexp` exponents to the 32-bit output parameter type.

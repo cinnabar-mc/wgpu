@@ -526,32 +526,35 @@ fn inject_standard_builtins(
         match sampler {
             "sampler1D" | "sampler1DArray" | "sampler2D" | "sampler2DArray" | "sampler2DMS"
             | "sampler2DMSArray" | "sampler3D" | "samplerCube" | "samplerCubeArray" => {
-                declaration.overloads.push(module.add_builtin(
-                    vec![
-                        TypeInner::Image {
-                            dim: match sampler {
-                                "sampler1D" | "sampler1DArray" => Dim::D1,
-                                "sampler2D" | "sampler2DArray" | "sampler2DMS"
-                                | "sampler2DMSArray" => Dim::D2,
-                                "sampler3D" => Dim::D3,
-                                _ => Dim::Cube,
-                            },
-                            arrayed: matches!(
-                                sampler,
-                                "sampler1DArray"
-                                    | "sampler2DArray"
-                                    | "sampler2DMSArray"
-                                    | "samplerCubeArray"
-                            ),
-                            class: ImageClass::Sampled {
-                                kind,
-                                multi: matches!(sampler, "sampler2DMS" | "sampler2DMSArray"),
-                            },
-                        },
-                        TypeInner::Sampler { comparison: false },
-                    ],
-                    MacroCall::Sampler,
-                ));
+                let image = TypeInner::Image {
+                    dim: match sampler {
+                        "sampler1D" | "sampler1DArray" => Dim::D1,
+                        "sampler2D" | "sampler2DArray" | "sampler2DMS" | "sampler2DMSArray" => {
+                            Dim::D2
+                        }
+                        "sampler3D" => Dim::D3,
+                        _ => Dim::Cube,
+                    },
+                    arrayed: matches!(
+                        sampler,
+                        "sampler1DArray"
+                            | "sampler2DArray"
+                            | "sampler2DMSArray"
+                            | "samplerCubeArray"
+                    ),
+                    class: ImageClass::Sampled {
+                        kind,
+                        multi: matches!(sampler, "sampler2DMS" | "sampler2DMSArray"),
+                    },
+                };
+                for image in
+                    core::iter::once(image.clone()).chain(super::types::image_depth_type(&image))
+                {
+                    declaration.overloads.push(module.add_builtin(
+                        vec![image, TypeInner::Sampler { comparison: false }],
+                        MacroCall::Sampler,
+                    ));
+                }
                 return;
             }
             _ => (),
@@ -576,19 +579,16 @@ fn inject_standard_builtins(
                 "sampler1DArrayShadow" | "sampler2DArrayShadow" | "samplerCubeArrayShadow"
             );
 
-            for i in 0..2 {
-                let ty = TypeInner::Image {
-                    dim,
-                    arrayed,
-                    class: match i {
-                        0 => ImageClass::Sampled {
-                            kind: Sk::Float,
-                            multi: false,
-                        },
-                        _ => ImageClass::Depth { multi: false },
-                    },
-                };
-
+            let image = TypeInner::Image {
+                dim,
+                arrayed,
+                class: ImageClass::Sampled {
+                    kind: Sk::Float,
+                    multi: false,
+                },
+            };
+            for ty in core::iter::once(image.clone()).chain(super::types::image_depth_type(&image))
+            {
                 declaration.overloads.push(module.add_builtin(
                     vec![ty, TypeInner::Sampler { comparison: true }],
                     MacroCall::SamplerShadow,
@@ -2499,39 +2499,10 @@ pub fn sampled_to_depth(
         }
     };
 
-    match ctx.module.types[*ty].inner {
-        // Update the image class to depth in case it already isn't
-        TypeInner::Image {
-            class,
-            dim,
-            arrayed,
-        } => match class {
-            ImageClass::Sampled { multi, .. } => {
-                *ty = ctx.module.types.insert(
-                    Type {
-                        name: ctx.module.types[*ty].name.clone(),
-                        inner: TypeInner::Image {
-                            dim,
-                            arrayed,
-                            class: ImageClass::Depth { multi },
-                        },
-                    },
-                    Span::default(),
-                )
-            }
-            ImageClass::Depth { .. } => {}
-            // Other image classes aren't allowed to be transformed to depth
-            ImageClass::Storage { .. } => errors.push(Error {
-                kind: ErrorKind::SemanticError("Not a texture".into()),
-                meta,
-            }),
-            ImageClass::External => unreachable!(),
-        },
-        _ => errors.push(Error {
-            kind: ErrorKind::SemanticError("Not a texture".into()),
-            meta,
-        }),
-    };
+    match super::types::promote_depth_type(&mut ctx.module.types, *ty, meta) {
+        Ok(depth) => *ty = depth,
+        Err(error) => errors.push(error),
+    }
 }
 
 bitflags::bitflags! {

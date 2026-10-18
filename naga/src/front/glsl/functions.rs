@@ -1144,6 +1144,7 @@ impl Frontend {
             ..
         } = ctx;
 
+        let carries_depth = parameters_info.iter().any(|parameter| parameter.depth);
         let function = Function {
             name: Some(name),
             arguments,
@@ -1191,12 +1192,19 @@ impl Frontend {
             decl.defined = true;
             decl.parameters = parameters;
             decl.parameters_info = parameters_info;
-            match decl.kind {
-                FunctionKind::Call(handle) => *module.functions.get_mut(handle) = function,
+            let handle = match decl.kind {
+                FunctionKind::Call(handle) => {
+                    *module.functions.get_mut(handle) = function;
+                    handle
+                }
                 FunctionKind::Macro(_) => {
                     let handle = module.functions.append(function, meta);
-                    decl.kind = FunctionKind::Call(handle)
+                    decl.kind = FunctionKind::Call(handle);
+                    handle
                 }
+            };
+            if carries_depth {
+                self.propagate_depth_calls(module, handle);
             }
             return;
         }
@@ -1210,6 +1218,98 @@ impl Frontend {
             internal: false,
             void,
         });
+        if carries_depth {
+            self.propagate_depth_calls(module, handle);
+        }
+    }
+
+    /// Propagates committed depth requirements backwards through selected call edges.
+    fn propagate_depth_calls(&mut self, module: &mut crate::Module, function: Handle<Function>) {
+        let mut callers = crate::FastHashMap::default();
+        for (caller, function) in module.functions.iter() {
+            visit_calls(&function.body, &mut |callee, arguments| {
+                callers
+                    .entry(callee)
+                    .or_insert_with(Vec::new)
+                    .push((caller, arguments.to_vec()));
+            });
+        }
+        let mut pending = vec![function];
+        while let Some(callee) = pending.pop() {
+            let Some(sites) = callers.get(&callee) else {
+                continue;
+            };
+            for &(caller, ref arguments) in sites {
+                for argument in depth_call_arguments(module, callee, arguments) {
+                    let function = &module.functions[caller];
+                    let meta = function.expressions.get_span(argument);
+                    let origin = function.expressions[argument].clone();
+                    let ty = match origin {
+                        Expression::GlobalVariable(handle) => module.global_variables[handle].ty,
+                        Expression::FunctionArgument(index) => {
+                            function.arguments[index as usize].ty
+                        }
+                        _ => {
+                            self.errors.push(Error {
+                                kind: ErrorKind::SemanticError(
+                                    "Not a valid texture expression".into(),
+                                ),
+                                meta,
+                            });
+                            continue;
+                        }
+                    };
+                    let depth = match super::types::promote_depth_type(&mut module.types, ty, meta)
+                    {
+                        Ok(depth) => depth,
+                        Err(error) => {
+                            self.errors.push(error);
+                            continue;
+                        }
+                    };
+                    match origin {
+                        Expression::GlobalVariable(handle) => {
+                            module.global_variables.get_mut(handle).ty = depth
+                        }
+                        Expression::FunctionArgument(index) => {
+                            let mut changed = ty != depth;
+                            module.functions.get_mut(caller).arguments[index as usize].ty = depth;
+                            for declaration in self.lookup_function.values_mut() {
+                                for overload in &mut declaration.overloads {
+                                    if matches!(overload.kind, FunctionKind::Call(handle) if handle == caller)
+                                    {
+                                        let parameter =
+                                            &mut overload.parameters_info[index as usize];
+                                        changed |= !parameter.depth;
+                                        parameter.depth = true;
+                                    }
+                                }
+                            }
+                            if changed {
+                                pending.push(caller);
+                            }
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+            }
+        }
+    }
+
+    /// Applies final callee depth requirements to pending global-initializer calls.
+    pub(crate) fn resolve_depth_calls(&mut self, ctx: &mut Context) -> Result<()> {
+        let mut calls = Vec::new();
+        visit_calls(&ctx.body, &mut |callee, arguments| {
+            calls.push((callee, arguments.to_vec()))
+        });
+        for (callee, arguments) in calls {
+            for argument in depth_call_arguments(ctx.module, callee, &arguments) {
+                let meta = ctx.expressions.get_span(argument);
+                sampled_to_depth(ctx, argument, meta, &mut self.errors);
+                ctx.invalidate_expression(argument, meta)?;
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn add_prototype(
@@ -1620,27 +1720,71 @@ impl Context<'_> {
     }
 }
 
+/// Visits selected calls in nested blocks without following the call graph recursively.
+fn visit_calls(block: &Block, visit: &mut impl FnMut(Handle<Function>, &[Handle<Expression>])) {
+    for statement in block.iter() {
+        match *statement {
+            Statement::Call {
+                function,
+                ref arguments,
+                ..
+            } => visit(function, arguments),
+            Statement::Block(ref block) => visit_calls(block, visit),
+            Statement::If {
+                ref accept,
+                ref reject,
+                ..
+            } => {
+                visit_calls(accept, visit);
+                visit_calls(reject, visit);
+            }
+            Statement::Switch { ref cases, .. } => {
+                for case in cases {
+                    visit_calls(&case.body, visit);
+                }
+            }
+            Statement::Loop {
+                ref body,
+                ref continuing,
+                ..
+            } => {
+                visit_calls(body, visit);
+                visit_calls(continuing, visit);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Lists actual arguments whose selected callee requires a native depth texture.
+fn depth_call_arguments(
+    module: &crate::Module,
+    callee: Handle<Function>,
+    arguments: &[Handle<Expression>],
+) -> Vec<Handle<Expression>> {
+    module.functions[callee]
+        .arguments
+        .iter()
+        .zip(arguments)
+        .filter_map(|(parameter, &argument)| {
+            matches!(
+                module.types[parameter.ty].inner,
+                TypeInner::Image {
+                    class: crate::ImageClass::Depth { .. },
+                    ..
+                }
+            )
+            .then_some(argument)
+        })
+        .collect()
+}
+
 /// Computes a candidate's depth view without changing any resource or parameter type.
-const fn overload_argument_type(ty: &TypeInner, depth: bool) -> Option<Cow<'_, TypeInner>> {
+fn overload_argument_type(ty: &TypeInner, depth: bool) -> Option<Cow<'_, TypeInner>> {
     if !depth {
         return Some(Cow::Borrowed(ty));
     }
-    match *ty {
-        TypeInner::Image {
-            dim,
-            arrayed,
-            class: crate::ImageClass::Sampled { multi, .. },
-        } => Some(Cow::Owned(TypeInner::Image {
-            dim,
-            arrayed,
-            class: crate::ImageClass::Depth { multi },
-        })),
-        TypeInner::Image {
-            class: crate::ImageClass::Depth { .. },
-            ..
-        } => Some(Cow::Borrowed(ty)),
-        _ => None,
-    }
+    super::types::image_depth_type(ty).map(Cow::Owned)
 }
 
 /// Checks repeated source declarations without replacing the stored result or definition.
@@ -1699,7 +1843,7 @@ impl CallCandidate<'_> {
     }
 }
 
-/// Compares prospective signatures while accepting generic formats only for native builtins.
+/// Compares declared signatures first, then native views with generic builtin formats.
 fn same_overload_signature(module: &crate::Module, source: &Overload, builtin: &Overload) -> bool {
     let generic_formats = builtin.internal;
     source.parameters.len() == builtin.parameters.len()
@@ -1709,6 +1853,9 @@ fn same_overload_signature(module: &crate::Module, source: &Overload, builtin: &
             .zip(&builtin.parameters)
             .enumerate()
             .all(|(index, (source_type, builtin_type))| {
+                if module.types[*source_type].inner == module.types[*builtin_type].inner {
+                    return true;
+                }
                 let Some(source) = overload_argument_type(
                     &module.types[*source_type].inner,
                     source.parameters_info[index].depth,

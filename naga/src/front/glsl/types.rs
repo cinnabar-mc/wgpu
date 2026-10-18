@@ -7,6 +7,49 @@ use crate::{
     VectorSize,
 };
 
+/// Computes the native depth view of a floating-point texture without mutation.
+pub(super) const fn image_depth_type(ty: &TypeInner) -> Option<TypeInner> {
+    match *ty {
+        TypeInner::Image {
+            dim,
+            arrayed,
+            class:
+                ImageClass::Sampled {
+                    kind: ScalarKind::Float,
+                    multi,
+                }
+                | ImageClass::Depth { multi },
+        } => Some(TypeInner::Image {
+            dim,
+            arrayed,
+            class: ImageClass::Depth { multi },
+        }),
+        _ => None,
+    }
+}
+
+/// Commits the shared depth view while retaining the declared type name.
+pub(super) fn promote_depth_type(
+    types: &mut crate::UniqueArena<Type>,
+    ty: Handle<Type>,
+    meta: Span,
+) -> Result<Handle<Type>> {
+    let inner = image_depth_type(&types[ty].inner).ok_or_else(|| Error {
+        kind: ErrorKind::SemanticError("Not a floating-point texture".into()),
+        meta,
+    })?;
+    if inner == types[ty].inner {
+        return Ok(ty);
+    }
+    Ok(types.insert(
+        Type {
+            name: types[ty].name.clone(),
+            inner,
+        },
+        meta,
+    ))
+}
+
 pub fn parse_type(type_name: &str) -> Option<Type> {
     match type_name {
         "bool" => Some(Type {
