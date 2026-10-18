@@ -11,9 +11,8 @@ use super::{
 use crate::{
     AtomicFunction, Barrier, BinaryOperator, DerivativeAxis as Axis, DerivativeControl as Ctrl,
     Expression, Handle, ImageClass, ImageDimension as Dim, ImageQuery, MathFunction, Module,
-    RelationalFunction,
-    SampleLevel, Scalar, ScalarKind as Sk, Span, SwizzleComponent, Type, TypeInner, UnaryOperator,
-    VectorSize,
+    RelationalFunction, SampleLevel, Scalar, ScalarKind as Sk, Span, SwizzleComponent, Type,
+    TypeInner, UnaryOperator, VectorSize,
 };
 
 impl crate::ScalarKind {
@@ -501,8 +500,13 @@ pub fn inject_builtin(
             // Don't generate shadow nor multisampled images since they aren't supported
             texture_args_generator(variations.into(), f)
         }
-        "imageAtomicAdd" | "imageAtomicMin" | "imageAtomicMax" | "imageAtomicAnd"
-        | "imageAtomicOr" | "imageAtomicXor" | "imageAtomicExchange" => {
+        "imageAtomicAdd"
+        | "imageAtomicMin"
+        | "imageAtomicMax"
+        | "imageAtomicAnd"
+        | "imageAtomicOr"
+        | "imageAtomicXor"
+        | "imageAtomicExchange" => {
             let fun = atomic_function(&name["imageAtomic".len()..]);
             let f = |kind: Sk, dim, arrayed, _, _| {
                 // Atomics need 32-bit integer texels, and naga has no cube storage images
@@ -2384,7 +2388,8 @@ impl MacroCall {
             )?,
             MacroCall::MemoryBarrier(barrier) => {
                 ctx.emit_restart();
-                ctx.body.push(crate::Statement::MemoryBarrier(barrier), meta);
+                ctx.body
+                    .push(crate::Statement::MemoryBarrier(barrier), meta);
                 return Ok(None);
             }
             MacroCall::Atomic(fun) => {
@@ -2470,10 +2475,8 @@ impl MacroCall {
                 // `Barrier::all()` would also request a subgroup barrier, which needs
                 // the `SUBGROUP_BARRIER` capability.
                 ctx.emit_restart();
-                ctx.body.push(
-                    crate::Statement::ControlBarrier(Barrier::WORK_GROUP),
-                    meta,
-                );
+                ctx.body
+                    .push(crate::Statement::ControlBarrier(Barrier::WORK_GROUP), meta);
                 return Ok(None);
             }
             MacroCall::SmoothStep { splatted } => {
@@ -2555,10 +2558,8 @@ impl Frontend {
     ) -> Result<Handle<Type>> {
         let unsupported = |what: &str| Error {
             kind: ErrorKind::SemanticError(
-                alloc::format!(
-                    "atomic operations need a buffer or shared scalar, not {what}"
-                )
-                .into(),
+                alloc::format!("atomic operations need a buffer or shared scalar, not {what}")
+                    .into(),
             ),
             meta,
         };
