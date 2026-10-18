@@ -707,7 +707,7 @@ mod regressions {
                     } else {
                         String::new()
                     };
-                    alloc::format!("float choose({ty});\nfloat forward({ty} image,float x) {{ float value=0.0; if(x>0.0) {{value=choose(image);}} else {{value=choose(image);}} for(int i=0;i<1;i++) {{value+=choose(image);}} switch(int(x)) {{case 1:value+=choose(image);break;default:break;}} return value; }}\n{repeated}\nfloat transit({ty} image) {{ return forward(image,1); }}")
+                    alloc::format!("void noop({ty} image) {{}}\nfloat choose({ty});\nfloat forward({ty} image,float x) {{ noop(image); float value=0.0; if(x>0.0) {{value=choose(image);}} else {{value=choose(image);}} for(int i=0;i<1;i++) {{value+=choose(image);}} switch(int(x)) {{case 1:value+=choose(image);break;default:break;}} return value; }}\n{repeated}\nfloat transit({ty} image) {{ return forward(image,1); }}")
                 } else {
                     String::new()
                 };
@@ -741,6 +741,163 @@ mod regressions {
                                 }
                             ));
                         }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Reconciles shared arguments, globals and pending calls without changing gather results.
+    #[test]
+    fn configured_depth_shared_image_flow() {
+        for configured in [true, false] {
+            let configuration = sampled_configuration(configured);
+            let ty = if configured { "Tex" } else { "texture2D" };
+            for early_depth in [false, true] {
+                for global_read in [false, true] {
+                    let read = alloc::format!("float read({ty} t) {{ return texture(sampler2DShadow(t,comparison),vec3(0.5)); }}");
+                    let definition = if early_depth { read.as_str() } else { "" };
+                    let late_definition = if early_depth { "" } else { read.as_str() };
+                    let gather_image = if global_read { "source" } else { "t" };
+                    let source = alloc::format!(
+                        r#"#version 450
+                        layout(binding=0) uniform {ty} source;
+                        layout(binding=1) uniform {ty} other;
+                        layout(binding=2) uniform sampler filtering;
+                        layout(binding=3) uniform samplerShadow comparison;
+                        void noop({ty} t) {{}}
+                        float read({ty});
+                        {definition}
+                        vec4 gather({ty} t) {{ return textureGather(sampler2D({gather_image},filtering),vec2(0.5)); }}
+                        float forward({ty} t) {{ noop(t); return read(t); }}
+                        vec4 sibling({ty} t) {{ noop(t); return gather(t); }}
+                        vec4 first=sibling(other);
+                        {late_definition}
+                        layout(location=0) out vec4 color;
+                        void main() {{ color=sibling(source)+sibling(other)+vec4(forward(source)); }}
+                    "#
+                    );
+                    let (module, info) = parse(&source, &configuration);
+                    let (handle, function) = module
+                        .functions
+                        .iter()
+                        .find(|&(_, function)| function.name.as_deref() == Some("gather"))
+                        .unwrap();
+                    let (sample, _) = function
+                        .expressions
+                        .iter()
+                        .find(|&(_, expression)| {
+                            matches!(
+                                expression,
+                                crate::Expression::ImageSample {
+                                    gather: Some(_),
+                                    depth_ref: None,
+                                    ..
+                                }
+                            )
+                        })
+                        .unwrap();
+                    assert_eq!(
+                        *info[handle][sample].ty.inner_with(&module.types),
+                        TypeInner::Vector {
+                            size: VectorSize::Quad,
+                            scalar: crate::Scalar::F32
+                        }
+                    );
+                    for (_, global) in module.global_variables.iter().filter(|&(_, global)| {
+                        matches!(global.name.as_deref(), Some("source" | "other"))
+                    }) {
+                        assert!(matches!(
+                            module.types[global.ty].inner,
+                            TypeInner::Image {
+                                class: ImageClass::Depth { .. },
+                                ..
+                            }
+                        ));
+                        assert_eq!(
+                            module.types[global.ty].name.as_deref(),
+                            configured.then_some("Tex")
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Preserves ordinary vec4 sampling and the baseline rejection of mixed result shapes.
+    #[test]
+    fn configured_depth_sampling_result_shapes() {
+        for configured in [true, false] {
+            let configuration = sampled_configuration(configured);
+            let ty = if configured { "Tex" } else { "texture2D" };
+            for shared_global in [false, true] {
+                for mixed in [false, true] {
+                    let parameter = if shared_global {
+                        String::new()
+                    } else {
+                        alloc::format!("{ty} t")
+                    };
+                    let argument = if shared_global { "" } else { "source" };
+                    let image = if shared_global { "source" } else { "t" };
+                    let shadow = if mixed {
+                        "return texture(sampler2DShadow(t,comparison),vec3(0.5));"
+                    } else {
+                        "return 1.0;"
+                    };
+                    let source = alloc::format!(
+                        r#"#version 450
+                        layout(binding=0) uniform {ty} source;
+                        layout(binding=1) uniform sampler filtering;
+                        layout(binding=2) uniform samplerShadow comparison;
+                        vec4 read({parameter}) {{ return texture(sampler2D({image},filtering),vec2(0.5)); }}
+                        float shadow({ty} t) {{ {shadow} }}
+                        layout(location=0) out vec4 color;
+                        void main() {{ color=read({argument})+vec4(shadow(source)); }}
+                    "#
+                    );
+                    if mixed {
+                        let module = Frontend::default()
+                            .parse_with_configuration(
+                                &super::super::Options::from(ShaderStage::Fragment),
+                                &source,
+                                &configuration,
+                            )
+                            .unwrap();
+                        let error = crate::valid::Validator::new(
+                            crate::valid::ValidationFlags::all(),
+                            crate::valid::Capabilities::all(),
+                        )
+                        .validate(&module)
+                        .unwrap_err();
+                        assert!(alloc::format!("{error:?}").contains("InvalidReturnType"));
+                    } else {
+                        let (module, info) = parse(&source, &configuration);
+                        let (handle, function) = module
+                            .functions
+                            .iter()
+                            .find(|&(_, function)| function.name.as_deref() == Some("read"))
+                            .unwrap();
+                        let (sample, _) = function
+                            .expressions
+                            .iter()
+                            .find(|&(_, expression)| {
+                                matches!(
+                                    expression,
+                                    crate::Expression::ImageSample {
+                                        gather: None,
+                                        depth_ref: None,
+                                        ..
+                                    }
+                                )
+                            })
+                            .unwrap();
+                        assert_eq!(
+                            *info[handle][sample].ty.inner_with(&module.types),
+                            TypeInner::Vector {
+                                size: VectorSize::Quad,
+                                scalar: crate::Scalar::F32
+                            }
+                        );
                     }
                 }
             }
