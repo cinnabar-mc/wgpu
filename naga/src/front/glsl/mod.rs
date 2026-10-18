@@ -13,6 +13,7 @@ To begin, take a look at the documentation for the [`Frontend`].
 */
 
 pub use ast::{Precision, Profile};
+pub use configuration::{Configuration, FunctionAlias, OpaqueType};
 pub use error::{Error, ErrorKind, ExpectedToken, ParseErrors};
 pub use token::TokenValue;
 
@@ -24,6 +25,7 @@ use parser::ParsingContext;
 
 mod ast;
 mod builtins;
+mod configuration;
 mod context;
 mod error;
 mod functions;
@@ -166,6 +168,8 @@ impl Default for ShaderMetadata {
 #[derive(Debug, Default)]
 pub struct Frontend {
     meta: ShaderMetadata,
+    configuration: Configuration,
+    logical_types: FastHashMap<String, String>,
 
     lookup_function: FastHashMap<String, FunctionDeclaration>,
     lookup_type: FastHashMap<String, Handle<Type>>,
@@ -185,6 +189,7 @@ impl Frontend {
 
         self.lookup_function.clear();
         self.lookup_type.clear();
+        self.logical_types.clear();
         self.global_variables.clear();
         self.entry_args.clear();
         self.layouter.clear();
@@ -199,7 +204,18 @@ impl Frontend {
         options: &Options,
         source: &str,
     ) -> core::result::Result<Module, ParseErrors> {
+        self.parse_with_configuration(options, source, &Configuration::default())
+    }
+
+    /// Parses GLSL with caller-owned opaque types and independent builtin families.
+    pub fn parse_with_configuration(
+        &mut self,
+        options: &Options,
+        source: &str,
+        configuration: &Configuration,
+    ) -> core::result::Result<Module, ParseErrors> {
         self.reset(options.stage);
+        self.configuration = configuration.clone();
 
         let lexer = lex::Lexer::new(source, &options.defines);
         let mut ctx = ParsingContext::new(lexer);

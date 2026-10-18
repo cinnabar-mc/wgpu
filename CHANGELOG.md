@@ -42,6 +42,12 @@ Bottom level categories:
 
 ## Unreleased
 
+### Added/New Features
+
+#### naga
+
+- Add GLSL frontend configuration for typed opaque aliases and independent builtin overload families, and support stores through storage-image function parameters.
+
 ### Bug Fixes
 
 #### naga

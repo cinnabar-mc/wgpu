@@ -168,11 +168,11 @@ pub struct ExpressionInfo {
     /// expressions that are ultimately unused.
     pub ref_count: usize,
 
-    /// The global variable into which this expression produces a pointer.
+    /// The global or parameter whose storage this expression refers to.
     ///
     /// This is `None` unless this expression is either a
-    /// [`GlobalVariable`], or an [`Access`] or [`AccessIndex`] that
-    /// ultimately refers to some part of a global.
+    /// [`GlobalVariable`], a function argument, or an [`Access`] or [`AccessIndex`]
+    /// that ultimately refers to their storage.
     ///
     /// [`Load`] expressions applied to pointer-typed arguments could
     /// refer to globals, but we leave this as `None` for them.
@@ -181,7 +181,7 @@ pub struct ExpressionInfo {
     /// [`Access`]: crate::Expression::Access
     /// [`AccessIndex`]: crate::Expression::AccessIndex
     /// [`Load`]: crate::Expression::Load
-    assignable_global: Option<Handle<crate::GlobalVariable>>,
+    assignable: Option<GlobalOrArgument>,
 
     /// The type of this expression.
     pub ty: TypeResolution,
@@ -192,7 +192,7 @@ impl ExpressionInfo {
         ExpressionInfo {
             uniformity: Uniformity::new(),
             ref_count: 0,
-            assignable_global: None,
+            assignable: None,
             // this doesn't matter at this point, will be overwritten
             ty: TypeResolution::Value(crate::TypeInner::Scalar(crate::Scalar {
                 kind: crate::ScalarKind::Bool,
@@ -272,6 +272,9 @@ pub struct FunctionInfo {
     /// so you can simply index this struct with a global handle to retrieve
     /// its usage information.
     pub global_uses: Box<[GlobalUse]>,
+
+    /// How each parameter's underlying resource is used, propagated through calls.
+    argument_uses: Box<[GlobalUse]>,
 
     /// Information about each expression in this function's body.
     ///
@@ -371,9 +374,15 @@ impl FunctionInfo {
     ) -> NonUniformResult {
         let info = &mut self.expressions[expr.index()];
         info.ref_count += 1;
-        // Record usage if this expression may access a global
-        if let Some(global) = info.assignable_global {
-            self.global_uses[global.index()] |= global_use;
+        // Record usage of the underlying global or parameter.
+        match info.assignable {
+            Some(GlobalOrArgument::Global(global)) => {
+                self.global_uses[global.index()] |= global_use
+            }
+            Some(GlobalOrArgument::Argument(index)) => {
+                self.argument_uses[index as usize] |= global_use
+            }
+            None => {}
         }
         info.uniformity.non_uniform_result
     }
@@ -410,31 +419,30 @@ impl FunctionInfo {
     ///
     /// Bump `expr`'s reference count, and return its uniformity.
     ///
-    /// If `expr` is a pointer to a global variable, or some part
-    /// thereof, store that global in `*assignable_global`. Leave the
-    /// global's uses unchanged.
+    /// If `expr` refers to global or parameter storage, retain its owner in
+    /// `*assignable` without changing that owner's usage flags.
     ///
-    /// This is used to determine the [`assignable_global`] for
+    /// This is used to determine the [`assignable`] for
     /// [`Access`] and [`AccessIndex`] expressions that ultimately
-    /// refer to a global variable. Those expressions don't contribute
-    /// any usage to the global themselves; that depends on how other
+    /// refer to global or parameter storage. They don't contribute
+    /// any usage themselves; that depends on how other
     /// expressions use them.
     ///
-    /// [`assignable_global`]: ExpressionInfo::assignable_global
+    /// [`assignable`]: ExpressionInfo::assignable
     /// [`Access`]: crate::Expression::Access
     /// [`AccessIndex`]: crate::Expression::AccessIndex
     #[must_use]
     fn add_assignable_ref(
         &mut self,
         expr: Handle<crate::Expression>,
-        assignable_global: &mut Option<Handle<crate::GlobalVariable>>,
+        assignable: &mut Option<GlobalOrArgument>,
     ) -> NonUniformResult {
         let info = &mut self.expressions[expr.index()];
         info.ref_count += 1;
-        // propagate the assignable global up the chain, till it either hits
+        // Propagate the storage owner up the chain, until it reaches
         // a value-type expression, or the assignment statement.
-        if let Some(global) = info.assignable_global {
-            if let Some(_old) = assignable_global.replace(global) {
+        if let Some(global) = info.assignable {
+            if let Some(_old) = assignable.replace(global) {
                 unreachable!()
             }
         }
@@ -546,7 +554,7 @@ impl FunctionInfo {
         use crate::{Expression as E, SampleLevel as Sl};
 
         let expression = &expression_arena[handle];
-        let mut assignable_global = None;
+        let mut assignable = None;
         let uniformity = match *expression {
             E::Access { base, index } => {
                 let base_ty = self[base].ty.inner_with(resolve_context.types);
@@ -608,13 +616,13 @@ impl FunctionInfo {
 
                 Uniformity {
                     non_uniform_result: self
-                        .add_assignable_ref(base, &mut assignable_global)
+                        .add_assignable_ref(base, &mut assignable)
                         .or(self.add_ref(index)),
                     requirements: UniformityRequirements::empty(),
                 }
             }
             E::AccessIndex { base, .. } => Uniformity {
-                non_uniform_result: self.add_assignable_ref(base, &mut assignable_global),
+                non_uniform_result: self.add_assignable_ref(base, &mut assignable),
                 requirements: UniformityRequirements::empty(),
             },
             // always uniform
@@ -638,6 +646,7 @@ impl FunctionInfo {
             }
             // depends on the builtin
             E::FunctionArgument(index) => {
+                assignable = Some(GlobalOrArgument::Argument(index));
                 let arg = &resolve_context.arguments[index as usize];
                 let uniform = match arg.binding {
                     Some(crate::Binding::BuiltIn(
@@ -656,7 +665,7 @@ impl FunctionInfo {
             // depends on the address space
             E::GlobalVariable(gh) => {
                 use crate::AddressSpace as As;
-                assignable_global = Some(gh);
+                assignable = Some(GlobalOrArgument::Global(gh));
                 let var = &resolve_context.global_vars[gh];
                 let uniform = match var.space {
                     // local data is non-uniform
@@ -682,7 +691,9 @@ impl FunctionInfo {
             E::Load { pointer } => {
                 let non_uniform_result = self.add_ref(pointer);
                 // Track which immediate slots this load touches.
-                if let Some(global) = self.expressions[pointer.index()].assignable_global {
+                if let Some(GlobalOrArgument::Global(global)) =
+                    self.expressions[pointer.index()].assignable
+                {
                     if resolve_context.global_vars[global].space == crate::AddressSpace::Immediate {
                         self.immediate_slots_used |= ImmediateSlots::for_pointer(
                             pointer,
@@ -879,7 +890,7 @@ impl FunctionInfo {
         self.expressions[handle.index()] = ExpressionInfo {
             uniformity,
             ref_count: 0,
-            assignable_global,
+            assignable,
             ty,
         };
         Ok(())
@@ -1110,10 +1121,15 @@ impl FunctionInfo {
                     ref arguments,
                     result: _,
                 } => {
-                    for &argument in arguments {
-                        let _ = self.add_ref(argument);
-                    }
                     let info = &other_functions[function.index()];
+                    for (index, &argument) in arguments.iter().enumerate() {
+                        let usage = info
+                            .argument_uses
+                            .get(index)
+                            .copied()
+                            .unwrap_or(GlobalUse::empty());
+                        let _ = self.add_ref_impl(argument, usage);
+                    }
                     //Note: the result is validated by the Validator, not here
                     self.process_call(info, arguments, expression_arena)?
                 }
@@ -1264,6 +1280,7 @@ impl ModuleInfo {
             may_kill: false,
             sampling_set: crate::FastHashSet::default(),
             global_uses: vec![GlobalUse::empty(); module.global_variables.len()].into_boxed_slice(),
+            argument_uses: vec![GlobalUse::empty(); fun.arguments.len()].into_boxed_slice(),
             expressions: vec![ExpressionInfo::new(); fun.expressions.len()].into_boxed_slice(),
             sampling: crate::FastHashSet::default(),
             dual_source_blending: false,
@@ -1308,9 +1325,13 @@ impl ModuleInfo {
         // assignments used to include a global in the shader's resource
         // interface. https://www.w3.org/TR/WGSL/#phony-assignment-section
         for &handle in fun.named_expressions.keys() {
-            if let Some(global) = info[handle].assignable_global {
-                if info.global_uses[global.index()].is_empty() {
-                    info.global_uses[global.index()] = GlobalUse::QUERY;
+            if let Some(storage) = info[handle].assignable {
+                let usage = match storage {
+                    GlobalOrArgument::Global(global) => &mut info.global_uses[global.index()],
+                    GlobalOrArgument::Argument(index) => &mut info.argument_uses[index as usize],
+                };
+                if usage.is_empty() {
+                    *usage = GlobalUse::QUERY;
                 }
             }
         }
@@ -1400,6 +1421,7 @@ fn uniform_control_flow() {
         may_kill: false,
         sampling_set: crate::FastHashSet::default(),
         global_uses: vec![GlobalUse::empty(); global_var_arena.len()].into_boxed_slice(),
+        argument_uses: Box::default(),
         expressions: vec![ExpressionInfo::new(); expressions.len()].into_boxed_slice(),
         sampling: crate::FastHashSet::default(),
         dual_source_blending: false,
@@ -1591,4 +1613,71 @@ fn uniform_control_flow() {
         }),
     );
     assert_eq!(info[non_uniform_global], GlobalUse::READ | GlobalUse::WRITE);
+}
+
+#[test]
+#[cfg(feature = "wgsl-in")]
+fn resource_parameter_usage_propagates_through_nested_calls() {
+    let module = crate::front::wgsl::parse_str(r#"
+        @group(0) @binding(0) var input: texture_storage_2d<rgba8unorm, read>;
+        @group(0) @binding(1) var output: texture_storage_2d<rgba8unorm, write>;
+        @group(0) @binding(2) var unused: texture_storage_2d<rgba8unorm, write>;
+        fn copy(source: texture_storage_2d<rgba8unorm, read>, dest: texture_storage_2d<rgba8unorm, write>) {
+            textureStore(dest, vec2i(0), textureLoad(source, vec2i(0)));
+        }
+        fn nested(source: texture_storage_2d<rgba8unorm, read>, dest: texture_storage_2d<rgba8unorm, write>) {
+            copy(source, dest);
+        }
+        fn drop_handle(dest: texture_storage_2d<rgba8unorm, write>) {}
+        @compute @workgroup_size(1) fn main() { nested(input, output); drop_handle(unused); }
+    "#).unwrap();
+    let info = super::Validator::new(ValidationFlags::all(), super::Capabilities::all())
+        .validate(&module)
+        .unwrap();
+    for (handle, global) in module.global_variables.iter() {
+        let expected = match global.name.as_deref().unwrap() {
+            "input" => GlobalUse::READ,
+            "output" => GlobalUse::WRITE,
+            "unused" => GlobalUse::QUERY,
+            _ => unreachable!(),
+        };
+        assert_eq!(info.get_entry_point(0)[handle], expected);
+    }
+    #[cfg(feature = "wgsl-out")]
+    {
+        let text = crate::back::wgsl::write_string(
+            &module,
+            &info,
+            crate::back::wgsl::WriterFlags::empty(),
+        )
+        .unwrap();
+        let reparsed = crate::front::wgsl::parse_str(&text).unwrap();
+        super::Validator::new(ValidationFlags::all(), super::Capabilities::all())
+            .validate(&reparsed)
+            .unwrap();
+    }
+    let mut readonly = module.clone();
+    let read_type = readonly
+        .global_variables
+        .iter()
+        .find(|item| item.1.name.as_deref() == Some("input"))
+        .unwrap()
+        .1
+        .ty;
+    readonly
+        .functions
+        .iter_mut()
+        .find(|item| item.1.name.as_deref() == Some("copy"))
+        .unwrap()
+        .1
+        .arguments[1]
+        .ty = read_type;
+    let error = super::Validator::new(ValidationFlags::all(), super::Capabilities::all())
+        .validate(&readonly)
+        .unwrap_err();
+    assert!(
+        matches!(error.as_inner(), &super::ValidationError::Function {
+        source: FunctionError::InvalidImageStore(ExpressionError::InvalidImageStoreAccess(access)), ..
+    } if access == crate::StorageAccess::LOAD)
+    );
 }

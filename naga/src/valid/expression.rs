@@ -85,6 +85,8 @@ pub enum ExpressionError {
     InvalidImageFormat(crate::StorageFormat),
     #[error("Image atomics require atomic storage access, {0:?} is insufficient")]
     InvalidImageStorageAccess(crate::StorageAccess),
+    #[error("Image stores require write access, {0:?} is insufficient")]
+    InvalidImageStoreAccess(crate::StorageAccess),
     #[error("Derivatives can only be taken from scalar and vector floats")]
     InvalidDerivative,
     #[error("Image array index parameter is misplaced")]

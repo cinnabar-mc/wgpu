@@ -167,6 +167,7 @@ impl<'source> ParsingContext<'source> {
 
     pub fn parse(&mut self, frontend: &mut Frontend) -> Result<Module> {
         let mut module = Module::default();
+        frontend.register_types(&mut module)?;
         let mut global_expression_kind_tracker = crate::proc::ExpressionKindTracker::new();
 
         // Body and expression arena for global initialization

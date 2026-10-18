@@ -567,18 +567,30 @@ impl Frontend {
         let mut variations =
             builtin_required_variations(args.iter().map(|&(expr, _)| ctx.get_type(expr)));
 
+        let builtin_alias = self
+            .configuration
+            .functions
+            .iter()
+            .find(|alias| alias.name == name);
+        let builtin_name = builtin_alias
+            .map_or(name.as_str(), |alias| alias.builtin.as_str())
+            .to_string();
+        let result_splat = builtin_alias.and_then(|alias| alias.result_splat);
+        let configured_family =
+            builtin_alias.is_some() || !self.configuration.opaque_types.is_empty();
+
         // Initiate the declaration if it wasn't previously initialized and inject builtins
         let declaration = self.lookup_function.entry(name.clone()).or_insert_with(|| {
             variations |= BuiltinVariations::STANDARD;
             Default::default()
         });
-        inject_builtin(declaration, ctx.module, &name, variations);
+        inject_builtin(declaration, ctx.module, &builtin_name, variations);
 
         // Borrow again but without mutability, at this point a declaration is guaranteed
         let declaration = self.lookup_function.get(&name).unwrap();
 
         // Possibly contains the overload to be used in the call
-        let mut maybe_overload = None;
+        let mut maybe_overload: Option<&Overload> = None;
         // Every viable overload with the conversions each argument needs to call it
         let mut candidates: Vec<(&Overload, Vec<Conversion>)> = Vec::new();
 
@@ -601,6 +613,16 @@ impl Frontend {
             for (i, overload_parameter) in overload.parameters.iter().enumerate() {
                 let call_argument = &args[i];
                 let parameter_info = &overload.parameters_info[i];
+
+                if !overload.internal
+                    && ctx.typifier[call_argument.0]
+                        .handle()
+                        .is_some_and(|call_type| {
+                            !self.same_logical_type(ctx.module, *overload_parameter, call_type)
+                        })
+                {
+                    continue 'outer;
+                }
 
                 // If the image is used in the overload as a depth texture convert it
                 // before comparing, otherwise exact matches wouldn't be reported
@@ -626,7 +648,7 @@ impl Frontend {
                         class:
                             crate::ImageClass::Storage {
                                 format: overload_format,
-                                access: overload_access,
+                                ..
                             },
                         dim: overload_dim,
                         arrayed: overload_arrayed,
@@ -635,7 +657,7 @@ impl Frontend {
                         class:
                             crate::ImageClass::Storage {
                                 format: call_format,
-                                access: call_access,
+                                ..
                             },
                         dim: call_dim,
                         arrayed: call_arrayed,
@@ -654,21 +676,7 @@ impl Frontend {
                         continue 'outer;
                     }
 
-                    // While storage access mismatch is an error it isn't one that causes
-                    // the overload matching to fail so we defer the error and consider
-                    // that the images match exactly
-                    if !call_access.contains(overload_access) {
-                        self.errors.push(Error {
-                            kind: ErrorKind::SemanticError(
-                                format!(
-                                    "'{name}': image needs {overload_access:?} access but only {call_access:?} was provided"
-                                )
-                                .into(),
-                            ),
-                            meta,
-                        });
-                    }
-
+                    // Access is diagnosed only after the complete overload is selected.
                     // The images satisfy the conditions to be considered as an exact match
                     conversions.push(Conversion::Exact);
                     continue;
@@ -713,26 +721,33 @@ impl Frontend {
                 exact = false;
             }
 
-            // The overload matches exactly the function call so there's no ambiguity (since
-            // repeated overload aren't allowed) and the current overload is selected, no
-            // further querying is needed.
+            // Registered physical variants may coexist with a generic native candidate.
+            // Preserve the matching source definition when it overrides that candidate.
             if exact {
-                maybe_overload = Some(overload);
+                if maybe_overload.is_none_or(|previous| previous.internal && !overload.internal) {
+                    maybe_overload = Some(overload);
+                }
                 candidates.clear();
-                break;
+                if !configured_family {
+                    break;
+                }
+            } else if maybe_overload.is_none() {
+                candidates.push((overload, conversions));
             }
-
-            candidates.push((overload, conversions));
         }
 
         // Without an exact match, the GLSL rules (4.60 § 6.1) select the overload
         // that is better than every other viable overload: one that needs a better
         // conversion for at least one argument and a worse one for none.
         if !candidates.is_empty() {
-            let best = candidates.iter().position(|(_, a)| {
-                candidates
-                    .iter()
-                    .all(|(_, b)| core::ptr::eq(a, b) || is_better_overload(a, b))
+            let best = candidates.iter().position(|&(source, ref a)| {
+                candidates.iter().all(|&(other, ref b)| {
+                    core::ptr::eq(a, b)
+                        || is_better_overload(a, b)
+                        || (configured_family
+                            && a == b
+                            && overrides_builtin(ctx.module, source, other))
+                })
             });
 
             if best.is_none() {
@@ -769,6 +784,32 @@ impl Frontend {
             .zip(raw_args)
             .zip(&parameters)
         {
+            if let (
+                &TypeInner::Image {
+                    class:
+                        crate::ImageClass::Storage {
+                            access: required, ..
+                        },
+                    ..
+                },
+                &TypeInner::Image {
+                    class:
+                        crate::ImageClass::Storage {
+                            access: provided, ..
+                        },
+                    ..
+                },
+            ) = (
+                &ctx.module.types[*parameter].inner,
+                ctx.get_type(call_argument.0),
+            ) {
+                if !provided.contains(required) {
+                    self.errors.push(Error {
+                        kind: ErrorKind::SemanticError(format!("'{name}': image needs {required:?} access but only {provided:?} was provided").into()),
+                        meta,
+                    });
+                }
+            }
             if parameter_info.qualifier.is_lhs() {
                 // Reprocess argument in LHS position
                 let (handle, meta) = ctx.lower_expect_inner(stmt, self, *expr, ExprPos::Lhs)?;
@@ -825,7 +866,13 @@ impl Frontend {
             // Builtins with `out` parameters (`modf`, `frexp`) store to their
             // arguments, which may also need proxy writes.
             FunctionKind::Macro(builtin) => {
-                builtin.call(self, ctx, arguments.as_mut_slice(), meta)?
+                let result = builtin.call(self, ctx, arguments.as_mut_slice(), meta)?;
+                match (result, result_splat) {
+                    (Some(value), Some(size)) => {
+                        Some(ctx.add_expression(Expression::Splat { size, value }, meta)?)
+                    }
+                    _ => result,
+                }
             }
         };
 
@@ -1043,12 +1090,22 @@ impl Frontend {
                 .map(|&arg| &ctx.module.types[arg].inner),
         );
 
+        let builtin_alias = self
+            .configuration
+            .functions
+            .iter()
+            .find(|alias| alias.name == name);
+        let builtin_name = builtin_alias
+            .map_or(name.as_str(), |alias| alias.builtin.as_str())
+            .to_string();
+
         // Initiate the declaration if it wasn't previously initialized and inject builtins
+        let logical_types = &self.logical_types;
         let declaration = self.lookup_function.entry(name.clone()).or_insert_with(|| {
             variations |= BuiltinVariations::STANDARD;
             Default::default()
         });
-        inject_builtin(declaration, ctx.module, &name, variations);
+        inject_builtin(declaration, ctx.module, &builtin_name, variations);
 
         let Context {
             expressions,
@@ -1081,7 +1138,14 @@ impl Frontend {
                 let new_inner = &module.types[*new_parameter].inner;
                 let old_inner = &module.types[*old_parameter].inner;
 
-                if new_inner != old_inner {
+                if new_inner != old_inner
+                    || !super::configuration::same_declared_type(
+                        logical_types,
+                        module,
+                        *new_parameter,
+                        *old_parameter,
+                    )
+                {
                     continue 'outer;
                 }
             }
@@ -1094,6 +1158,9 @@ impl Frontend {
             }
 
             decl.defined = true;
+            decl.internal = false;
+            decl.void = void;
+            decl.parameters = parameters;
             decl.parameters_info = parameters_info;
             match decl.kind {
                 FunctionKind::Call(handle) => *module.functions.get_mut(handle) = function,
@@ -1132,12 +1199,22 @@ impl Frontend {
                 .map(|&arg| &ctx.module.types[arg].inner),
         );
 
+        let builtin_alias = self
+            .configuration
+            .functions
+            .iter()
+            .find(|alias| alias.name == name);
+        let builtin_name = builtin_alias
+            .map_or(name.as_str(), |alias| alias.builtin.as_str())
+            .to_string();
+
         // Initiate the declaration if it wasn't previously initialized and inject builtins
+        let logical_types = &self.logical_types;
         let declaration = self.lookup_function.entry(name.clone()).or_insert_with(|| {
             variations |= BuiltinVariations::STANDARD;
             Default::default()
         });
-        inject_builtin(declaration, ctx.module, &name, variations);
+        inject_builtin(declaration, ctx.module, &builtin_name, variations);
 
         let Context {
             arguments,
@@ -1163,7 +1240,14 @@ impl Frontend {
                 let new_inner = &module.types[*new_parameter].inner;
                 let old_inner = &module.types[*old_parameter].inner;
 
-                if new_inner != old_inner {
+                if new_inner != old_inner
+                    || !super::configuration::same_declared_type(
+                        logical_types,
+                        module,
+                        *new_parameter,
+                        *old_parameter,
+                    )
+                {
                     continue 'outer;
                 }
             }
@@ -1499,6 +1583,36 @@ impl Context<'_> {
 
         Ok(())
     }
+}
+
+/// Recognizes a source definition of a native signature without copying builtin tables.
+fn overrides_builtin(module: &crate::Module, source: &Overload, builtin: &Overload) -> bool {
+    !source.internal
+        && builtin.internal
+        && source.parameters.len() == builtin.parameters.len()
+        && source
+            .parameters
+            .iter()
+            .zip(&builtin.parameters)
+            .all(|(source, builtin)| {
+                let source = &module.types[*source].inner;
+                let builtin = &module.types[*builtin].inner;
+                match (source, builtin) {
+                    (
+                        &TypeInner::Image {
+                            dim: a,
+                            arrayed: aa,
+                            class: crate::ImageClass::Storage { format: af, .. },
+                        },
+                        &TypeInner::Image {
+                            dim: b,
+                            arrayed: ba,
+                            class: crate::ImageClass::Storage { format: bf, .. },
+                        },
+                    ) => a == b && aa == ba && Scalar::from(af) == Scalar::from(bf),
+                    _ => source == builtin,
+                }
+            })
 }
 
 /// Helper enum containing the type of conversion need for a call
