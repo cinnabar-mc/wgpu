@@ -96,11 +96,16 @@ fn source_image_access_prototypes_reject_changed_qualifiers() {
         ("restrict readonly", "readonly"),
         ("const readonly", "readonly"),
     ] {
-        let source = alloc::format!(
-            "#version 450\nvoid restricted({declaration} Image);\nvoid restricted({definition} Image s) {{}}\nvoid main() {{}}"
-        );
-        let error = parse(&source).unwrap_err().emit_to_string(&source);
-        assert!(error.contains("qualifiers must match"), "{error}");
+        let prototype = alloc::format!("void restricted({declaration} Image);");
+        let definition = alloc::format!("void restricted({definition} Image s) {{}}");
+        for statements in [
+            alloc::format!("{prototype}\n{definition}"),
+            alloc::format!("{definition}\n{prototype}"),
+        ] {
+            let source = alloc::format!("#version 450\n{statements}\nvoid main() {{}}");
+            let error = parse(&source).unwrap_err().emit_to_string(&source);
+            assert!(error.contains("qualifiers must match"), "{error}");
+        }
     }
 }
 

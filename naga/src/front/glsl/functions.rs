@@ -1176,40 +1176,16 @@ impl Frontend {
                 }
             }
 
-            if decl
-                .parameters_info
-                .iter()
-                .zip(&parameters_info)
-                .any(|(old, new)| {
-                    old.qualifier != new.qualifier
-                        || old.storage_access != new.storage_access
-                        || old.restrict != new.restrict
-                })
-            {
-                return self.errors.push(Error {
-                    kind: ErrorKind::SemanticError(
-                        "Function parameter qualifiers must match the declaration".into(),
-                    ),
-                    meta,
-                });
-            }
             if decl.defined {
                 return self.errors.push(Error {
                     kind: ErrorKind::SemanticError("Function already defined".into()),
                     meta,
                 });
             }
-            if let FunctionKind::Call(handle) = decl.kind {
-                if module.functions[handle].result.as_ref().map(|r| r.ty)
-                    != function.result.as_ref().map(|r| r.ty)
-                {
-                    return self.errors.push(Error {
-                        kind: ErrorKind::SemanticError(
-                            "Function return type must match the declaration".into(),
-                        ),
-                        meta,
-                    });
-                }
+            if let Err(error) =
+                check_source_declaration(decl, &function, &parameters_info, module, meta)
+            {
+                return self.errors.push(error);
             }
 
             decl.defined = true;
@@ -1301,10 +1277,12 @@ impl Frontend {
                 }
             }
 
-            return self.errors.push(Error {
-                kind: ErrorKind::SemanticError("Prototype already defined".into()),
-                meta,
-            });
+            if let Err(error) =
+                check_source_declaration(decl, &function, &parameters_info, module, meta)
+            {
+                self.errors.push(error);
+            }
+            return;
         }
 
         let handle = module.functions.append(function, meta);
@@ -1663,6 +1641,46 @@ const fn overload_argument_type(ty: &TypeInner, depth: bool) -> Option<Cow<'_, T
         } => Some(Cow::Borrowed(ty)),
         _ => None,
     }
+}
+
+/// Checks repeated source declarations without replacing the stored result or definition.
+fn check_source_declaration(
+    declaration: &Overload,
+    function: &Function,
+    parameters_info: &[ParameterInfo],
+    module: &crate::Module,
+    meta: Span,
+) -> Result<()> {
+    if declaration
+        .parameters_info
+        .iter()
+        .zip(parameters_info)
+        .any(|(old, new)| {
+            old.qualifier != new.qualifier
+                || old.storage_access != new.storage_access
+                || old.restrict != new.restrict
+        })
+    {
+        return Err(Error {
+            kind: ErrorKind::SemanticError(
+                "Function parameter qualifiers must match the declaration".into(),
+            ),
+            meta,
+        });
+    }
+    if let FunctionKind::Call(handle) = declaration.kind {
+        if module.functions[handle].result.as_ref().map(|r| r.ty)
+            != function.result.as_ref().map(|r| r.ty)
+        {
+            return Err(Error {
+                kind: ErrorKind::SemanticError(
+                    "Function return type must match the declaration".into(),
+                ),
+                meta,
+            });
+        }
+    }
+    Ok(())
 }
 
 /// A source/value match and the concrete native compatibility of its image arguments.
