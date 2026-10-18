@@ -362,7 +362,6 @@ impl ParsingContext<'_> {
                                     )?;
 
                                     frontend.add_function(context, name, result, meta);
-                                    frontend.resolve_depth_calls(ctx)?;
 
                                     Ok(Some(meta))
                                 }
