@@ -596,6 +596,33 @@ mod regressions {
     }
 
     #[test]
+    fn configured_overload_identity_uses_constant_expression_types() {
+        let source = r#"#version 450
+            vec2 sin(vec2 x) { return x; }
+            const float c = sin(1);
+            layout(location=0) out vec4 color;
+            void main() { color=vec4(c); }
+        "#;
+        parse(source, &Configuration::default());
+        let configuration = Configuration {
+            opaque_types: alloc::vec![OpaqueType {
+                name: "Unused".into(),
+                logical_name: "sampler2D".into(),
+                inner: TypeInner::Image {
+                    dim: ImageDimension::D2,
+                    arrayed: false,
+                    class: ImageClass::Sampled {
+                        kind: ScalarKind::Float,
+                        multi: false
+                    },
+                },
+            }],
+            ..Configuration::default()
+        };
+        parse(source, &configuration);
+    }
+
+    #[test]
     fn configured_scalar_prototypes_can_override_native_signatures() {
         let configuration = Configuration {
             functions: alloc::vec![FunctionAlias {

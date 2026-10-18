@@ -2,8 +2,9 @@ use alloc::format;
 
 use super::{context::Context, Error, ErrorKind, Result, Span};
 use crate::{
-    proc::ResolveContext, Expression, Handle, ImageClass, ImageDimension, Scalar, ScalarKind, Type,
-    TypeInner, VectorSize,
+    proc::{ResolveContext, TypeResolution},
+    Expression, Handle, ImageClass, ImageDimension, Scalar, ScalarKind, Type, TypeInner,
+    VectorSize,
 };
 
 pub fn parse_type(type_name: &str) -> Option<Type> {
@@ -253,14 +254,20 @@ impl Context<'_> {
             })
     }
 
-    pub(crate) fn get_type(&self, expr: Handle<Expression>) -> &TypeInner {
+    /// Returns a grown expression's resolution from its active constant or runtime arena.
+    pub(crate) fn get_type_resolution(&self, expr: Handle<Expression>) -> &TypeResolution {
         let typifier = if self.is_const {
             &self.const_typifier
         } else {
             &self.typifier
         };
+        &typifier[expr]
+    }
 
-        typifier.get(expr, &self.module.types)
+    /// Returns the native type of an expression already resolved in the active arena.
+    pub(crate) fn get_type(&self, expr: Handle<Expression>) -> &TypeInner {
+        self.get_type_resolution(expr)
+            .inner_with(&self.module.types)
     }
 
     /// Gets the type for the result of the `expr` expression

@@ -612,7 +612,8 @@ impl Frontend {
                 let parameter_info = &overload.parameters_info[i];
 
                 if !overload.internal
-                    && ctx.typifier[call_argument.0]
+                    && ctx
+                        .get_type_resolution(call_argument.0)
                         .handle()
                         .is_some_and(|call_type| {
                             !self.same_logical_type(ctx.module, *overload_parameter, call_type)
