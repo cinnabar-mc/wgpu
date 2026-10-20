@@ -11,6 +11,640 @@ use super::{
 };
 use crate::ShaderStage;
 
+/// Ordinary aggregate members stay usable beside an atomic member.
+#[test]
+fn regression_atomic_unmodified_subtree() {
+    for (declarations, body) in [
+        (
+            "struct S { uint a; }; layout(std430, binding = 0) buffer B { uint counter; uint data[4]; S info; };",
+            "atomicAdd(counter, 1u); uint copy[4] = data; data = uint[4](0u, 0u, 0u, 0u); S infoCopy = info; info = S(1u);",
+        ),
+        (
+            "struct S { uint a; }; layout(std430, binding = 0) buffer B { uint counter; uint data[4]; S info; } global;",
+            "atomicAdd(global.counter, 1u); uint copy[4] = global.data; global.data = uint[4](0u, 0u, 0u, 0u); S infoCopy = global.info; global.info = S(1u);",
+        ),
+        (
+            "struct S { uint a; }; struct T { uint counter; S info; }; shared T global;",
+            "atomicAdd(global.counter, 1u); S infoCopy = global.info; global.info = S(1u);",
+        ),
+    ] {
+        let source = alloc::format!(
+            "#version 450\n{declarations}\nvoid main() {{ {body} }}"
+        );
+        let module = Frontend::default().parse(&Options::from(ShaderStage::Compute), &source).unwrap();
+        crate::valid::Validator::new(
+            crate::valid::ValidationFlags::all(),
+            crate::valid::Capabilities::all(),
+        ).validate(&module).unwrap();
+    }
+}
+
+/// Constant inverses must retain finite results across large and small matrix scales.
+#[test]
+fn regression_inverse_matrix_range() {
+    for (matrix, scalar, scale) in [
+        ("dmat3", "double", "determinant(dmat4(1e38))"),
+        ("dmat3", "double", "determinant(dmat4(1e-30))"),
+        ("mat2", "float", "1e30"),
+        ("mat3", "float", "1e30"),
+        ("mat4", "float", "1e30"),
+        ("mat4", "float", "1e-30"),
+    ] {
+        let source = alloc::format!(
+            "#version 450\nconst {scalar} k = {scale};\nconst {matrix} m = inverse({matrix}(k));\nvoid main() {{}}"
+        );
+        let module = Frontend::default()
+            .parse(&Options::from(ShaderStage::Compute), &source)
+            .unwrap();
+        let literal = |handle| match module.global_expressions[handle] {
+            crate::Expression::Literal(crate::Literal::F32(value)) => f64::from(value),
+            crate::Expression::Literal(crate::Literal::F64(value)) => value,
+            ref expression => panic!("unexpected literal: {expression:?}"),
+        };
+        let k = module
+            .constants
+            .iter()
+            .find(|(_, constant)| constant.name.as_deref() == Some("k"))
+            .unwrap()
+            .1;
+        let m = module
+            .constants
+            .iter()
+            .find(|(_, constant)| constant.name.as_deref() == Some("m"))
+            .unwrap()
+            .1;
+        let crate::Expression::Compose { ref components, .. } = module.global_expressions[m.init]
+        else {
+            panic!("expected matrix");
+        };
+        let crate::Expression::Compose { ref components, .. } =
+            module.global_expressions[components[0]]
+        else {
+            panic!("expected column");
+        };
+        let value = literal(components[0]) * literal(k.init);
+        assert!((value - 1.0).abs() < 1e-6, "{matrix}, {scale}: {value}");
+        crate::valid::Validator::new(
+            crate::valid::ValidationFlags::all(),
+            crate::valid::Capabilities::all(),
+        )
+        .validate(&module)
+        .unwrap();
+    }
+    assert!(Frontend::default()
+        .parse(
+            &Options::from(ShaderStage::Compute),
+            "#version 450\nconst mat2 m = inverse(mat2(1e-39));\nvoid main() {}",
+        )
+        .is_err());
+}
+
+/// Memory-only barriers must not become divergent Metal control barriers.
+#[test]
+fn regression_memory_barrier_control_flow() {
+    for body in [
+        "if (gl_LocalInvocationIndex == 0u) memoryBarrierBuffer();",
+        "for (int i = 0; i < 1; ++i) memoryBarrierImage();",
+        "while (gl_LocalInvocationIndex == 0u) { memoryBarrierShared(); break; }",
+        "switch (gl_LocalInvocationIndex) { case 0u: memoryBarrier(); break; default: break; }",
+        "if (gl_LocalInvocationIndex == 0u) return; groupMemoryBarrier();",
+        "if (gl_LocalInvocationIndex == 0u) return; { memoryBarrierAtomicCounter(); }",
+        "if (gl_LocalInvocationIndex == 0u) fence();",
+        "if (gl_LocalInvocationIndex == 0u) return; fence();",
+    ] {
+        let source = alloc::format!(
+            "#version 450\nvoid fence() {{ memoryBarrierBuffer(); }}\nvoid main() {{ {body} }}"
+        );
+        let errors = Frontend::default()
+            .parse(&Options::from(ShaderStage::Compute), &source)
+            .unwrap_err();
+        assert!(errors.errors.iter().any(|error| matches!(
+            &error.kind,
+            ErrorKind::SemanticError(message) if message.contains("Memory barriers must be unconditional and precede possible early returns")
+        )), "{errors:?}");
+    }
+    let module = Frontend::default().parse(
+        &Options::from(ShaderStage::Compute),
+        "#version 450\nvoid fence() { memoryBarrierBuffer(); }\nvoid main() { { memoryBarrierShared(); } if (gl_LocalInvocationIndex == 0u) { uint x = 0u; } fence(); barrier(); }",
+    ).unwrap();
+    crate::valid::Validator::new(
+        crate::valid::ValidationFlags::all(),
+        crate::valid::Capabilities::all(),
+    )
+    .validate(&module)
+    .unwrap();
+}
+
+/// Fixed array length queries must not read arrays that are used atomically.
+#[test]
+fn regression_atomic_array_length() {
+    for (declarations, array, target) in [
+        ("shared uint a[4];", "a", "a[0]"),
+        ("layout(binding = 0) buffer B { uint a[4]; };", "a", "a[0]"),
+        (
+            "layout(binding = 0) buffer B { uint a[4]; } b;",
+            "b.a",
+            "b.a[0]",
+        ),
+        ("struct S { uint a[4]; }; shared S s;", "s.a", "s.a[0]"),
+        (
+            "shared uint a[2][4];",
+            "a[gl_LocalInvocationIndex]",
+            "a[0][0]",
+        ),
+        (
+            "struct S { uint a[4]; }; shared S s[2];",
+            "s[gl_LocalInvocationIndex].a",
+            "s[0].a[0]",
+        ),
+        ("struct S { uint a; }; shared S s[4];", "s", "s[0].a"),
+    ] {
+        for body in [
+            alloc::format!("int n = {array}.length(); atomicAdd({target}, 1u);"),
+            alloc::format!("atomicAdd({target}, 1u); int n = {array}.length();"),
+        ] {
+            let source = alloc::format!("#version 450\n{declarations}\nvoid main() {{ {body} }}");
+            let module = Frontend::default()
+                .parse(&Options::from(ShaderStage::Compute), &source)
+                .unwrap();
+            crate::valid::Validator::new(
+                crate::valid::ValidationFlags::all(),
+                crate::valid::Capabilities::all(),
+            )
+            .validate(&module)
+            .unwrap();
+        }
+    }
+}
+
+/// Runtime array length queries must retain pointers to atomic buffer arrays.
+#[test]
+fn regression_atomic_runtime_array_length() {
+    for (instance, array) in [("", "a"), ("b", "b.a")] {
+        let source = alloc::format!(
+            "#version 450\nlayout(binding = 0) buffer B {{ uint a[]; }} {instance};\nvoid main() {{ int n = {array}.length(); atomicAdd({array}[0], 1u); }}"
+        );
+        let module = Frontend::default()
+            .parse(&Options::from(ShaderStage::Compute), &source)
+            .unwrap();
+        crate::valid::Validator::new(
+            crate::valid::ValidationFlags::all(),
+            crate::valid::Capabilities::all(),
+        )
+        .validate(&module)
+        .unwrap();
+    }
+}
+
+/// Length queries must also accept array values that are not addressable.
+#[test]
+fn regression_array_length_values() {
+    let module = Frontend::default()
+        .parse(
+            &Options::from(ShaderStage::Compute),
+            "#version 450
+            uint[4] make() { return uint[4](1u, 2u, 3u, 4u); }
+            void main() {
+                uint a[4];
+                uint b[4];
+                int n = uint[4](1u, 2u, 3u, 4u).length() + make().length()
+                    + (gl_LocalInvocationIndex == 0u ? a : b).length() + (a, b).length();
+            }",
+        )
+        .unwrap();
+    crate::valid::Validator::new(
+        crate::valid::ValidationFlags::all(),
+        crate::valid::Capabilities::all(),
+    )
+    .validate(&module)
+    .unwrap();
+}
+
+/// Scalar atomic members must retain their addresses and evaluate indices once.
+#[test]
+fn regression_atomic_member_pointer() {
+    for (declarations, target, expected_increments) in [
+        ("struct S { uint a; }; shared S s;", "s.a", 0),
+        ("layout(binding = 0) buffer B { uint a; } s;", "s.a", 0),
+        ("struct S { uint a; }; shared S s[4];", "s[i++].a", 1),
+        (
+            "layout(binding = 0) buffer B { uint a[4]; } s;",
+            "s.a[i++]",
+            1,
+        ),
+    ] {
+        let source = alloc::format!(
+            "#version 450\n{declarations}\nvoid main() {{ int i = 0; atomicAdd({target}, 1u); }}"
+        );
+        let module = Frontend::default()
+            .parse(&Options::from(ShaderStage::Compute), &source)
+            .unwrap();
+        crate::valid::Validator::new(
+            crate::valid::ValidationFlags::all(),
+            crate::valid::Capabilities::all(),
+        )
+        .validate(&module)
+        .unwrap();
+        let function = module.functions.iter().next().unwrap().1;
+        let increments = function
+            .expressions
+            .iter()
+            .filter(|(_, expression)| {
+                matches!(
+                    expression,
+                    crate::Expression::Binary {
+                        op: crate::BinaryOperator::Add,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(increments, expected_increments);
+    }
+}
+
+/// Whole-value array accesses must be rejected when the global is used atomically.
+#[test]
+fn regression_atomic_aggregate_whole_value_access() {
+    for (declarations, body) in [
+        (
+            "shared uint a[4];",
+            "a = uint[4](0u, 0u, 0u, 0u); atomicAdd(a[0], 1u);",
+        ),
+        (
+            "shared uint a[4];",
+            "atomicAdd(a[0], 1u); a = uint[4](0u, 0u, 0u, 0u);",
+        ),
+        ("shared uint a[4];", "uint b[4] = a; atomicAdd(a[0], 1u);"),
+        ("shared uint a[4];", "atomicAdd(a[0], 1u); uint b[4] = a;"),
+        (
+            "shared uint a[4];",
+            "if (true) { a = uint[4](0u, 0u, 0u, 0u); } atomicAdd(a[0], 1u);",
+        ),
+        (
+            "layout(binding = 0) buffer Data { uint a[4]; };",
+            "a = uint[4](0u, 0u, 0u, 0u); atomicAdd(a[0], 1u);",
+        ),
+        (
+            "shared uint a[2][2];",
+            "a[0] = uint[2](0u, 0u); atomicAdd(a[1][0], 1u);",
+        ),
+        (
+            "shared uint a[4]; shared uint b[4];",
+            "b = a; atomicAdd(a[0], 1u);",
+        ),
+    ] {
+        let source = alloc::format!("#version 450\n{declarations}\nvoid main() {{ {body} }}");
+        let errors = Frontend::default()
+            .parse(&Options::from(ShaderStage::Compute), &source)
+            .unwrap_err();
+        assert!(errors.errors.iter().any(|error| matches!(
+            &error.kind,
+            ErrorKind::SemanticError(message) if message.contains("Whole-value accesses to atomic structs and arrays")
+        )), "{errors:?}");
+    }
+    let module = Frontend::default().parse(
+        &Options::from(ShaderStage::Compute),
+        "#version 450\nshared uint a[4]; shared uint b[4];\nvoid main() { b = uint[4](0u, 0u, 0u, 0u); uint c[4] = b; atomicAdd(a[0], 1u); }",
+    ).unwrap();
+    crate::valid::Validator::new(
+        crate::valid::ValidationFlags::all(),
+        crate::valid::Capabilities::all(),
+    )
+    .validate(&module)
+    .unwrap();
+}
+
+/// Atomic image upgrades must reject helper calls in either source order.
+#[test]
+fn regression_atomic_image_helper_argument() {
+    let configuration = super::Configuration {
+        opaque_types: vec![super::OpaqueType {
+            name: "Image".into(),
+            logical_name: "image".into(),
+            inner: crate::TypeInner::Image {
+                dim: crate::ImageDimension::D2,
+                arrayed: false,
+                class: crate::ImageClass::Storage {
+                    format: crate::StorageFormat::R32Uint,
+                    access: crate::StorageAccess::LOAD | crate::StorageAccess::STORE,
+                },
+            },
+        }],
+        ..Default::default()
+    };
+    let mut frontend = Frontend::default();
+    for body in [
+        "touch(img); imageAtomicAdd(img, ivec2(0), 1u);",
+        "imageAtomicAdd(img, ivec2(0), 1u); touch(img);",
+        "if (true) { touch(img); } imageAtomicAdd(img, ivec2(0), 1u);",
+    ] {
+        let source = alloc::format!(
+            "#version 450\nlayout(r32ui, binding = 0) uniform Image img;\nvoid touch(Image image) {{ imageStore(image, ivec2(0), uvec4(1u)); }}\nvoid main() {{ {body} }}"
+        );
+        let errors = frontend
+            .parse_with_configuration(
+                &Options::from(ShaderStage::Compute),
+                &source,
+                &configuration,
+            )
+            .unwrap_err();
+        assert!(errors.errors.iter().any(|error| matches!(
+            &error.kind,
+            ErrorKind::SemanticError(message) if message.contains("Images upgraded for atomic operations cannot be passed to helper functions")
+        )), "{errors:?}");
+    }
+    let module = frontend.parse_with_configuration(
+        &Options::from(ShaderStage::Compute),
+        "#version 450\nlayout(r32ui, binding = 0) uniform Image img;\nvoid touch(Image image) { imageStore(image, ivec2(0), uvec4(1u)); }\nvoid main() { touch(img); }",
+        &configuration,
+    ).unwrap();
+    crate::valid::Validator::new(
+        crate::valid::ValidationFlags::all(),
+        crate::valid::Capabilities::all(),
+    )
+    .validate(&module)
+    .unwrap();
+}
+
+/// Atomic array indices must be evaluated once, including their side effects.
+#[test]
+fn regression_atomic_argument_evaluated_once() {
+    let module = Frontend::default()
+        .parse(
+            &Options::from(ShaderStage::Compute),
+            "#version 450\nshared uint a[4];\nvoid main() { int i = 0; atomicAdd(a[i++], 1u); }",
+        )
+        .unwrap();
+    crate::valid::Validator::new(
+        crate::valid::ValidationFlags::all(),
+        crate::valid::Capabilities::all(),
+    )
+    .validate(&module)
+    .unwrap();
+    let function = module.functions.iter().next().unwrap().1;
+    let increments = function
+        .expressions
+        .iter()
+        .filter(|(_, expression)| {
+            matches!(
+                expression,
+                crate::Expression::Binary {
+                    op: crate::BinaryOperator::Add,
+                    ..
+                }
+            )
+        })
+        .count();
+    assert_eq!(increments, 1);
+}
+
+/// GLSL compare-and-swap must retry a weak exchange that fails spuriously.
+#[test]
+fn regression_atomic_comp_swap_retries() {
+    let module = Frontend::default()
+        .parse(
+            &Options::from(ShaderStage::Compute),
+            "#version 450\nshared uint a;\nvoid main() { uint old = atomicCompSwap(a, 0u, 1u); }",
+        )
+        .unwrap();
+    crate::valid::Validator::new(
+        crate::valid::ValidationFlags::all(),
+        crate::valid::Capabilities::all(),
+    )
+    .validate(&module)
+    .unwrap();
+    let function = module.functions.iter().next().unwrap().1;
+    assert!(function
+        .body
+        .iter()
+        .any(|statement| matches!(statement, crate::Statement::Loop { .. })));
+}
+
+/// Image memory barriers must retain device scope in the SPIR-V writer.
+#[test]
+fn regression_image_barrier_device_scope() {
+    let module = Frontend::default()
+        .parse(
+            &Options::from(ShaderStage::Compute),
+            "#version 450\nvoid main() { memoryBarrierImage(); }",
+        )
+        .unwrap();
+    let function = module.functions.iter().next().unwrap().1;
+    assert!(function.body.iter().any(|statement| matches!(
+        statement,
+        crate::Statement::MemoryBarrier(flags)
+            if flags.contains(crate::Barrier::STORAGE | crate::Barrier::TEXTURE)
+    )));
+}
+
+/// Checks constant access errors with and without overlapping arena indices.
+fn assert_non_constant_access_error(declarations: &str, ty: &str, expression: &str) {
+    for prefix in ["uint pad0; uint pad1; uint pad2;", ""] {
+        let source = alloc::format!(
+            "#version 450\n{prefix}\n{declarations}\nconst {ty} n = {expression};\nvoid main() {{}}"
+        );
+        let errors = Frontend::default()
+            .parse(&Options::from(ShaderStage::Compute), &source)
+            .unwrap_err();
+        assert!(
+            errors
+                .errors
+                .iter()
+                .any(|error| error.kind == crate::proc::ConstantEvaluatorError::Load.into()),
+            "{source}\n{errors:?}"
+        );
+    }
+}
+
+/// Constant field access must reject runtime bases without mixing expression arenas.
+#[test]
+fn regression_constant_field_runtime_base() {
+    assert_non_constant_access_error("struct S { uint a; }; S s;", "uint", "s.a");
+    assert_non_constant_access_error("struct S { uint a; }; S s[2];", "uint", "s[0].a");
+}
+
+/// Constant swizzles must reject runtime scalar and vector bases.
+#[test]
+fn regression_constant_swizzle_runtime_base() {
+    assert_non_constant_access_error("vec4 v;", "vec4", "v.wzyx");
+    assert_non_constant_access_error("vec4 v;", "float", "v.x");
+    assert_non_constant_access_error("float v;", "vec2", "v.xx");
+}
+
+/// Constant indexing must reject runtime arrays, vectors and matrices.
+#[test]
+fn regression_constant_index_runtime_base() {
+    assert_non_constant_access_error("uint a[4];", "uint", "a[0]");
+    assert_non_constant_access_error("vec4 v;", "float", "v[0]");
+    assert_non_constant_access_error("mat2 m;", "vec2", "m[0]");
+}
+
+/// Constant length queries must reject runtime bases before resolving their types.
+#[test]
+fn regression_constant_length_runtime_base() {
+    assert_non_constant_access_error("uint a[4];", "int", "a.length()");
+    assert_non_constant_access_error("struct S { uint a[4]; }; S s;", "int", "s.a.length()");
+}
+
+/// Access chains backed by actual constants must remain valid in constant contexts.
+#[test]
+fn regression_constant_access_constant_base() {
+    for (declarations, ty, expression) in [
+        ("struct S { uint a; }; const S s = S(7u);", "uint", "s.a"),
+        ("const vec4 v = vec4(1.0);", "vec4", "v.wzyx"),
+        ("const uint a[2] = uint[2](1u, 2u);", "uint", "a[0]"),
+        ("const uint a[2] = uint[2](1u, 2u);", "int", "a.length()"),
+    ] {
+        let source = alloc::format!(
+            "#version 450\n{declarations}\nconst {ty} n = {expression};\nvoid main() {{}}"
+        );
+        let module = Frontend::default()
+            .parse(&Options::from(ShaderStage::Compute), &source)
+            .unwrap();
+        crate::valid::Validator::new(
+            crate::valid::ValidationFlags::all(),
+            crate::valid::Capabilities::all(),
+        )
+        .validate(&module)
+        .unwrap();
+    }
+}
+
+/// Swizzles on runtime conditionals must select vector values.
+#[test]
+fn regression_runtime_conditional_swizzle() {
+    let module = Frontend::default()
+        .parse(
+            &Options::from(ShaderStage::Fragment),
+            "#version 450
+            layout(location = 0) in float depth;
+            layout(location = 0) out vec4 color;
+            void main() {
+                vec4 a = vec4(1.0);
+                vec4 b = vec4(2.0);
+                color = (depth > 0.0 ? a : b).wzyx;
+            }",
+        )
+        .unwrap();
+    crate::valid::Validator::new(
+        crate::valid::ValidationFlags::all(),
+        crate::valid::Capabilities::all(),
+    )
+    .validate(&module)
+    .unwrap();
+}
+
+/// Fields on runtime conditionals must select struct values.
+#[test]
+fn regression_runtime_conditional_field() {
+    let module = Frontend::default()
+        .parse(
+            &Options::from(ShaderStage::Fragment),
+            "#version 450
+            layout(location = 0) in float depth;
+            layout(location = 0) out vec4 color;
+            struct S { vec4 field; };
+            void main() {
+                S a = S(vec4(1.0));
+                S b = S(vec4(2.0));
+                color = (depth > 0.0 ? a : b).field;
+            }",
+        )
+        .unwrap();
+    crate::valid::Validator::new(
+        crate::valid::ValidationFlags::all(),
+        crate::valid::Capabilities::all(),
+    )
+    .validate(&module)
+    .unwrap();
+}
+
+/// Constant conditionals must type-check the operand that is not selected.
+#[test]
+fn regression_constant_conditional_operand_types() {
+    for operands in ["1.0 : vec3(2.0)", "vec2(1.0) : vec3(2.0)", "1.0 : false"] {
+        let source =
+            alloc::format!("#version 450\nconst float x = true ? {operands};\nvoid main() {{}}");
+        let errors = Frontend::default()
+            .parse(&Options::from(ShaderStage::Fragment), &source)
+            .unwrap_err();
+        assert!(
+            errors.errors.iter().any(|error| matches!(
+                &error.kind,
+                ErrorKind::SemanticError(message) if message.contains("conditional operand types")
+            )),
+            "{errors:?}"
+        );
+    }
+}
+
+/// Unsupported atomic structs must fail in the frontend instead of producing invalid IR.
+#[test]
+fn regression_atomic_struct_aggregate_access() {
+    for body in [
+        "s = S(0u, 0u); atomicAdd(s.a, 1u);",
+        "atomicAdd(s.a, 1u); s = S(0u, 0u);",
+        "atomicAdd(s.a, 1u); S t = s;",
+    ] {
+        let source = alloc::format!(
+            "#version 450\nstruct S {{ uint a; uint b; }};\nshared S s;\nvoid main() {{ {body} }}"
+        );
+        let errors = Frontend::default()
+            .parse(&Options::from(ShaderStage::Compute), &source)
+            .unwrap_err();
+        assert!(
+            errors.errors.iter().any(|error| matches!(
+                &error.kind,
+                ErrorKind::SemanticError(message) if message.contains("Whole-value accesses to atomic structs and arrays")
+            )),
+            "{errors:?}"
+        );
+    }
+}
+
+/// Unsupported barrier stages must have a clear frontend diagnostic.
+#[test]
+fn regression_memory_barrier_stage_error() {
+    for stage in [ShaderStage::Vertex, ShaderStage::Fragment] {
+        for barrier in [
+            "memoryBarrierBuffer",
+            "memoryBarrierImage",
+            "memoryBarrierAtomicCounter",
+            "memoryBarrierShared",
+            "memoryBarrier",
+            "groupMemoryBarrier",
+        ] {
+            let source = alloc::format!("#version 450\nvoid main() {{ {barrier}(); }}");
+            let errors = Frontend::default()
+                .parse(&Options::from(stage), &source)
+                .unwrap_err();
+            assert!(errors.errors.iter().any(|error| matches!(
+                &error.kind,
+                ErrorKind::SemanticError(message) if message.contains("memory barriers are only supported in compute shaders")
+            )), "{errors:?}");
+        }
+    }
+}
+
+/// Image atomic operations need both read and write access.
+#[test]
+fn regression_image_atomics_require_read_write() {
+    for qualifier in ["readonly", "writeonly"] {
+        let source = alloc::format!("#version 450\nlayout(r32ui, binding = 0) uniform {qualifier} uimage2D image;\nvoid main() {{ imageAtomicAdd(image, ivec2(0), 1u); }}");
+        let errors = Frontend::default()
+            .parse(&Options::from(ShaderStage::Compute), &source)
+            .unwrap_err();
+        assert!(
+            errors.errors.iter().any(|error| matches!(
+                &error.kind,
+                ErrorKind::SemanticError(message) if message.contains("image needs")
+            )),
+            "{errors:?}"
+        );
+    }
+}
+
 /// Check that gather layers round up at half integers before integer conversion.
 #[test]
 fn texture_gather_array_layer_rounding() {

@@ -424,20 +424,20 @@ fn point_light(light: PointLight, roughness_8: f32, NdotV: f32, N: vec3<f32>, V_
     R_1 = R;
     F0_1 = F0_;
     diffuseColor_1 = diffuseColor;
-    let _e17 = light_1;
+    let _e18 = light_1.pos;
     let _e20 = v_WorldPosition_1;
-    light_to_frag = (_e17.pos.xyz - _e20.xyz);
+    light_to_frag = (_e18.xyz - _e20.xyz);
     let _e24 = light_to_frag;
     let _e25 = light_to_frag;
     distance_square = dot(_e24, _e25);
     let _e28 = distance_square;
-    let _e29 = light_1;
-    let _e32 = getDistanceAttenuation(_e28, _e29.lightParams.x);
+    let _e30 = light_1.lightParams;
+    let _e32 = getDistanceAttenuation(_e28, _e30.x);
     rangeAttenuation = _e32;
     let _e34 = roughness_9;
     a_1 = _e34;
-    let _e36 = light_1;
-    radius = _e36.lightParams.y;
+    let _e37 = light_1.lightParams;
+    radius = _e37.y;
     let _e40 = light_to_frag;
     let _e41 = R_1;
     let _e43 = R_1;
@@ -508,10 +508,10 @@ fn point_light(light: PointLight, roughness_8: f32, NdotV: f32, N: vec3<f32>, V_
     diffuse = (_e148 * _e153);
     let _e156 = diffuse;
     let _e157 = specular_1;
-    let _e159 = light_1;
+    let _e160 = light_1.color;
     let _e163 = rangeAttenuation;
     let _e164 = NoL_6;
-    return (((_e156 + _e157) * _e159.color.xyz) * (_e163 * _e164));
+    return (((_e156 + _e157) * _e160.xyz) * (_e163 * _e164));
 }
 
 fn dir_light(light_2: DirectionalLight, roughness_10: f32, NdotV_2: f32, normal: vec3<f32>, view: vec3<f32>, R_2: vec3<f32>, F0_2: vec3<f32>, diffuseColor_2: vec3<f32>) -> vec3<f32> {
@@ -540,8 +540,8 @@ fn dir_light(light_2: DirectionalLight, roughness_10: f32, NdotV_2: f32, normal:
     R_3 = R_2;
     F0_3 = F0_2;
     diffuseColor_3 = diffuseColor_2;
-    let _e16 = light_3;
-    incident_light = _e16.direction.xyz;
+    let _e17 = light_3.direction;
+    incident_light = _e17.xyz;
     let _e20 = incident_light;
     let _e21 = view_1;
     half_vector = normalize((_e20 + _e21));
@@ -573,9 +573,9 @@ fn dir_light(light_2: DirectionalLight, roughness_10: f32, NdotV_2: f32, normal:
     specular_2 = _e64;
     let _e66 = specular_2;
     let _e67 = diffuse_1;
-    let _e69 = light_3;
+    let _e70 = light_3.color;
     let _e73 = NoL_7;
-    return (((_e66 + _e67) * _e69.color.xyz) * _e73);
+    return (((_e66 + _e67) * _e70.xyz) * _e73);
 }
 
 fn main_1() {

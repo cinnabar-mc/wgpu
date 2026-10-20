@@ -1,9 +1,9 @@
 //! Upgrade the types of scalars observed to be accessed as atomics to [`Atomic`] types.
 //!
-//! In SPIR-V, atomic operations can be applied to any scalar value, but in Naga
+//! In SPIR-V and GLSL, atomic operations can be applied to any scalar value, but in Naga
 //! IR atomic operations can only be applied to values of type [`Atomic`]. Naga
 //! IR's restriction matches Metal Shading Language and WGSL, so we don't want
-//! to relax that. Instead, when the SPIR-V front end observes a value being
+//! to relax that. Instead, when the SPIR-V or GLSL front end observes a value being
 //! accessed using atomic instructions, it promotes the value's type from
 //! [`Scalar`] to [`Atomic`]. This module implements `Module::upgrade_atomics`,
 //! the function that makes that change.
@@ -17,10 +17,6 @@
 //! on [`Atomic`] values, retrieving and depositing ordinary [`Scalar`] values,
 //! so changing the types doesn't have much effect on the code that operates on
 //! those values.
-//!
-//! Future work:
-//!
-//! - The GLSL front end could use this transformation as well.
 //!
 //! [`Atomic`]: TypeInner::Atomic
 //! [`Scalar`]: TypeInner::Scalar

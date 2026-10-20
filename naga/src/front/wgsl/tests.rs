@@ -2,6 +2,43 @@ use alloc::format;
 
 use super::parse_str;
 
+/// Smoothstep must report overflowing intermediates before clamping hides them.
+#[test]
+fn regression_smoothstep_non_finite_intermediates() {
+    for arguments in [
+        "-3e38f, 3e38f, 0.0f",
+        "-3e38f, -2e38f, 3e38f",
+        "0.0f, 1e-38f, 3e38f",
+        "-65000.0h, 65000.0h, 0.0h",
+        "-65000.0h, -64000.0h, 65000.0h",
+        "0.0h, 0.001h, 65000.0h",
+        "-1e308, 1e308, 0.0",
+        "vec2(-3e38f, 0.0f), vec2(3e38f, 1.0f), vec2(0.0f)",
+    ] {
+        let source = format!("enable f16; const c = smoothstep({arguments});");
+        let error = parse_str(&source).unwrap_err();
+        assert!(error.emit_to_string(&source).contains("smoothstep"));
+    }
+    parse_str("const c = smoothstep(0.0, 1.0, 2.0);").unwrap();
+    parse_str("const c = smoothstep(1.0, 0.0, -1.0);").unwrap();
+}
+
+/// Equal smoothstep edges are invalid for every constant floating-point shape.
+#[test]
+fn regression_smoothstep_equal_edges() {
+    for arguments in [
+        "1.0, 1.0, 1.0",
+        "1.0f, 1.0f, 0.0f",
+        "1.0h, 1.0h, 2.0h",
+        "vec2(0.0, 1.0), vec2(1.0, 1.0), vec2(0.5, 1.0)",
+    ] {
+        let source = format!("enable f16; const x = smoothstep({arguments});");
+        let error = parse_str(&source).unwrap_err();
+        assert!(error.emit_to_string(&source).contains("smoothstep"));
+    }
+    parse_str("const x = smoothstep(1.0, 0.0, 0.5);").unwrap();
+}
+
 #[test]
 fn parse_comment() {
     parse_str(

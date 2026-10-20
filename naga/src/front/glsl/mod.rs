@@ -42,6 +42,9 @@ mod variables;
 
 type Result<T> = core::result::Result<T, Error>;
 
+const ATOMIC_AGGREGATE_ACCESS_ERROR: &str =
+    "Whole-value accesses to atomic structs and arrays are not supported";
+
 /// Per-shader options passed to [`parse`](Frontend::parse).
 ///
 /// The [`From`] trait is implemented for [`ShaderStage`] to provide a quick way
@@ -184,6 +187,13 @@ pub struct Frontend {
     layouter: Layouter,
 
     errors: Vec<Error>,
+
+    /// Globals and struct fields accessed with `atomic*` functions, whose
+    /// scalar types become atomic once parsing is done.
+    atomic_upgrades: crate::front::atomic_upgrade::Upgrades,
+
+    /// Images whose native access was upgraded by an image atomic operation.
+    atomic_images: crate::arena::HandleSet<crate::GlobalVariable>,
 }
 
 impl Frontend {
@@ -197,6 +207,8 @@ impl Frontend {
         self.global_variables.clear();
         self.entry_args.clear();
         self.layouter.clear();
+        self.atomic_upgrades = Default::default();
+        self.atomic_images.clear();
     }
 
     /// Parses a shader either outputting a shader [`Module`] or a list of

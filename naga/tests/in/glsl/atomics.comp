@@ -1,0 +1,22 @@
+#version 450
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) buffer Counts { uint total; uint hist[]; };
+layout(r32ui, binding = 1) uniform uimage2D marks;
+shared int lightCount;
+shared uint lightHashMap[128];
+void main() {
+    if (gl_LocalInvocationIndex == 0u) lightCount = 0;
+    barrier();
+    memoryBarrierShared();
+    int index = atomicAdd(lightCount, 1);
+    uint bit = 1u << (gl_LocalInvocationIndex % 32u);
+    bool known = (atomicOr(lightHashMap[gl_LocalInvocationIndex / 32u], bit) & bit) != 0u;
+    atomicMax(hist[index], 3u);
+    uint old = atomicCompSwap(total, 0u, uint(index));
+    atomicExchange(lightCount, -1);
+    imageAtomicOr(marks, ivec2(index, 0), old);
+    memoryBarrierImage();
+    groupMemoryBarrier();
+    memoryBarrier();
+    if (known) atomicMin(lightCount, 7);
+}

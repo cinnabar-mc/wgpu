@@ -572,11 +572,15 @@ impl<'a> Context<'a> {
                     // Don't try to generate `AccessIndex` if in a LHS position, since it
                     // wouldn't produce a pointer.
                     ExprPos::Lhs => None,
-                    _ => self
-                        .module
-                        .to_ctx()
-                        .get_const_val_from(index, &self.expressions)
-                        .ok(),
+                    _ => {
+                        // Constant expressions live in the module's arena.
+                        let arena = if self.is_const {
+                            &self.module.global_expressions
+                        } else {
+                            &self.expressions
+                        };
+                        self.module.to_ctx().get_const_val_from(index, arena).ok()
+                    }
                 };
 
                 let base = self
@@ -607,7 +611,9 @@ impl<'a> Context<'a> {
                 pointer
             }
             HirExprKind::Select { base, ref field } => {
-                let base = self.lower_expect_inner(stmt, frontend, base, pos)?.0;
+                let base = self
+                    .lower_expect_inner(stmt, frontend, base, pos.maybe_access_base(true))?
+                    .0;
 
                 frontend.field_selection(self, pos, base, field, meta)?
             }
@@ -1049,6 +1055,15 @@ impl<'a> Context<'a> {
 
                     var.expr
                 }
+                // A constant expression indexes the constant itself; `var.expr`
+                // lives in a function's arena.
+                ExprPos::AccessBase { .. } if self.is_const => {
+                    let (constant, _) = var.constant.ok_or_else(|| Error {
+                        kind: crate::proc::ConstantEvaluatorError::Load.into(),
+                        meta,
+                    })?;
+                    self.add_expression(Expression::Constant(constant), meta)?
+                }
                 ExprPos::AccessBase { constant_index } => {
                     // If the index isn't constant all accesses backed by a constant base need
                     // to be done through a proxy local variable, since constants have a non
@@ -1114,6 +1129,54 @@ impl<'a> Context<'a> {
                 condition,
                 accept,
                 reject,
+            } if ExprPos::Lhs != pos && self.is_const => {
+                // In a constant expression the condition is known, so the
+                // conditional is the selected operand, converted to the type
+                // both operands share. A runtime `if` can't exist here.
+                let (condition, condition_meta) =
+                    self.lower_expect_inner(stmt, frontend, condition, ExprPos::Rhs)?;
+                let (mut accept, accept_meta) =
+                    self.lower_expect_inner(stmt, frontend, accept, ExprPos::Rhs)?;
+                let (mut reject, reject_meta) =
+                    self.lower_expect_inner(stmt, frontend, reject, ExprPos::Rhs)?;
+                self.binary_implicit_conversion(
+                    &mut accept,
+                    accept_meta,
+                    &mut reject,
+                    reject_meta,
+                )?;
+                self.typifier_grow(accept, accept_meta)?;
+                self.typifier_grow(reject, reject_meta)?;
+                if !crate::proc::compare_types(
+                    self.get_type_resolution(accept),
+                    self.get_type_resolution(reject),
+                    &self.module.types,
+                ) {
+                    return Err(Error {
+                        kind: ErrorKind::SemanticError(
+                            "Incompatible constant conditional operand types".into(),
+                        ),
+                        meta,
+                    });
+                }
+                match self[condition] {
+                    Expression::Literal(Literal::Bool(true)) => accept,
+                    Expression::Literal(Literal::Bool(false)) => reject,
+                    _ => {
+                        return Err(Error {
+                            kind: ErrorKind::SemanticError(
+                                "Condition of a constant conditional must be a constant bool"
+                                    .into(),
+                            ),
+                            meta: condition_meta,
+                        })
+                    }
+                }
+            }
+            HirExprKind::Conditional {
+                condition,
+                accept,
+                reject,
             } if ExprPos::Lhs != pos => {
                 // Given an expression `a ? b : c`, we need to produce a Naga
                 // statement roughly like:
@@ -1137,13 +1200,13 @@ impl<'a> Context<'a> {
                 let (mut accept_body, (mut accept, accept_meta)) =
                     self.new_body_with_ret(|ctx| {
                         // Lower the `true` branch
-                        ctx.lower_expect_inner(stmt, frontend, accept, pos)
+                        ctx.lower_expect_inner(stmt, frontend, accept, ExprPos::Rhs)
                     })?;
 
                 let (mut reject_body, (mut reject, reject_meta)) =
                     self.new_body_with_ret(|ctx| {
                         // Lower the `false` branch
-                        ctx.lower_expect_inner(stmt, frontend, reject, pos)
+                        ctx.lower_expect_inner(stmt, frontend, reject, ExprPos::Rhs)
                     })?;
 
                 // We need to do some custom implicit conversions since the two target expressions
@@ -1345,8 +1408,18 @@ impl<'a> Context<'a> {
                                 meta,
                             });
                         }
-                        let lowered_array = self.lower_expect_inner(stmt, frontend, object, pos)?.0;
-                        let array_type = self.resolve_type(lowered_array, meta)?;
+                        let lowered_array = self
+                            .lower_expect_inner(
+                                stmt,
+                                frontend,
+                                object,
+                                pos.maybe_access_base(true),
+                            )?
+                            .0;
+                        let array_type = match *self.resolve_type(lowered_array, meta)? {
+                            TypeInner::Pointer { base, .. } => &self.module.types[base].inner,
+                            ref ty => ty,
+                        };
 
                         match *array_type {
                             TypeInner::Array {

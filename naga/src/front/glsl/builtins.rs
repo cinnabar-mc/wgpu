@@ -9,10 +9,10 @@ use super::{
     Error, ErrorKind, Frontend, Result,
 };
 use crate::{
-    BinaryOperator, DerivativeAxis as Axis, DerivativeControl as Ctrl, Expression, Handle,
-    ImageClass, ImageDimension as Dim, ImageQuery, MathFunction, Module, RelationalFunction,
-    SampleLevel, Scalar, ScalarKind as Sk, Span, SwizzleComponent, Type, TypeInner, UnaryOperator,
-    VectorSize,
+    AtomicFunction, Barrier, BinaryOperator, DerivativeAxis as Axis, DerivativeControl as Ctrl,
+    Expression, Handle, ImageClass, ImageDimension as Dim, ImageQuery, MathFunction, Module,
+    RelationalFunction, SampleLevel, Scalar, ScalarKind as Sk, Span, SwizzleComponent, Type,
+    TypeInner, UnaryOperator, VectorSize,
 };
 
 impl crate::ScalarKind {
@@ -502,7 +502,59 @@ pub fn inject_builtin(
             // Don't generate shadow nor multisampled images since they aren't supported
             texture_args_generator(variations.into(), f)
         }
+        "imageAtomicAdd"
+        | "imageAtomicMin"
+        | "imageAtomicMax"
+        | "imageAtomicAnd"
+        | "imageAtomicOr"
+        | "imageAtomicXor"
+        | "imageAtomicExchange" => {
+            let fun = atomic_function(&name["imageAtomic".len()..]);
+            let f = |kind: Sk, dim, arrayed, _, _| {
+                // Atomics need 32-bit integer texels, and naga has no cube storage images
+                if dim == Dim::Cube || kind == Sk::Float {
+                    return;
+                }
+
+                let image = TypeInner::Image {
+                    dim,
+                    arrayed,
+                    class: ImageClass::Storage {
+                        format: kind.dummy_storage_format(),
+                        access: crate::StorageAccess::LOAD | crate::StorageAccess::STORE,
+                    },
+                };
+                let coord_size = image_dims_to_coords_size(dim) + arrayed as usize;
+                let args = vec![
+                    image,
+                    make_coords_arg(coord_size, Sk::Sint),
+                    TypeInner::Scalar(Scalar { kind, width: 4 }),
+                ];
+
+                // Naga's image atomics return nothing, so these can only be
+                // called as statements.
+                let mut overload = module.add_builtin(args, MacroCall::ImageAtomic(fun));
+                overload.void = true;
+                declaration.overloads.push(overload)
+            };
+
+            texture_args_generator(variations.into(), f)
+        }
         _ => {}
+    }
+}
+
+/// The operation of an `atomic*` or `imageAtomic*` built-in, given its name
+/// without that prefix (`Add`, `Or`, …).
+fn atomic_function(operation: &str) -> AtomicFunction {
+    match operation {
+        "Add" => AtomicFunction::Add,
+        "Min" => AtomicFunction::Min,
+        "Max" => AtomicFunction::Max,
+        "And" => AtomicFunction::And,
+        "Or" => AtomicFunction::InclusiveOr,
+        "Xor" => AtomicFunction::ExclusiveOr,
+        _ => AtomicFunction::Exchange { compare: None },
     }
 }
 
@@ -1083,6 +1135,38 @@ fn inject_standard_builtins(
                     .push(module.add_builtin(args, MacroCall::Clamp(size)))
             }
         }
+        "memoryBarrier"
+        | "memoryBarrierShared"
+        | "memoryBarrierBuffer"
+        | "memoryBarrierImage"
+        | "memoryBarrierAtomicCounter"
+        | "groupMemoryBarrier" => {
+            let barrier = match name {
+                "memoryBarrierShared" => Barrier::WORK_GROUP,
+                "memoryBarrierBuffer" | "memoryBarrierAtomicCounter" => Barrier::STORAGE,
+                "memoryBarrierImage" => Barrier::TEXTURE | Barrier::STORAGE,
+                _ => Barrier::STORAGE | Barrier::WORK_GROUP | Barrier::TEXTURE,
+            };
+            let mut overload = module.add_builtin(Vec::new(), MacroCall::MemoryBarrier(barrier));
+            overload.void = true;
+            declaration.overloads.push(overload)
+        }
+        "atomicAdd" | "atomicMin" | "atomicMax" | "atomicAnd" | "atomicOr" | "atomicXor"
+        | "atomicExchange" | "atomicCompSwap" => {
+            let (macro_call, count) = match name {
+                "atomicCompSwap" => (MacroCall::AtomicCompSwap, 3),
+                _ => (
+                    MacroCall::Atomic(atomic_function(&name["atomic".len()..])),
+                    2,
+                ),
+            };
+            for scalar in [Scalar::I32, Scalar::U32] {
+                let mut overload =
+                    module.add_builtin(vec![TypeInner::Scalar(scalar); count], macro_call);
+                overload.parameters_info[0].qualifier = ParameterQualifier::InOut;
+                declaration.overloads.push(overload)
+            }
+        }
         "barrier" => declaration
             .overloads
             .push(module.add_builtin(Vec::new(), MacroCall::Barrier)),
@@ -1658,6 +1742,15 @@ pub enum MacroCall {
     BitCast(Sk),
     Derivate(Axis, Ctrl),
     Barrier,
+    /// `memoryBarrier*()` and `groupMemoryBarrier()`.
+    MemoryBarrier(Barrier),
+    /// `atomic*(inout mem, data)`. The memory argument is passed as a pointer
+    /// into a buffer or `shared` variable, whose type is upgraded to atomic.
+    Atomic(AtomicFunction),
+    /// `atomicCompSwap(inout mem, compare, data)`.
+    AtomicCompSwap,
+    /// `imageAtomic*(image, coord, data)`, called as a statement.
+    ImageAtomic(AtomicFunction),
     /// SmoothStep needs a separate variant because it might need it's inputs
     /// to be splatted depending on the overload
     SmoothStep {
@@ -1669,6 +1762,7 @@ pub enum MacroCall {
 impl MacroCall {
     /// Adds the necessary expressions and statements to the passed body and
     /// finally returns the final expression with the correct result
+    #[allow(clippy::large_stack_frames)] // TODO(https://github.com/gfx-rs/wgpu/issues/9456)
     pub fn call(
         &self,
         frontend: &mut Frontend,
@@ -2295,6 +2389,157 @@ impl MacroCall {
                 },
                 Span::default(),
             )?,
+            MacroCall::MemoryBarrier(barrier) => {
+                if !frontend.meta.stage.compute_like() {
+                    return Err(Error {
+                        kind: ErrorKind::SemanticError(
+                            "GLSL memory barriers are only supported in compute shaders".into(),
+                        ),
+                        meta,
+                    });
+                }
+                ctx.emit_restart();
+                ctx.body
+                    .push(crate::Statement::MemoryBarrier(barrier), meta);
+                return Ok(None);
+            }
+            MacroCall::Atomic(fun) => {
+                frontend.record_atomic_access(ctx, args[0], meta)?;
+                let ty = ctx.resolve_type_handle(args[1], meta)?;
+                ctx.emit_end();
+                let result = ctx.add_expression(
+                    Expression::AtomicResult {
+                        ty,
+                        comparison: false,
+                    },
+                    meta,
+                )?;
+                ctx.body.push(
+                    crate::Statement::Atomic {
+                        pointer: args[0],
+                        fun,
+                        value: args[1],
+                        result: Some(result),
+                    },
+                    meta,
+                );
+                ctx.emit_start();
+                result
+            }
+            MacroCall::AtomicCompSwap => {
+                frontend.record_atomic_access(ctx, args[0], meta)?;
+                let TypeInner::Scalar(scalar) = *ctx.resolve_type(args[1], meta)? else {
+                    unreachable!("atomicCompSwap overloads take scalars");
+                };
+                let ty = ctx.module.generate_predeclared_type(
+                    crate::PredeclaredType::AtomicCompareExchangeWeakResult(scalar),
+                );
+                let scalar_ty = ctx.resolve_type_handle(args[1], meta)?;
+                let local = ctx.locals.append(
+                    crate::LocalVariable {
+                        name: None,
+                        ty: scalar_ty,
+                        init: None,
+                    },
+                    meta,
+                );
+                let pointer = ctx.add_expression(Expression::LocalVariable(local), meta)?;
+                ctx.emit_end();
+                let outer_body = core::mem::take(&mut ctx.body);
+                let result = ctx.add_expression(
+                    Expression::AtomicResult {
+                        ty,
+                        comparison: true,
+                    },
+                    meta,
+                )?;
+                ctx.body.push(
+                    crate::Statement::Atomic {
+                        pointer: args[0],
+                        fun: AtomicFunction::Exchange {
+                            compare: Some(args[1]),
+                        },
+                        value: args[2],
+                        result: Some(result),
+                    },
+                    meta,
+                );
+                ctx.emit_start();
+                let old_value = ctx.add_expression(
+                    Expression::AccessIndex {
+                        base: result,
+                        index: 0,
+                    },
+                    meta,
+                )?;
+                let exchanged = ctx.add_expression(
+                    Expression::AccessIndex {
+                        base: result,
+                        index: 1,
+                    },
+                    meta,
+                )?;
+                let mismatch = ctx.add_expression(
+                    Expression::Binary {
+                        op: BinaryOperator::NotEqual,
+                        left: old_value,
+                        right: args[1],
+                    },
+                    meta,
+                )?;
+                let done = ctx.add_expression(
+                    Expression::Binary {
+                        op: BinaryOperator::LogicalOr,
+                        left: exchanged,
+                        right: mismatch,
+                    },
+                    meta,
+                )?;
+                ctx.emit_end();
+                ctx.body.push(
+                    crate::Statement::Store {
+                        pointer,
+                        value: old_value,
+                    },
+                    meta,
+                );
+                // Only retry when the comparison matched but the weak exchange failed.
+                ctx.body.push(
+                    crate::Statement::If {
+                        condition: done,
+                        accept: crate::Block::from_vec(vec![crate::Statement::Break]),
+                        reject: crate::Block::new(),
+                    },
+                    meta,
+                );
+                let body = core::mem::replace(&mut ctx.body, outer_body);
+                ctx.body.push(
+                    crate::Statement::Loop {
+                        body,
+                        continuing: crate::Block::new(),
+                        break_if: None,
+                    },
+                    meta,
+                );
+                ctx.emit_start();
+                ctx.add_expression(Expression::Load { pointer }, meta)?
+            }
+            MacroCall::ImageAtomic(fun) => {
+                frontend.allow_image_atomics(ctx, args[0], meta)?;
+                let comps = frontend.coordinate_components(ctx, args[0], args[1], None, meta)?;
+                ctx.emit_restart();
+                ctx.body.push(
+                    crate::Statement::ImageAtomic {
+                        image: args[0],
+                        coordinate: comps.coordinate,
+                        array_index: comps.array_index,
+                        fun,
+                        value: args[2],
+                    },
+                    meta,
+                );
+                return Ok(None);
+            }
             MacroCall::Barrier => {
                 // GLSL's `barrier()` synchronizes the invocations of a workgroup and
                 // orders accesses to `shared` variables, like glslang's
@@ -2302,10 +2547,8 @@ impl MacroCall {
                 // `Barrier::all()` would also request a subgroup barrier, which needs
                 // the `SUBGROUP_BARRIER` capability.
                 ctx.emit_restart();
-                ctx.body.push(
-                    crate::Statement::ControlBarrier(crate::Barrier::WORK_GROUP),
-                    meta,
-                );
+                ctx.body
+                    .push(crate::Statement::ControlBarrier(Barrier::WORK_GROUP), meta);
                 return Ok(None);
             }
             MacroCall::SmoothStep { splatted } => {
@@ -2373,6 +2616,101 @@ struct CoordComponents {
     depth_ref: Option<Handle<Expression>>,
     array_index: Option<Handle<Expression>>,
     used_extra: bool,
+}
+
+impl Frontend {
+    /// Notes the global variable and struct fields that `pointer`, the memory
+    /// argument of an `atomic*` call, points into, so that their scalar types
+    /// are upgraded to atomics after parsing. Returns the type `pointer` points to.
+    fn record_atomic_access(
+        &mut self,
+        ctx: &Context,
+        pointer: Handle<Expression>,
+        meta: Span,
+    ) -> Result<Handle<Type>> {
+        let unsupported = |what: &str| Error {
+            kind: ErrorKind::SemanticError(
+                alloc::format!("atomic operations need a buffer or shared scalar, not {what}")
+                    .into(),
+            ),
+            meta,
+        };
+        match ctx.expressions[pointer] {
+            Expression::Access { base, .. } => {
+                let ty = self.record_atomic_access(ctx, base, meta)?;
+                match ctx.module.types[ty].inner {
+                    TypeInner::Array { base, .. } => Ok(base),
+                    _ => Err(unsupported("a vector or matrix component")),
+                }
+            }
+            Expression::AccessIndex { base, index } => {
+                let ty = self.record_atomic_access(ctx, base, meta)?;
+                match ctx.module.types[ty].inner {
+                    TypeInner::Struct { ref members, .. } => {
+                        self.atomic_upgrades.insert_field(ty, index as usize);
+                        Ok(members[index as usize].ty)
+                    }
+                    TypeInner::Array { base, .. } => Ok(base),
+                    _ => Err(unsupported("a vector or matrix component")),
+                }
+            }
+            Expression::GlobalVariable(global) => {
+                let var = &ctx.module.global_variables[global];
+                match var.space {
+                    crate::AddressSpace::Storage { .. } | crate::AddressSpace::WorkGroup => {
+                        self.atomic_upgrades.insert_global(global);
+                        Ok(var.ty)
+                    }
+                    _ => Err(unsupported("a variable in this address space")),
+                }
+            }
+            _ => Err(unsupported("a local value")),
+        }
+    }
+
+    /// Adds atomic access to the storage image `image`, the global variable
+    /// an `imageAtomic*` call operates on.
+    fn allow_image_atomics(
+        &mut self,
+        ctx: &mut Context,
+        image: Handle<Expression>,
+        meta: Span,
+    ) -> Result<()> {
+        let Expression::GlobalVariable(global) = ctx.expressions[image] else {
+            return Err(Error {
+                kind: ErrorKind::SemanticError(
+                    "image atomic operations need a global image".into(),
+                ),
+                meta,
+            });
+        };
+        let ty = &ctx.module.types[ctx.module.global_variables[global].ty];
+        let TypeInner::Image {
+            dim,
+            arrayed,
+            class: ImageClass::Storage { format, access },
+        } = ty.inner
+        else {
+            unreachable!("imageAtomic overloads take storage images");
+        };
+        if access.contains(crate::StorageAccess::ATOMIC) {
+            return Ok(());
+        }
+        let atomic = Type {
+            name: ty.name.clone(),
+            inner: TypeInner::Image {
+                dim,
+                arrayed,
+                class: ImageClass::Storage {
+                    format,
+                    access: access | crate::StorageAccess::ATOMIC,
+                },
+            },
+        };
+        ctx.module.global_variables[global].ty = ctx.module.types.insert(atomic, meta);
+        self.atomic_images.insert(global);
+        Ok(())
+    }
 }
 
 impl Frontend {

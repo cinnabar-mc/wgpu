@@ -1,0 +1,12 @@
+#version 450
+layout(local_size_x = 1) in;
+shared uint values[4];
+shared int signedValue;
+void main() {
+    int index = 0;
+    uint expected = 0u;
+    uint replacement = 1u;
+    uint old = atomicCompSwap(values[index++], expected++, replacement++);
+    int signedOld = atomicCompSwap(signedValue, 0, 1);
+    atomicAdd(values[index++], old + uint(signedOld));
+}

@@ -10,6 +10,7 @@ OpExtension "SPV_KHR_integer_dot_product"
 OpMemoryModel Logical GLSL450
 OpEntryPoint GLCompute %69 "main"
 OpExecutionMode %69 LocalSize 1 1 1
+OpDecorate %15 NoContraction
 %2 = OpTypeVoid
 %4 = OpTypeFloat 32
 %3 = OpTypeVector %4 2

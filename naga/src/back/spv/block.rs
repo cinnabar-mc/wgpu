@@ -1574,7 +1574,14 @@ impl BlockContext<'_> {
                         Some(crate::ScalarKind::Sint) => spirv::GlslStd450Op::SSign,
                         other => unimplemented!("Unexpected sign({:?})", other),
                     }),
-                    Mf::Fma => MathOp::Ext(spirv::GlslStd450Op::Fma),
+                    Mf::Fma => {
+                        // Without `NoContraction` a driver may evaluate `fma` as a separate
+                        // multiply and add and re-fuse them in another order; `fma` is asked for
+                        // to get exactly one fused rounding.
+                        self.writer
+                            .decorate(id, spirv::Decoration::NoContraction, &[]);
+                        MathOp::Ext(spirv::GlslStd450Op::Fma)
+                    }
                     Mf::Mix => {
                         let selector = arg2.unwrap();
                         let selector_ty =

@@ -5,18 +5,31 @@
 /// to the end, because it may be either redundant or invalid,
 /// e.g. when the user already has returns in if/else branches.
 pub fn ensure_block_returns(block: &mut crate::Block) {
+    ensure_block_returns_value(block, &mut || None);
+}
+
+/// Like [`ensure_block_returns`], but the appended return statements return
+/// `value()`, which is only called where control flow can reach the end of
+/// `block`.
+///
+/// Frontends use this for languages where flowing off the end of a function
+/// with a return type is allowed and returns an undefined value.
+pub fn ensure_block_returns_value(
+    block: &mut crate::Block,
+    value: &mut dyn FnMut() -> Option<crate::Handle<crate::Expression>>,
+) {
     use crate::Statement as S;
     match block.last_mut() {
         Some(&mut S::Block(ref mut b)) => {
-            ensure_block_returns(b);
+            ensure_block_returns_value(b, value);
         }
         Some(&mut S::If {
             condition: _,
             ref mut accept,
             ref mut reject,
         }) => {
-            ensure_block_returns(accept);
-            ensure_block_returns(reject);
+            ensure_block_returns_value(accept, value);
+            ensure_block_returns_value(reject, value);
         }
         Some(&mut S::Switch {
             selector: _,
@@ -24,7 +37,7 @@ pub fn ensure_block_returns(block: &mut crate::Block) {
         }) => {
             for case in cases.iter_mut() {
                 if !case.fall_through {
-                    ensure_block_returns(&mut case.body);
+                    ensure_block_returns_value(&mut case.body, value);
                 }
             }
         }
@@ -47,6 +60,6 @@ pub fn ensure_block_returns(block: &mut crate::Block) {
             | S::CooperativeStore { .. }
             | S::RayPipelineFunction(_)),
         )
-        | None => block.push(S::Return { value: None }, Default::default()),
+        | None => block.push(S::Return { value: value() }, Default::default()),
     }
 }
