@@ -11,6 +11,173 @@ use super::{
 };
 use crate::ShaderStage;
 
+/// Ordinary aggregate members stay usable beside an atomic member.
+#[test]
+fn regression_atomic_unmodified_subtree() {
+    for (declarations, body) in [
+        (
+            "struct S { uint a; }; layout(std430, binding = 0) buffer B { uint counter; uint data[4]; S info; };",
+            "atomicAdd(counter, 1u); uint copy[4] = data; data = uint[4](0u, 0u, 0u, 0u); S infoCopy = info; info = S(1u);",
+        ),
+        (
+            "struct S { uint a; }; layout(std430, binding = 0) buffer B { uint counter; uint data[4]; S info; } global;",
+            "atomicAdd(global.counter, 1u); uint copy[4] = global.data; global.data = uint[4](0u, 0u, 0u, 0u); S infoCopy = global.info; global.info = S(1u);",
+        ),
+        (
+            "struct S { uint a; }; struct T { uint counter; S info; }; shared T global;",
+            "atomicAdd(global.counter, 1u); S infoCopy = global.info; global.info = S(1u);",
+        ),
+    ] {
+        let source = alloc::format!(
+            "#version 450\n{declarations}\nvoid main() {{ {body} }}"
+        );
+        let module = Frontend::default().parse(&Options::from(ShaderStage::Compute), &source).unwrap();
+        crate::valid::Validator::new(
+            crate::valid::ValidationFlags::all(),
+            crate::valid::Capabilities::all(),
+        ).validate(&module).unwrap();
+    }
+}
+
+/// Constant inverses must retain finite results across large and small matrix scales.
+#[test]
+fn regression_inverse_matrix_range() {
+    for (matrix, scalar, scale) in [
+        ("dmat3", "double", "determinant(dmat4(1e38))"),
+        ("dmat3", "double", "determinant(dmat4(1e-30))"),
+        ("mat2", "float", "1e30"),
+        ("mat3", "float", "1e30"),
+        ("mat4", "float", "1e30"),
+        ("mat4", "float", "1e-30"),
+    ] {
+        let source = alloc::format!(
+            "#version 450\nconst {scalar} k = {scale};\nconst {matrix} m = inverse({matrix}(k));\nvoid main() {{}}"
+        );
+        let module = Frontend::default()
+            .parse(&Options::from(ShaderStage::Compute), &source)
+            .unwrap();
+        let literal = |handle| match module.global_expressions[handle] {
+            crate::Expression::Literal(crate::Literal::F32(value)) => f64::from(value),
+            crate::Expression::Literal(crate::Literal::F64(value)) => value,
+            ref expression => panic!("unexpected literal: {expression:?}"),
+        };
+        let k = module
+            .constants
+            .iter()
+            .find(|(_, constant)| constant.name.as_deref() == Some("k"))
+            .unwrap()
+            .1;
+        let m = module
+            .constants
+            .iter()
+            .find(|(_, constant)| constant.name.as_deref() == Some("m"))
+            .unwrap()
+            .1;
+        let crate::Expression::Compose { ref components, .. } = module.global_expressions[m.init]
+        else {
+            panic!("expected matrix");
+        };
+        let crate::Expression::Compose { ref components, .. } =
+            module.global_expressions[components[0]]
+        else {
+            panic!("expected column");
+        };
+        let value = literal(components[0]) * literal(k.init);
+        assert!((value - 1.0).abs() < 1e-6, "{matrix}, {scale}: {value}");
+        crate::valid::Validator::new(
+            crate::valid::ValidationFlags::all(),
+            crate::valid::Capabilities::all(),
+        )
+        .validate(&module)
+        .unwrap();
+    }
+    assert!(Frontend::default()
+        .parse(
+            &Options::from(ShaderStage::Compute),
+            "#version 450\nconst mat2 m = inverse(mat2(1e-39));\nvoid main() {}",
+        )
+        .is_err());
+}
+
+/// Memory-only barriers must not become divergent Metal control barriers.
+#[test]
+fn regression_memory_barrier_control_flow() {
+    for body in [
+        "if (gl_LocalInvocationIndex == 0u) memoryBarrierBuffer();",
+        "for (int i = 0; i < 1; ++i) memoryBarrierImage();",
+        "while (gl_LocalInvocationIndex == 0u) { memoryBarrierShared(); break; }",
+        "switch (gl_LocalInvocationIndex) { case 0u: memoryBarrier(); break; default: break; }",
+        "if (gl_LocalInvocationIndex == 0u) return; groupMemoryBarrier();",
+        "if (gl_LocalInvocationIndex == 0u) return; { memoryBarrierAtomicCounter(); }",
+        "if (gl_LocalInvocationIndex == 0u) fence();",
+        "if (gl_LocalInvocationIndex == 0u) return; fence();",
+    ] {
+        let source = alloc::format!(
+            "#version 450\nvoid fence() {{ memoryBarrierBuffer(); }}\nvoid main() {{ {body} }}"
+        );
+        let errors = Frontend::default()
+            .parse(&Options::from(ShaderStage::Compute), &source)
+            .unwrap_err();
+        assert!(errors.errors.iter().any(|error| matches!(
+            &error.kind,
+            ErrorKind::SemanticError(message) if message.contains("Memory barriers must be unconditional and precede possible early returns")
+        )), "{errors:?}");
+    }
+    let module = Frontend::default().parse(
+        &Options::from(ShaderStage::Compute),
+        "#version 450\nvoid fence() { memoryBarrierBuffer(); }\nvoid main() { { memoryBarrierShared(); } if (gl_LocalInvocationIndex == 0u) { uint x = 0u; } fence(); barrier(); }",
+    ).unwrap();
+    crate::valid::Validator::new(
+        crate::valid::ValidationFlags::all(),
+        crate::valid::Capabilities::all(),
+    )
+    .validate(&module)
+    .unwrap();
+}
+
+/// Scalar atomic members must retain their addresses and evaluate indices once.
+#[test]
+fn regression_atomic_member_pointer() {
+    for (declarations, target, expected_increments) in [
+        ("struct S { uint a; }; shared S s;", "s.a", 0),
+        ("layout(binding = 0) buffer B { uint a; } s;", "s.a", 0),
+        ("struct S { uint a; }; shared S s[4];", "s[i++].a", 1),
+        (
+            "layout(binding = 0) buffer B { uint a[4]; } s;",
+            "s.a[i++]",
+            1,
+        ),
+    ] {
+        let source = alloc::format!(
+            "#version 450\n{declarations}\nvoid main() {{ int i = 0; atomicAdd({target}, 1u); }}"
+        );
+        let module = Frontend::default()
+            .parse(&Options::from(ShaderStage::Compute), &source)
+            .unwrap();
+        crate::valid::Validator::new(
+            crate::valid::ValidationFlags::all(),
+            crate::valid::Capabilities::all(),
+        )
+        .validate(&module)
+        .unwrap();
+        let function = module.functions.iter().next().unwrap().1;
+        let increments = function
+            .expressions
+            .iter()
+            .filter(|(_, expression)| {
+                matches!(
+                    expression,
+                    crate::Expression::Binary {
+                        op: crate::BinaryOperator::Add,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(increments, expected_increments);
+    }
+}
+
 /// Whole-value array accesses must be rejected when the global is used atomically.
 #[test]
 fn regression_atomic_aggregate_whole_value_access() {

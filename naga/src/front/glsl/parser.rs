@@ -191,13 +191,14 @@ impl<'source> ParsingContext<'source> {
                     if decl.defined && decl.parameters.is_empty() {
                         frontend.add_entry_point(handle, ctx)?;
                         let upgrades = core::mem::take(&mut frontend.atomic_upgrades);
-                        frontend.validate_atomic_accesses(&module, &upgrades)?;
                         if !upgrades.is_empty() {
                             module.upgrade_atomics(&upgrades).map_err(|e| Error {
                                 kind: ErrorKind::SemanticError(alloc::format!("{e}").into()),
                                 meta: Span::default(),
                             })?;
                         }
+                        frontend.validate_atomic_accesses(&module, &upgrades)?;
+                        Frontend::validate_memory_barriers(&module)?;
                         return Ok(module);
                     }
                 }

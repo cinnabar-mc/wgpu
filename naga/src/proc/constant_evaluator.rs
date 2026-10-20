@@ -2148,6 +2148,19 @@ impl<'a> ConstantEvaluator<'a> {
         if nc != nr {
             return Err(ConstantEvaluatorError::InvalidMathArg);
         }
+        // Scaling keeps the determinant in range without narrowing f32 intermediates.
+        let scale = if fun == crate::MathFunction::Inverse {
+            m.iter()
+                .flatten()
+                .fold(0.0f64, |scale, value| scale.max(value.abs()))
+        } else {
+            1.0
+        };
+        if scale != 0.0 && scale != 1.0 {
+            for value in m.iter_mut().flatten() {
+                *value /= scale;
+            }
+        }
         let det = determinant(&m, nc);
         if fun == crate::MathFunction::Determinant {
             let det = literal(det)?;
@@ -2162,7 +2175,7 @@ impl<'a> ConstantEvaluator<'a> {
         for (c, column) in inv.iter_mut().enumerate().take(nc) {
             for (r, v) in column.iter_mut().enumerate().take(nr) {
                 let sign = if (r + c) % 2 == 0 { 1.0 } else { -1.0 };
-                *v = sign * determinant(&minor(&m, r, c, nc), nc - 1) / det;
+                *v = sign * determinant(&minor(&m, r, c, nc), nc - 1) / det / scale;
             }
         }
         self.matrix_from_columns(&inv, columns, rows, scalar, literal, span)

@@ -52,7 +52,9 @@ Bottom level categories:
 
 #### naga
 
-- Preserve GLSL atomic argument evaluation, compare-and-swap semantics, image access restrictions, and image barrier scope. Report whole-value accesses to atomic structs and arrays, atomic images passed to helper functions, and unsupported memory barrier stages in the frontend.
+- Preserve GLSL atomic argument evaluation, member addresses, compare-and-swap semantics, image access restrictions, and image barrier scope. Keep aggregate subtrees without atomic fields usable.
+- Report whole-value accesses to atomic-bearing aggregates and atomic images passed to helper functions. Reject memory-only barriers outside compute stages, inside conditional control flow, or after possible early returns.
+- Preserve finite constant matrix inverses at large and small scales with scaled f64 intermediates.
 - Validate both operands of constant GLSL conditionals and reject constant `smoothstep` calls with equal edges or non-finite intermediates.
 - Retain resources passed to unused helper parameters, preserve scalar and unnamed function prototypes, and keep rejected shadow overloads from changing resource types.
 - Use native storage-image access when emitting Metal and GLSL helper parameters.

@@ -611,7 +611,9 @@ impl<'a> Context<'a> {
                 pointer
             }
             HirExprKind::Select { base, ref field } => {
-                let base = self.lower_expect_inner(stmt, frontend, base, pos)?.0;
+                let base = self
+                    .lower_expect_inner(stmt, frontend, base, pos.maybe_access_base(true))?
+                    .0;
 
                 frontend.field_selection(self, pos, base, field, meta)?
             }

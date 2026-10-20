@@ -26,8 +26,8 @@ fn main_1() {
     let _e46 = c.lo[2];
     let _e49 = p.lo[3];
     let _e53 = p.b[1];
-    let _e54 = c;
-    o = vec4<f32>((_e46 + _e49), _e53.x, _e53.y, _e54.a);
+    let _e55 = c.a;
+    o = vec4<f32>((_e46 + _e49), _e53.x, _e53.y, _e55);
     return;
 }
 

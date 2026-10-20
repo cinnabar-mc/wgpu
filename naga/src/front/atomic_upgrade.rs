@@ -117,11 +117,6 @@ impl Upgrades {
     pub fn is_empty(&self) -> bool {
         self.globals.is_empty()
     }
-
-    /// Returns whether a global needs its scalar leaves upgraded to atomic types.
-    pub(crate) fn contains_global(&self, global: Handle<GlobalVariable>) -> bool {
-        self.globals.contains(global)
-    }
 }
 
 struct UpgradeState<'a> {
