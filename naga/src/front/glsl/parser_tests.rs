@@ -353,6 +353,55 @@ fn regression_image_barrier_device_scope() {
     )));
 }
 
+/// Swizzles on runtime conditionals must select vector values.
+#[test]
+fn regression_runtime_conditional_swizzle() {
+    let module = Frontend::default()
+        .parse(
+            &Options::from(ShaderStage::Fragment),
+            "#version 450
+            layout(location = 0) in float depth;
+            layout(location = 0) out vec4 color;
+            void main() {
+                vec4 a = vec4(1.0);
+                vec4 b = vec4(2.0);
+                color = (depth > 0.0 ? a : b).wzyx;
+            }",
+        )
+        .unwrap();
+    crate::valid::Validator::new(
+        crate::valid::ValidationFlags::all(),
+        crate::valid::Capabilities::all(),
+    )
+    .validate(&module)
+    .unwrap();
+}
+
+/// Fields on runtime conditionals must select struct values.
+#[test]
+fn regression_runtime_conditional_field() {
+    let module = Frontend::default()
+        .parse(
+            &Options::from(ShaderStage::Fragment),
+            "#version 450
+            layout(location = 0) in float depth;
+            layout(location = 0) out vec4 color;
+            struct S { vec4 field; };
+            void main() {
+                S a = S(vec4(1.0));
+                S b = S(vec4(2.0));
+                color = (depth > 0.0 ? a : b).field;
+            }",
+        )
+        .unwrap();
+    crate::valid::Validator::new(
+        crate::valid::ValidationFlags::all(),
+        crate::valid::Capabilities::all(),
+    )
+    .validate(&module)
+    .unwrap();
+}
+
 /// Constant conditionals must type-check the operand that is not selected.
 #[test]
 fn regression_constant_conditional_operand_types() {

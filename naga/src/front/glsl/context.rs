@@ -1133,9 +1133,9 @@ impl<'a> Context<'a> {
                 let (condition, condition_meta) =
                     self.lower_expect_inner(stmt, frontend, condition, ExprPos::Rhs)?;
                 let (mut accept, accept_meta) =
-                    self.lower_expect_inner(stmt, frontend, accept, pos)?;
+                    self.lower_expect_inner(stmt, frontend, accept, ExprPos::Rhs)?;
                 let (mut reject, reject_meta) =
-                    self.lower_expect_inner(stmt, frontend, reject, pos)?;
+                    self.lower_expect_inner(stmt, frontend, reject, ExprPos::Rhs)?;
                 self.binary_implicit_conversion(
                     &mut accept,
                     accept_meta,
@@ -1197,13 +1197,13 @@ impl<'a> Context<'a> {
                 let (mut accept_body, (mut accept, accept_meta)) =
                     self.new_body_with_ret(|ctx| {
                         // Lower the `true` branch
-                        ctx.lower_expect_inner(stmt, frontend, accept, pos)
+                        ctx.lower_expect_inner(stmt, frontend, accept, ExprPos::Rhs)
                     })?;
 
                 let (mut reject_body, (mut reject, reject_meta)) =
                     self.new_body_with_ret(|ctx| {
                         // Lower the `false` branch
-                        ctx.lower_expect_inner(stmt, frontend, reject, pos)
+                        ctx.lower_expect_inner(stmt, frontend, reject, ExprPos::Rhs)
                     })?;
 
                 // We need to do some custom implicit conversions since the two target expressions
