@@ -52,8 +52,8 @@ Bottom level categories:
 
 #### naga
 
-- Preserve GLSL atomic argument evaluation, compare-and-swap semantics, image access restrictions, and image barrier scope. Report unsupported atomic aggregate accesses and memory barrier stages in the frontend.
-- Validate both operands of constant GLSL conditionals and reject constant `smoothstep` calls with equal edges.
+- Preserve GLSL atomic argument evaluation, compare-and-swap semantics, image access restrictions, and image barrier scope. Report whole-value accesses to atomic structs and arrays, atomic images passed to helper functions, and unsupported memory barrier stages in the frontend.
+- Validate both operands of constant GLSL conditionals and reject constant `smoothstep` calls with equal edges or non-finite intermediates.
 - Retain resources passed to unused helper parameters, preserve scalar and unnamed function prototypes, and keep rejected shadow overloads from changing resource types.
 - Use native storage-image access when emitting Metal and GLSL helper parameters.
 - Preserve GLSL image parameter memory restrictions independently of native resource access.

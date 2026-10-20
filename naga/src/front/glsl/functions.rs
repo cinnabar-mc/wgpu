@@ -841,7 +841,7 @@ impl Frontend {
                     let Expression::Load { pointer } = ctx.expressions[call_argument.0] else {
                         return Err(Error {
                             kind: ErrorKind::SemanticError(
-                                "Atomic operations require a scalar memory argument; struct fields accessed through aggregate values are not supported".into(),
+                                super::ATOMIC_AGGREGATE_ACCESS_ERROR.into(),
                             ),
                             meta: call_argument.1,
                         });
@@ -1723,27 +1723,122 @@ impl Context<'_> {
     }
 }
 
+impl Frontend {
+    /// Rejects accesses whose value or helper parameter types cannot follow atomic upgrades.
+    pub(super) fn validate_atomic_accesses(
+        &self,
+        module: &crate::Module,
+        upgrades: &crate::front::atomic_upgrade::Upgrades,
+    ) -> Result<()> {
+        if upgrades.is_empty() && self.atomic_images.is_empty() {
+            return Ok(());
+        }
+        for function in module
+            .functions
+            .iter()
+            .map(|(_, function)| function)
+            .chain(module.entry_points.iter().map(|entry| &entry.function))
+        {
+            let mut typifier = crate::front::Typifier::new();
+            let resolve_ctx = crate::proc::ResolveContext::with_locals(
+                module,
+                &function.local_variables,
+                &function.arguments,
+            );
+            if let Some((last, _)) = function.expressions.iter().next_back() {
+                typifier
+                    .grow(last, &function.expressions, &resolve_ctx)
+                    .map_err(|error| Error {
+                        kind: ErrorKind::SemanticError(
+                            format!("Can't resolve type: {error:?}").into(),
+                        ),
+                        meta: function.expressions.get_span(last),
+                    })?;
+            }
+            let is_atomic_aggregate = |mut pointer| {
+                let TypeInner::Pointer { base, .. } = *typifier.get(pointer, &module.types) else {
+                    return false;
+                };
+                if !matches!(
+                    module.types[base].inner,
+                    TypeInner::Struct { .. } | TypeInner::Array { .. }
+                ) {
+                    return false;
+                }
+                loop {
+                    match function.expressions[pointer] {
+                        Expression::Access { base, .. } | Expression::AccessIndex { base, .. } => {
+                            pointer = base
+                        }
+                        Expression::GlobalVariable(global) => {
+                            return upgrades.contains_global(global)
+                        }
+                        _ => return false,
+                    }
+                }
+            };
+            for (handle, expression) in function.expressions.iter() {
+                if matches!(*expression, Expression::Load { pointer } if is_atomic_aggregate(pointer))
+                {
+                    return Err(Error {
+                        kind: ErrorKind::SemanticError(super::ATOMIC_AGGREGATE_ACCESS_ERROR.into()),
+                        meta: function.expressions.get_span(handle),
+                    });
+                }
+            }
+            let mut error = None;
+            visit_statements(&function.body, &mut |statement, meta| {
+                let message = match *statement {
+                    Statement::Store { pointer, .. } if is_atomic_aggregate(pointer) => super::ATOMIC_AGGREGATE_ACCESS_ERROR,
+                    Statement::Call { ref arguments, .. } if arguments.iter().any(|argument| {
+                        matches!(function.expressions[*argument], Expression::GlobalVariable(global) if self.atomic_images.contains(global))
+                    }) => "Images upgraded for atomic operations cannot be passed to helper functions",
+                    _ => return,
+                };
+                error.get_or_insert(Error {
+                    kind: ErrorKind::SemanticError(message.into()),
+                    meta,
+                });
+            });
+            if let Some(error) = error {
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Visits selected calls in nested blocks without following the call graph recursively.
 fn visit_calls(block: &Block, visit: &mut impl FnMut(Handle<Function>, &[Handle<Expression>])) {
-    for statement in block.iter() {
+    visit_statements(block, &mut |statement, _| {
+        if let Statement::Call {
+            function,
+            ref arguments,
+            ..
+        } = *statement
+        {
+            visit(function, arguments);
+        }
+    });
+}
+
+/// Visits every statement in a block and its nested control flow.
+fn visit_statements(block: &Block, visit: &mut impl FnMut(&Statement, Span)) {
+    for (statement, &span) in block.span_iter() {
+        visit(statement, span);
         match *statement {
-            Statement::Call {
-                function,
-                ref arguments,
-                ..
-            } => visit(function, arguments),
-            Statement::Block(ref block) => visit_calls(block, visit),
+            Statement::Block(ref block) => visit_statements(block, visit),
             Statement::If {
                 ref accept,
                 ref reject,
                 ..
             } => {
-                visit_calls(accept, visit);
-                visit_calls(reject, visit);
+                visit_statements(accept, visit);
+                visit_statements(reject, visit);
             }
             Statement::Switch { ref cases, .. } => {
                 for case in cases {
-                    visit_calls(&case.body, visit);
+                    visit_statements(&case.body, visit);
                 }
             }
             Statement::Loop {
@@ -1751,8 +1846,8 @@ fn visit_calls(block: &Block, visit: &mut impl FnMut(Handle<Function>, &[Handle<
                 ref continuing,
                 ..
             } => {
-                visit_calls(body, visit);
-                visit_calls(continuing, visit);
+                visit_statements(body, visit);
+                visit_statements(continuing, visit);
             }
             _ => {}
         }

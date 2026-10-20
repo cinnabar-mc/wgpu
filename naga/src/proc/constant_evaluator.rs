@@ -1786,9 +1786,18 @@ impl<'a> ConstantEvaluator<'a> {
                             "smoothstep".into(),
                         ));
                     }
+                    let numerator = x - edge0;
+                    let denominator = edge1 - edge0;
+                    if !numerator.is_finite() || !denominator.is_finite() {
+                        return Err(ConstantEvaluatorError::Overflow("smoothstep".into()));
+                    }
+                    let quotient = numerator / denominator;
+                    if !quotient.is_finite() {
+                        return Err(ConstantEvaluatorError::Overflow("smoothstep".into()));
+                    }
                     let mut one = x;
                     one.set_one();
-                    let t = ((x - edge0) / (edge1 - edge0)).max(Zero::zero()).min(one);
+                    let t = quotient.max(Zero::zero()).min(one);
                     let two = one + one;
                     Ok([t * t * (two + one - two * t)])
                 }

@@ -2647,16 +2647,6 @@ impl Frontend {
                 let ty = self.record_atomic_access(ctx, base, meta)?;
                 match ctx.module.types[ty].inner {
                     TypeInner::Struct { ref members, .. } => {
-                        if !matches!(ctx.expressions[base], Expression::GlobalVariable(global)
-                            if matches!(ctx.module.global_variables[global].space, crate::AddressSpace::Storage { .. }))
-                        {
-                            return Err(Error {
-                                kind: ErrorKind::SemanticError(
-                                    "Atomic operations on struct fields are only supported directly in buffer blocks".into(),
-                                ),
-                                meta,
-                            });
-                        }
                         self.atomic_upgrades.insert_field(ty, index as usize);
                         Ok(members[index as usize].ty)
                     }
@@ -2718,6 +2708,7 @@ impl Frontend {
             },
         };
         ctx.module.global_variables[global].ty = ctx.module.types.insert(atomic, meta);
+        self.atomic_images.insert(global);
         Ok(())
     }
 }

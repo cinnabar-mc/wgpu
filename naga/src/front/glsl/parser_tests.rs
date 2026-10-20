@@ -11,6 +11,110 @@ use super::{
 };
 use crate::ShaderStage;
 
+/// Whole-value array accesses must be rejected when the global is used atomically.
+#[test]
+fn regression_atomic_aggregate_whole_value_access() {
+    for (declarations, body) in [
+        (
+            "shared uint a[4];",
+            "a = uint[4](0u, 0u, 0u, 0u); atomicAdd(a[0], 1u);",
+        ),
+        (
+            "shared uint a[4];",
+            "atomicAdd(a[0], 1u); a = uint[4](0u, 0u, 0u, 0u);",
+        ),
+        ("shared uint a[4];", "uint b[4] = a; atomicAdd(a[0], 1u);"),
+        ("shared uint a[4];", "atomicAdd(a[0], 1u); uint b[4] = a;"),
+        (
+            "shared uint a[4];",
+            "if (true) { a = uint[4](0u, 0u, 0u, 0u); } atomicAdd(a[0], 1u);",
+        ),
+        (
+            "layout(binding = 0) buffer Data { uint a[4]; };",
+            "a = uint[4](0u, 0u, 0u, 0u); atomicAdd(a[0], 1u);",
+        ),
+        (
+            "shared uint a[2][2];",
+            "a[0] = uint[2](0u, 0u); atomicAdd(a[1][0], 1u);",
+        ),
+        (
+            "shared uint a[4]; shared uint b[4];",
+            "b = a; atomicAdd(a[0], 1u);",
+        ),
+    ] {
+        let source = alloc::format!("#version 450\n{declarations}\nvoid main() {{ {body} }}");
+        let errors = Frontend::default()
+            .parse(&Options::from(ShaderStage::Compute), &source)
+            .unwrap_err();
+        assert!(errors.errors.iter().any(|error| matches!(
+            &error.kind,
+            ErrorKind::SemanticError(message) if message.contains("Whole-value accesses to atomic structs and arrays")
+        )), "{errors:?}");
+    }
+    let module = Frontend::default().parse(
+        &Options::from(ShaderStage::Compute),
+        "#version 450\nshared uint a[4]; shared uint b[4];\nvoid main() { b = uint[4](0u, 0u, 0u, 0u); uint c[4] = b; atomicAdd(a[0], 1u); }",
+    ).unwrap();
+    crate::valid::Validator::new(
+        crate::valid::ValidationFlags::all(),
+        crate::valid::Capabilities::all(),
+    )
+    .validate(&module)
+    .unwrap();
+}
+
+/// Atomic image upgrades must reject helper calls in either source order.
+#[test]
+fn regression_atomic_image_helper_argument() {
+    let configuration = super::Configuration {
+        opaque_types: vec![super::OpaqueType {
+            name: "Image".into(),
+            logical_name: "image".into(),
+            inner: crate::TypeInner::Image {
+                dim: crate::ImageDimension::D2,
+                arrayed: false,
+                class: crate::ImageClass::Storage {
+                    format: crate::StorageFormat::R32Uint,
+                    access: crate::StorageAccess::LOAD | crate::StorageAccess::STORE,
+                },
+            },
+        }],
+        ..Default::default()
+    };
+    let mut frontend = Frontend::default();
+    for body in [
+        "touch(img); imageAtomicAdd(img, ivec2(0), 1u);",
+        "imageAtomicAdd(img, ivec2(0), 1u); touch(img);",
+        "if (true) { touch(img); } imageAtomicAdd(img, ivec2(0), 1u);",
+    ] {
+        let source = alloc::format!(
+            "#version 450\nlayout(r32ui, binding = 0) uniform Image img;\nvoid touch(Image image) {{ imageStore(image, ivec2(0), uvec4(1u)); }}\nvoid main() {{ {body} }}"
+        );
+        let errors = frontend
+            .parse_with_configuration(
+                &Options::from(ShaderStage::Compute),
+                &source,
+                &configuration,
+            )
+            .unwrap_err();
+        assert!(errors.errors.iter().any(|error| matches!(
+            &error.kind,
+            ErrorKind::SemanticError(message) if message.contains("Images upgraded for atomic operations cannot be passed to helper functions")
+        )), "{errors:?}");
+    }
+    let module = frontend.parse_with_configuration(
+        &Options::from(ShaderStage::Compute),
+        "#version 450\nlayout(r32ui, binding = 0) uniform Image img;\nvoid touch(Image image) { imageStore(image, ivec2(0), uvec4(1u)); }\nvoid main() { touch(img); }",
+        &configuration,
+    ).unwrap();
+    crate::valid::Validator::new(
+        crate::valid::ValidationFlags::all(),
+        crate::valid::Capabilities::all(),
+    )
+    .validate(&module)
+    .unwrap();
+}
+
 /// Atomic array indices must be evaluated once, including their side effects.
 #[test]
 fn regression_atomic_argument_evaluated_once() {
@@ -118,7 +222,7 @@ fn regression_atomic_struct_aggregate_access() {
         assert!(
             errors.errors.iter().any(|error| matches!(
                 &error.kind,
-                ErrorKind::SemanticError(message) if message.contains("struct fields")
+                ErrorKind::SemanticError(message) if message.contains("Whole-value accesses to atomic structs and arrays")
             )),
             "{errors:?}"
         );
