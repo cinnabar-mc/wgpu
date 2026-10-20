@@ -1405,8 +1405,18 @@ impl<'a> Context<'a> {
                                 meta,
                             });
                         }
-                        let lowered_array = self.lower_expect_inner(stmt, frontend, object, pos)?.0;
-                        let array_type = self.resolve_type(lowered_array, meta)?;
+                        let lowered_array = self
+                            .lower_expect_inner(
+                                stmt,
+                                frontend,
+                                object,
+                                pos.maybe_access_base(true),
+                            )?
+                            .0;
+                        let array_type = match *self.resolve_type(lowered_array, meta)? {
+                            TypeInner::Pointer { base, .. } => &self.module.types[base].inner,
+                            ref ty => ty,
+                        };
 
                         match *array_type {
                             TypeInner::Array {

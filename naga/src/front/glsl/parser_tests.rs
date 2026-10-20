@@ -135,6 +135,91 @@ fn regression_memory_barrier_control_flow() {
     .unwrap();
 }
 
+/// Fixed array length queries must not read arrays that are used atomically.
+#[test]
+fn regression_atomic_array_length() {
+    for (declarations, array, target) in [
+        ("shared uint a[4];", "a", "a[0]"),
+        ("layout(binding = 0) buffer B { uint a[4]; };", "a", "a[0]"),
+        (
+            "layout(binding = 0) buffer B { uint a[4]; } b;",
+            "b.a",
+            "b.a[0]",
+        ),
+        ("struct S { uint a[4]; }; shared S s;", "s.a", "s.a[0]"),
+        (
+            "shared uint a[2][4];",
+            "a[gl_LocalInvocationIndex]",
+            "a[0][0]",
+        ),
+        (
+            "struct S { uint a[4]; }; shared S s[2];",
+            "s[gl_LocalInvocationIndex].a",
+            "s[0].a[0]",
+        ),
+        ("struct S { uint a; }; shared S s[4];", "s", "s[0].a"),
+    ] {
+        for body in [
+            alloc::format!("int n = {array}.length(); atomicAdd({target}, 1u);"),
+            alloc::format!("atomicAdd({target}, 1u); int n = {array}.length();"),
+        ] {
+            let source = alloc::format!("#version 450\n{declarations}\nvoid main() {{ {body} }}");
+            let module = Frontend::default()
+                .parse(&Options::from(ShaderStage::Compute), &source)
+                .unwrap();
+            crate::valid::Validator::new(
+                crate::valid::ValidationFlags::all(),
+                crate::valid::Capabilities::all(),
+            )
+            .validate(&module)
+            .unwrap();
+        }
+    }
+}
+
+/// Runtime array length queries must retain pointers to atomic buffer arrays.
+#[test]
+fn regression_atomic_runtime_array_length() {
+    for (instance, array) in [("", "a"), ("b", "b.a")] {
+        let source = alloc::format!(
+            "#version 450\nlayout(binding = 0) buffer B {{ uint a[]; }} {instance};\nvoid main() {{ int n = {array}.length(); atomicAdd({array}[0], 1u); }}"
+        );
+        let module = Frontend::default()
+            .parse(&Options::from(ShaderStage::Compute), &source)
+            .unwrap();
+        crate::valid::Validator::new(
+            crate::valid::ValidationFlags::all(),
+            crate::valid::Capabilities::all(),
+        )
+        .validate(&module)
+        .unwrap();
+    }
+}
+
+/// Length queries must also accept array values that are not addressable.
+#[test]
+fn regression_array_length_values() {
+    let module = Frontend::default()
+        .parse(
+            &Options::from(ShaderStage::Compute),
+            "#version 450
+            uint[4] make() { return uint[4](1u, 2u, 3u, 4u); }
+            void main() {
+                uint a[4];
+                uint b[4];
+                int n = uint[4](1u, 2u, 3u, 4u).length() + make().length()
+                    + (gl_LocalInvocationIndex == 0u ? a : b).length() + (a, b).length();
+            }",
+        )
+        .unwrap();
+    crate::valid::Validator::new(
+        crate::valid::ValidationFlags::all(),
+        crate::valid::Capabilities::all(),
+    )
+    .validate(&module)
+    .unwrap();
+}
+
 /// Scalar atomic members must retain their addresses and evaluate indices once.
 #[test]
 fn regression_atomic_member_pointer() {
