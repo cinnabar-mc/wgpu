@@ -55,6 +55,7 @@ Bottom level categories:
 - Preserve GLSL atomic argument evaluation, member addresses, compare-and-swap semantics, image access restrictions, and image barrier scope. Keep aggregate subtrees without atomic fields usable.
 - Preserve value types in GLSL conditional operands used by field selections and swizzles.
 - Preserve GLSL length queries on fixed-size and runtime-sized atomic arrays.
+- Report constant-expression errors for GLSL accesses with non-constant bases instead of panicking.
 - Report whole-value accesses to atomic-bearing aggregates and atomic images passed to helper functions. Reject memory-only barriers outside compute stages, inside conditional control flow, or after possible early returns.
 - Preserve finite constant matrix inverses at large and small scales with scaled f64 intermediates.
 - Validate both operands of constant GLSL conditionals and reject constant `smoothstep` calls with equal edges or non-finite intermediates.

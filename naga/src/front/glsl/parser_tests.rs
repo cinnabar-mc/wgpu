@@ -438,6 +438,79 @@ fn regression_image_barrier_device_scope() {
     )));
 }
 
+/// Checks constant access errors with and without overlapping arena indices.
+fn assert_non_constant_access_error(declarations: &str, ty: &str, expression: &str) {
+    for prefix in ["uint pad0; uint pad1; uint pad2;", ""] {
+        let source = alloc::format!(
+            "#version 450\n{prefix}\n{declarations}\nconst {ty} n = {expression};\nvoid main() {{}}"
+        );
+        let errors = Frontend::default()
+            .parse(&Options::from(ShaderStage::Compute), &source)
+            .unwrap_err();
+        assert!(
+            errors
+                .errors
+                .iter()
+                .any(|error| error.kind == crate::proc::ConstantEvaluatorError::Load.into()),
+            "{source}\n{errors:?}"
+        );
+    }
+}
+
+/// Constant field access must reject runtime bases without mixing expression arenas.
+#[test]
+fn regression_constant_field_runtime_base() {
+    assert_non_constant_access_error("struct S { uint a; }; S s;", "uint", "s.a");
+    assert_non_constant_access_error("struct S { uint a; }; S s[2];", "uint", "s[0].a");
+}
+
+/// Constant swizzles must reject runtime scalar and vector bases.
+#[test]
+fn regression_constant_swizzle_runtime_base() {
+    assert_non_constant_access_error("vec4 v;", "vec4", "v.wzyx");
+    assert_non_constant_access_error("vec4 v;", "float", "v.x");
+    assert_non_constant_access_error("float v;", "vec2", "v.xx");
+}
+
+/// Constant indexing must reject runtime arrays, vectors and matrices.
+#[test]
+fn regression_constant_index_runtime_base() {
+    assert_non_constant_access_error("uint a[4];", "uint", "a[0]");
+    assert_non_constant_access_error("vec4 v;", "float", "v[0]");
+    assert_non_constant_access_error("mat2 m;", "vec2", "m[0]");
+}
+
+/// Constant length queries must reject runtime bases before resolving their types.
+#[test]
+fn regression_constant_length_runtime_base() {
+    assert_non_constant_access_error("uint a[4];", "int", "a.length()");
+    assert_non_constant_access_error("struct S { uint a[4]; }; S s;", "int", "s.a.length()");
+}
+
+/// Access chains backed by actual constants must remain valid in constant contexts.
+#[test]
+fn regression_constant_access_constant_base() {
+    for (declarations, ty, expression) in [
+        ("struct S { uint a; }; const S s = S(7u);", "uint", "s.a"),
+        ("const vec4 v = vec4(1.0);", "vec4", "v.wzyx"),
+        ("const uint a[2] = uint[2](1u, 2u);", "uint", "a[0]"),
+        ("const uint a[2] = uint[2](1u, 2u);", "int", "a.length()"),
+    ] {
+        let source = alloc::format!(
+            "#version 450\n{declarations}\nconst {ty} n = {expression};\nvoid main() {{}}"
+        );
+        let module = Frontend::default()
+            .parse(&Options::from(ShaderStage::Compute), &source)
+            .unwrap();
+        crate::valid::Validator::new(
+            crate::valid::ValidationFlags::all(),
+            crate::valid::Capabilities::all(),
+        )
+        .validate(&module)
+        .unwrap();
+    }
+}
+
 /// Swizzles on runtime conditionals must select vector values.
 #[test]
 fn regression_runtime_conditional_swizzle() {

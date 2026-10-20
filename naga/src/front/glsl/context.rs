@@ -1057,8 +1057,11 @@ impl<'a> Context<'a> {
                 }
                 // A constant expression indexes the constant itself; `var.expr`
                 // lives in a function's arena.
-                ExprPos::AccessBase { .. } if self.is_const && var.constant.is_some() => {
-                    let (constant, _) = var.constant.unwrap();
+                ExprPos::AccessBase { .. } if self.is_const => {
+                    let (constant, _) = var.constant.ok_or_else(|| Error {
+                        kind: crate::proc::ConstantEvaluatorError::Load.into(),
+                        meta,
+                    })?;
                     self.add_expression(Expression::Constant(constant), meta)?
                 }
                 ExprPos::AccessBase { constant_index } => {
