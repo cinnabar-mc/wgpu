@@ -11,6 +11,162 @@ use super::{
 };
 use crate::ShaderStage;
 
+/// Atomic array indices must be evaluated once, including their side effects.
+#[test]
+fn regression_atomic_argument_evaluated_once() {
+    let module = Frontend::default()
+        .parse(
+            &Options::from(ShaderStage::Compute),
+            "#version 450\nshared uint a[4];\nvoid main() { int i = 0; atomicAdd(a[i++], 1u); }",
+        )
+        .unwrap();
+    crate::valid::Validator::new(
+        crate::valid::ValidationFlags::all(),
+        crate::valid::Capabilities::all(),
+    )
+    .validate(&module)
+    .unwrap();
+    let function = module.functions.iter().next().unwrap().1;
+    let increments = function
+        .expressions
+        .iter()
+        .filter(|(_, expression)| {
+            matches!(
+                expression,
+                crate::Expression::Binary {
+                    op: crate::BinaryOperator::Add,
+                    ..
+                }
+            )
+        })
+        .count();
+    assert_eq!(increments, 1);
+}
+
+/// GLSL compare-and-swap must retry a weak exchange that fails spuriously.
+#[test]
+fn regression_atomic_comp_swap_retries() {
+    let module = Frontend::default()
+        .parse(
+            &Options::from(ShaderStage::Compute),
+            "#version 450\nshared uint a;\nvoid main() { uint old = atomicCompSwap(a, 0u, 1u); }",
+        )
+        .unwrap();
+    crate::valid::Validator::new(
+        crate::valid::ValidationFlags::all(),
+        crate::valid::Capabilities::all(),
+    )
+    .validate(&module)
+    .unwrap();
+    let function = module.functions.iter().next().unwrap().1;
+    assert!(function
+        .body
+        .iter()
+        .any(|statement| matches!(statement, crate::Statement::Loop { .. })));
+}
+
+/// Image memory barriers must retain device scope in the SPIR-V writer.
+#[test]
+fn regression_image_barrier_device_scope() {
+    let module = Frontend::default()
+        .parse(
+            &Options::from(ShaderStage::Compute),
+            "#version 450\nvoid main() { memoryBarrierImage(); }",
+        )
+        .unwrap();
+    let function = module.functions.iter().next().unwrap().1;
+    assert!(function.body.iter().any(|statement| matches!(
+        statement,
+        crate::Statement::MemoryBarrier(flags)
+            if flags.contains(crate::Barrier::STORAGE | crate::Barrier::TEXTURE)
+    )));
+}
+
+/// Constant conditionals must type-check the operand that is not selected.
+#[test]
+fn regression_constant_conditional_operand_types() {
+    for operands in ["1.0 : vec3(2.0)", "vec2(1.0) : vec3(2.0)", "1.0 : false"] {
+        let source =
+            alloc::format!("#version 450\nconst float x = true ? {operands};\nvoid main() {{}}");
+        let errors = Frontend::default()
+            .parse(&Options::from(ShaderStage::Fragment), &source)
+            .unwrap_err();
+        assert!(
+            errors.errors.iter().any(|error| matches!(
+                &error.kind,
+                ErrorKind::SemanticError(message) if message.contains("conditional operand types")
+            )),
+            "{errors:?}"
+        );
+    }
+}
+
+/// Unsupported atomic structs must fail in the frontend instead of producing invalid IR.
+#[test]
+fn regression_atomic_struct_aggregate_access() {
+    for body in [
+        "s = S(0u, 0u); atomicAdd(s.a, 1u);",
+        "atomicAdd(s.a, 1u); s = S(0u, 0u);",
+        "atomicAdd(s.a, 1u); S t = s;",
+    ] {
+        let source = alloc::format!(
+            "#version 450\nstruct S {{ uint a; uint b; }};\nshared S s;\nvoid main() {{ {body} }}"
+        );
+        let errors = Frontend::default()
+            .parse(&Options::from(ShaderStage::Compute), &source)
+            .unwrap_err();
+        assert!(
+            errors.errors.iter().any(|error| matches!(
+                &error.kind,
+                ErrorKind::SemanticError(message) if message.contains("struct fields")
+            )),
+            "{errors:?}"
+        );
+    }
+}
+
+/// Unsupported barrier stages must have a clear frontend diagnostic.
+#[test]
+fn regression_memory_barrier_stage_error() {
+    for stage in [ShaderStage::Vertex, ShaderStage::Fragment] {
+        for barrier in [
+            "memoryBarrierBuffer",
+            "memoryBarrierImage",
+            "memoryBarrierAtomicCounter",
+            "memoryBarrierShared",
+            "memoryBarrier",
+            "groupMemoryBarrier",
+        ] {
+            let source = alloc::format!("#version 450\nvoid main() {{ {barrier}(); }}");
+            let errors = Frontend::default()
+                .parse(&Options::from(stage), &source)
+                .unwrap_err();
+            assert!(errors.errors.iter().any(|error| matches!(
+                &error.kind,
+                ErrorKind::SemanticError(message) if message.contains("memory barriers are only supported in compute shaders")
+            )), "{errors:?}");
+        }
+    }
+}
+
+/// Image atomic operations need both read and write access.
+#[test]
+fn regression_image_atomics_require_read_write() {
+    for qualifier in ["readonly", "writeonly"] {
+        let source = alloc::format!("#version 450\nlayout(r32ui, binding = 0) uniform {qualifier} uimage2D image;\nvoid main() {{ imageAtomicAdd(image, ivec2(0), 1u); }}");
+        let errors = Frontend::default()
+            .parse(&Options::from(ShaderStage::Compute), &source)
+            .unwrap_err();
+        assert!(
+            errors.errors.iter().any(|error| matches!(
+                &error.kind,
+                ErrorKind::SemanticError(message) if message.contains("image needs")
+            )),
+            "{errors:?}"
+        );
+    }
+}
+
 /// Check that gather layers round up at half integers before integer conversion.
 #[test]
 fn texture_gather_array_layer_rounding() {

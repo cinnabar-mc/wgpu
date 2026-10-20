@@ -1140,6 +1140,20 @@ impl<'a> Context<'a> {
                     &mut reject,
                     reject_meta,
                 )?;
+                self.typifier_grow(accept, accept_meta)?;
+                self.typifier_grow(reject, reject_meta)?;
+                if !crate::proc::compare_types(
+                    self.get_type_resolution(accept),
+                    self.get_type_resolution(reject),
+                    &self.module.types,
+                ) {
+                    return Err(Error {
+                        kind: ErrorKind::SemanticError(
+                            "Incompatible constant conditional operand types".into(),
+                        ),
+                        meta,
+                    });
+                }
                 match self[condition] {
                     Expression::Literal(Literal::Bool(true)) => accept,
                     Expression::Literal(Literal::Bool(false)) => reject,

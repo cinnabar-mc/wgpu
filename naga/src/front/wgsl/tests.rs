@@ -2,6 +2,22 @@ use alloc::format;
 
 use super::parse_str;
 
+/// Equal smoothstep edges are invalid for every constant floating-point shape.
+#[test]
+fn regression_smoothstep_equal_edges() {
+    for arguments in [
+        "1.0, 1.0, 1.0",
+        "1.0f, 1.0f, 0.0f",
+        "1.0h, 1.0h, 2.0h",
+        "vec2(0.0, 1.0), vec2(1.0, 1.0), vec2(0.5, 1.0)",
+    ] {
+        let source = format!("enable f16; const x = smoothstep({arguments});");
+        let error = parse_str(&source).unwrap_err();
+        assert!(error.emit_to_string(&source).contains("smoothstep"));
+    }
+    parse_str("const x = smoothstep(1.0, 0.0, 0.5);").unwrap();
+}
+
 #[test]
 fn parse_comment() {
     parse_str(

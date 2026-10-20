@@ -1781,6 +1781,11 @@ impl<'a> ConstantEvaluator<'a> {
                 span,
                 [arg, arg1.unwrap(), arg2.unwrap()],
                 |edge0, edge1, x| {
+                    if edge0 == edge1 {
+                        return Err(ConstantEvaluatorError::InvalidMathArgValue(
+                            "smoothstep".into(),
+                        ));
+                    }
                     let mut one = x;
                     one.set_one();
                     let t = ((x - edge0) / (edge1 - edge0)).max(Zero::zero()).min(one);

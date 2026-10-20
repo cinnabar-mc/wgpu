@@ -835,15 +835,23 @@ impl Frontend {
                 }
             }
             if parameter_info.qualifier.is_lhs() {
-                // Reprocess argument in LHS position
-                let (handle, meta) = ctx.lower_expect_inner(stmt, self, *expr, ExprPos::Lhs)?;
-
-                // Atomic built-ins operate on the memory itself, never on a copy.
                 if let FunctionKind::Macro(MacroCall::Atomic(_) | MacroCall::AtomicCompSwap) = kind
                 {
-                    arguments.push(handle);
+                    // Reuse the evaluated address, including any index side effects.
+                    let Expression::Load { pointer } = ctx.expressions[call_argument.0] else {
+                        return Err(Error {
+                            kind: ErrorKind::SemanticError(
+                                "Atomic operations require a scalar memory argument; struct fields accessed through aggregate values are not supported".into(),
+                            ),
+                            meta: call_argument.1,
+                        });
+                    };
+                    arguments.push(pointer);
                     continue;
                 }
+
+                // Reprocess argument in LHS position
+                let (handle, meta) = ctx.lower_expect_inner(stmt, self, *expr, ExprPos::Lhs)?;
 
                 self.process_lhs_argument(
                     ctx,

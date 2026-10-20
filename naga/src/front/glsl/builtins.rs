@@ -521,7 +521,7 @@ pub fn inject_builtin(
                     arrayed,
                     class: ImageClass::Storage {
                         format: kind.dummy_storage_format(),
-                        access: crate::StorageAccess::empty(),
+                        access: crate::StorageAccess::LOAD | crate::StorageAccess::STORE,
                     },
                 };
                 let coord_size = image_dims_to_coords_size(dim) + arrayed as usize;
@@ -1144,7 +1144,7 @@ fn inject_standard_builtins(
             let barrier = match name {
                 "memoryBarrierShared" => Barrier::WORK_GROUP,
                 "memoryBarrierBuffer" | "memoryBarrierAtomicCounter" => Barrier::STORAGE,
-                "memoryBarrierImage" => Barrier::TEXTURE,
+                "memoryBarrierImage" => Barrier::TEXTURE | Barrier::STORAGE,
                 _ => Barrier::STORAGE | Barrier::WORK_GROUP | Barrier::TEXTURE,
             };
             let mut overload = module.add_builtin(Vec::new(), MacroCall::MemoryBarrier(barrier));
@@ -2390,6 +2390,14 @@ impl MacroCall {
                 Span::default(),
             )?,
             MacroCall::MemoryBarrier(barrier) => {
+                if !frontend.meta.stage.compute_like() {
+                    return Err(Error {
+                        kind: ErrorKind::SemanticError(
+                            "GLSL memory barriers are only supported in compute shaders".into(),
+                        ),
+                        meta,
+                    });
+                }
                 ctx.emit_restart();
                 ctx.body
                     .push(crate::Statement::MemoryBarrier(barrier), meta);
@@ -2426,7 +2434,18 @@ impl MacroCall {
                 let ty = ctx.module.generate_predeclared_type(
                     crate::PredeclaredType::AtomicCompareExchangeWeakResult(scalar),
                 );
+                let scalar_ty = ctx.resolve_type_handle(args[1], meta)?;
+                let local = ctx.locals.append(
+                    crate::LocalVariable {
+                        name: None,
+                        ty: scalar_ty,
+                        init: None,
+                    },
+                    meta,
+                );
+                let pointer = ctx.add_expression(Expression::LocalVariable(local), meta)?;
                 ctx.emit_end();
+                let outer_body = core::mem::take(&mut ctx.body);
                 let result = ctx.add_expression(
                     Expression::AtomicResult {
                         ty,
@@ -2446,14 +2465,64 @@ impl MacroCall {
                     meta,
                 );
                 ctx.emit_start();
-                // The original value
-                ctx.add_expression(
+                let old_value = ctx.add_expression(
                     Expression::AccessIndex {
                         base: result,
                         index: 0,
                     },
                     meta,
-                )?
+                )?;
+                let exchanged = ctx.add_expression(
+                    Expression::AccessIndex {
+                        base: result,
+                        index: 1,
+                    },
+                    meta,
+                )?;
+                let mismatch = ctx.add_expression(
+                    Expression::Binary {
+                        op: BinaryOperator::NotEqual,
+                        left: old_value,
+                        right: args[1],
+                    },
+                    meta,
+                )?;
+                let done = ctx.add_expression(
+                    Expression::Binary {
+                        op: BinaryOperator::LogicalOr,
+                        left: exchanged,
+                        right: mismatch,
+                    },
+                    meta,
+                )?;
+                ctx.emit_end();
+                ctx.body.push(
+                    crate::Statement::Store {
+                        pointer,
+                        value: old_value,
+                    },
+                    meta,
+                );
+                // Only retry when the comparison matched but the weak exchange failed.
+                ctx.body.push(
+                    crate::Statement::If {
+                        condition: done,
+                        accept: crate::Block::from_vec(vec![crate::Statement::Break]),
+                        reject: crate::Block::new(),
+                    },
+                    meta,
+                );
+                let body = core::mem::replace(&mut ctx.body, outer_body);
+                ctx.body.push(
+                    crate::Statement::Loop {
+                        body,
+                        continuing: crate::Block::new(),
+                        break_if: None,
+                    },
+                    meta,
+                );
+                ctx.emit_start();
+                ctx.add_expression(Expression::Load { pointer }, meta)?
             }
             MacroCall::ImageAtomic(fun) => {
                 frontend.allow_image_atomics(ctx, args[0], meta)?;
@@ -2578,6 +2647,16 @@ impl Frontend {
                 let ty = self.record_atomic_access(ctx, base, meta)?;
                 match ctx.module.types[ty].inner {
                     TypeInner::Struct { ref members, .. } => {
+                        if !matches!(ctx.expressions[base], Expression::GlobalVariable(global)
+                            if matches!(ctx.module.global_variables[global].space, crate::AddressSpace::Storage { .. }))
+                        {
+                            return Err(Error {
+                                kind: ErrorKind::SemanticError(
+                                    "Atomic operations on struct fields are only supported directly in buffer blocks".into(),
+                                ),
+                                meta,
+                            });
+                        }
                         self.atomic_upgrades.insert_field(ty, index as usize);
                         Ok(members[index as usize].ty)
                     }

@@ -15,6 +15,7 @@ fn main_1() {
     var index: i32;
     var bit: u32;
     var known: bool;
+    var local: u32;
     var old: u32;
 
     let _e8 = gl_LocalInvocationIndex_1;
@@ -27,20 +28,28 @@ fn main_1() {
     index = _e13;
     let _e16 = gl_LocalInvocationIndex_1;
     bit = (1u << (_e16 % 32u));
-    let _e21 = bit;
-    let _e22 = gl_LocalInvocationIndex_1;
-    let _e26 = atomicOr((&lightHashMap[(_e22 / 32u)]), _e21);
+    let _e21 = gl_LocalInvocationIndex_1;
+    let _e25 = bit;
+    let _e26 = atomicOr((&lightHashMap[(_e21 / 32u)]), _e25);
     let _e27 = bit;
     known = ((_e26 & _e27) != 0u);
-    let _e33 = index;
-    let _e35 = atomicMax((&global.hist[_e33]), 3u);
+    let _e32 = index;
+    let _e35 = atomicMax((&global.hist[_e32]), 3u);
     let _e37 = index;
-    let _e39 = atomicCompareExchangeWeak((&global.total), 0u, u32(_e37));
-    old = _e39.old_value;
-    let _e43 = atomicExchange((&lightCount), -1i);
-    let _e44 = index;
-    let _e47 = old;
-    textureAtomicOr(marks, vec2<i32>(_e44, 0i), _e47);
+    loop {
+        let _e40 = atomicCompareExchangeWeak((&global.total), 0u, u32(_e37));
+        local = _e40.old_value;
+        if (_e40.exchanged || (_e40.old_value != 0u)) {
+            break;
+        }
+    }
+    let _e45 = local;
+    old = _e45;
+    let _e48 = atomicExchange((&lightCount), -1i);
+    let _e49 = index;
+    let _e52 = old;
+    textureAtomicOr(marks, vec2<i32>(_e49, 0i), _e52);
+    storageBarrier();
     textureBarrier();
     storageBarrier();
     workgroupBarrier();
@@ -48,9 +57,9 @@ fn main_1() {
     storageBarrier();
     workgroupBarrier();
     textureBarrier();
-    let _e48 = known;
-    if _e48 {
-        let _e50 = atomicMin((&lightCount), 7i);
+    let _e53 = known;
+    if _e53 {
+        let _e55 = atomicMin((&lightCount), 7i);
         return;
     } else {
         return;
