@@ -1261,8 +1261,9 @@ impl StagingBuffer {
             memory_flags: hal::MemoryFlags::TRANSIENT,
         };
 
+        // Nothing is recorded yet, so running out of memory fails only this write.
         let raw = unsafe { device.raw().create_buffer(&stage_desc) }
-            .map_err(|e| device.handle_hal_error(e))?;
+            .map_err(|e| device.handle_hal_error_with_nonfatal_oom(e))?;
         let mapping = unsafe { device.raw().map_buffer(raw.as_ref(), 0..size.get()) }
             .map_err(|e| device.handle_hal_error(e))?;
 

@@ -151,6 +151,10 @@ impl WaitIdleError {
             &WaitIdleError::WrongSubmissionIndex(a, b) => {
                 Some(wgt::PollError::WrongSubmissionIndex(a, b))
             }
+            // Maintenance only reports hal errors, and each of those has already lost the device.
+            WaitIdleError::Device(DeviceError::Lost | DeviceError::OutOfMemory) => {
+                Some(wgt::PollError::DeviceLost)
+            }
             _ => None,
         }
     }
@@ -431,5 +435,21 @@ impl LifetimeTracker {
             }
         }
         pending_callbacks
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A lost device must reach `Device::poll` callers as an error, not a panic.
+    #[test]
+    fn lost_device_is_a_poll_error() {
+        for error in [DeviceError::Lost, DeviceError::OutOfMemory] {
+            assert!(matches!(
+                WaitIdleError::Device(error).to_poll_error(),
+                Some(wgt::PollError::DeviceLost)
+            ));
+        }
     }
 }
