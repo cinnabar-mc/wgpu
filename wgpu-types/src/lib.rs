@@ -245,6 +245,9 @@ pub enum PollError {
     Timeout,
     /// The requested Wait was given a wrong submission index.
     WrongSubmissionIndex(u64, u64),
+    /// The device is lost, so work in flight will never complete. The device-lost callback
+    /// has already been called.
+    DeviceLost,
 }
 
 // This impl could be derived by `thiserror`, but by not doing so, we can reduce the number of
@@ -261,6 +264,7 @@ impl fmt::Display for PollError {
                 that has not been returned by a successful submission \
                 (last successful submission: {successful}"
             ),
+            PollError::DeviceLost => f.write_str("The device was lost while polling."),
         }
     }
 }

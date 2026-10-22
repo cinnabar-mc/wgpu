@@ -921,6 +921,69 @@ impl Queue {
             return Ok(());
         }
 
+        let (block_width, block_height) = dst.desc.format.block_dimensions();
+        let width_in_blocks = size.width / block_width;
+        let height_in_blocks = size.height / block_height;
+
+        let block_size = dst
+            .desc
+            .format
+            .block_copy_size(Some(destination.aspect))
+            .unwrap();
+        let bytes_in_last_row = width_in_blocks * block_size;
+
+        let bytes_per_row = data_layout.bytes_per_row.unwrap_or(bytes_in_last_row);
+        let rows_per_image = data_layout.rows_per_image.unwrap_or(height_in_blocks);
+
+        let bytes_per_row_alignment = get_lowest_common_denom(
+            self.device.alignments.buffer_copy_pitch.get() as u32,
+            block_size,
+        );
+        assert!(u32::MAX - bytes_in_last_row >= bytes_per_row_alignment);
+        let stage_bytes_per_row = wgt::math::align_to(bytes_in_last_row, bytes_per_row_alignment);
+
+        // Stage before any side effect, so running out of staging memory leaves the
+        // texture's initialization state and the pending writes untouched.
+        let staging_buffer = if stage_bytes_per_row == bytes_per_row {
+            profiling::scope!("copy aligned");
+            // Fast path if the data is already being aligned optimally.
+            let stage_size = wgt::BufferSize::new(required_bytes_in_copy).unwrap();
+            let mut staging_buffer = StagingBuffer::new(&self.device, stage_size)?;
+            staging_buffer.write(&data[data_layout.offset as usize..]);
+            staging_buffer
+        } else {
+            profiling::scope!("copy chunked");
+            // Copy row by row into the optimal alignment.
+            let block_rows_in_copy = u64::from(size.depth_or_array_layers - 1)
+                * u64::from(rows_per_image)
+                + u64::from(height_in_blocks);
+            // The copy size was validated against the source buffer, however,
+            // `stage_bytes_per_row` can differ, so let's be paranoid.
+            let stage_size = u64::from(stage_bytes_per_row)
+                .checked_mul(block_rows_in_copy)
+                .and_then(wgt::BufferSize::new)
+                .unwrap();
+            let mut staging_buffer = StagingBuffer::new(&self.device, stage_size)?;
+            for layer in 0..u64::from(size.depth_or_array_layers) {
+                let rows_offset = layer * u64::from(rows_per_image);
+                for row in rows_offset..rows_offset + u64::from(height_in_blocks) {
+                    let src_offset = data_layout.offset + row * u64::from(bytes_per_row);
+                    let dst_offset = row * u64::from(stage_bytes_per_row);
+                    unsafe {
+                        staging_buffer.write_with_offset(
+                            data,
+                            src_offset as isize,
+                            dst_offset as isize,
+                            bytes_in_last_row as usize,
+                        )
+                    }
+                }
+            }
+            staging_buffer
+        };
+
+        let staging_buffer = staging_buffer.flush();
+
         let mut pending_writes = self.pending_writes.lock();
         let encoder = pending_writes.activate();
 
@@ -966,70 +1029,6 @@ impl Queue {
                     .drain(init_layer_range);
             }
         }
-
-        let (block_width, block_height) = dst.desc.format.block_dimensions();
-        let width_in_blocks = size.width / block_width;
-        let height_in_blocks = size.height / block_height;
-
-        let block_size = dst
-            .desc
-            .format
-            .block_copy_size(Some(destination.aspect))
-            .unwrap();
-        let bytes_in_last_row = width_in_blocks * block_size;
-
-        let bytes_per_row = data_layout.bytes_per_row.unwrap_or(bytes_in_last_row);
-        let rows_per_image = data_layout.rows_per_image.unwrap_or(height_in_blocks);
-
-        let bytes_per_row_alignment = get_lowest_common_denom(
-            self.device.alignments.buffer_copy_pitch.get() as u32,
-            block_size,
-        );
-        assert!(u32::MAX - bytes_in_last_row >= bytes_per_row_alignment);
-        let stage_bytes_per_row = wgt::math::align_to(bytes_in_last_row, bytes_per_row_alignment);
-
-        // Platform validation requires that the staging buffer always be
-        // freed, even if an error occurs. All paths from here must call
-        // `device.pending_writes.consume`.
-        let staging_buffer = if stage_bytes_per_row == bytes_per_row {
-            profiling::scope!("copy aligned");
-            // Fast path if the data is already being aligned optimally.
-            let stage_size = wgt::BufferSize::new(required_bytes_in_copy).unwrap();
-            let mut staging_buffer = StagingBuffer::new(&self.device, stage_size)?;
-            staging_buffer.write(&data[data_layout.offset as usize..]);
-            staging_buffer
-        } else {
-            profiling::scope!("copy chunked");
-            // Copy row by row into the optimal alignment.
-            let block_rows_in_copy = u64::from(size.depth_or_array_layers - 1)
-                * u64::from(rows_per_image)
-                + u64::from(height_in_blocks);
-            // The copy size was validated against the source buffer, however,
-            // `stage_bytes_per_row` can differ, so let's be paranoid.
-            let stage_size = u64::from(stage_bytes_per_row)
-                .checked_mul(block_rows_in_copy)
-                .and_then(wgt::BufferSize::new)
-                .unwrap();
-            let mut staging_buffer = StagingBuffer::new(&self.device, stage_size)?;
-            for layer in 0..u64::from(size.depth_or_array_layers) {
-                let rows_offset = layer * u64::from(rows_per_image);
-                for row in rows_offset..rows_offset + u64::from(height_in_blocks) {
-                    let src_offset = data_layout.offset + row * u64::from(bytes_per_row);
-                    let dst_offset = row * u64::from(stage_bytes_per_row);
-                    unsafe {
-                        staging_buffer.write_with_offset(
-                            data,
-                            src_offset as isize,
-                            dst_offset as isize,
-                            bytes_in_last_row as usize,
-                        )
-                    }
-                }
-            }
-            staging_buffer
-        };
-
-        let staging_buffer = staging_buffer.flush();
 
         let regions = (0..array_layer_count)
             .map(|array_layer_offset| {
