@@ -378,6 +378,9 @@ impl Frontend {
                     }
                 }
             }
+            TypeInner::Vector { .. } => {
+                return self.constructor_many(ctx, ty, vec![(value, expr_meta)], meta);
+            }
             _ => {
                 components = iter::repeat_n(value, columns as usize).collect();
             }
@@ -675,7 +678,7 @@ impl Frontend {
                     // The images satisfy the conditions to be considered as an exact match
                     conversions.push(Conversion::Exact);
                     continue;
-                } else if overload_param_ty == call_arg_ty {
+                } else if same_value_type(ctx.module, overload_param_ty, call_arg_ty) {
                     // If the types match there's no need to check for conversions so continue
                     conversions.push(Conversion::Exact);
                     continue;
@@ -876,6 +879,7 @@ impl Frontend {
                 ctx.implicit_conversion(&mut handle, meta, scalar)?;
             }
 
+            array_layout_conversion(ctx, &mut handle, *parameter, meta)?;
             arguments.push(handle)
         }
 
@@ -928,6 +932,9 @@ impl Frontend {
                 ctx.conversion(&mut value, meta, scalar)?;
             }
 
+            if let TypeInner::Pointer { base, .. } = *ctx.resolve_type(proxy_write.target, meta)? {
+                array_layout_conversion(ctx, &mut value, base, meta)?;
+            }
             ctx.emit_restart();
 
             ctx.body.push(
@@ -1007,7 +1014,7 @@ impl Frontend {
 
         // Since the original expression might be a pointer and we want a value
         // for the proxy writes, we might need to load the pointer.
-        let value = if original_pointer_space.is_some() {
+        let mut value = if original_pointer_space.is_some() {
             ctx.add_expression(Expression::Load { pointer: original }, Span::default())?
         } else {
             original
@@ -1044,6 +1051,8 @@ impl Frontend {
             // If the argument is also copied in we must store the value of the
             // original variable to the spill variable.
             if let ParameterQualifier::InOut = parameter_info.qualifier {
+                array_layout_conversion(ctx, &mut value, ty, meta)?;
+                ctx.emit_restart();
                 ctx.body.push(
                     Statement::Store {
                         pointer: spill_expr,
@@ -2119,6 +2128,21 @@ fn is_better_overload(a: &[Conversion], b: &[Conversion]) -> bool {
         better |= a.is_better_than(b);
     }
     better
+}
+
+/// Compares value types while ignoring array strides, which are not GLSL type identity.
+fn same_value_type(module: &crate::Module, a: &TypeInner, b: &TypeInner) -> bool {
+    match (a, b) {
+        (
+            &TypeInner::Array {
+                base: a, size: sa, ..
+            },
+            &TypeInner::Array {
+                base: b, size: sb, ..
+            },
+        ) => sa == sb && same_value_type(module, &module.types[a].inner, &module.types[b].inner),
+        _ => a == b,
+    }
 }
 
 /// Converts `expr`, an array value, to the array type `target` when the two only

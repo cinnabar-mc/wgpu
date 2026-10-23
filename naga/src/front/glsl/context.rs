@@ -1454,16 +1454,11 @@ impl<'a> Context<'a> {
                 }
             }
             HirExprKind::Sequence { ref exprs } if pos != ExprPos::Lhs => {
-                let mut last_handle = None;
-                for expr in exprs.iter() {
-                    let (handle, _) =
-                        self.lower_expect_inner(stmt, frontend, *expr, ExprPos::Rhs)?;
-                    last_handle = Some(handle);
+                let mut result = None;
+                for expr in exprs {
+                    result = self.lower_inner(stmt, frontend, *expr, ExprPos::Rhs)?.0;
                 }
-                match last_handle {
-                    Some(handle) => handle,
-                    None => unreachable!(),
-                }
+                return Ok((result, meta));
             }
             _ => {
                 return Err(Error {
