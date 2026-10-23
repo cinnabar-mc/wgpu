@@ -16,6 +16,15 @@ use super::{conv, descriptor::DescriptorCounts, RawTlasInstance};
 use crate::TlasInstance;
 
 impl super::DeviceShared {
+    /// Locks pipeline creation for this device when the driver cannot compile concurrently.
+    ///
+    /// Hold the returned guard across `vkCreate*Pipelines`; it is `None` on other drivers.
+    fn pipeline_creation_guard(&self) -> Option<parking_lot::MutexGuard<'_, ()>> {
+        self.workarounds
+            .contains(super::Workarounds::SERIALIZE_PIPELINE_CREATION)
+            .then(|| self.pipeline_creation.lock())
+    }
+
     /// Set the name of `object` to `name`.
     ///
     /// If `name` contains an interior null byte, then the name set will be truncated to that byte.
@@ -2168,6 +2177,7 @@ impl crate::Device for super::Device {
 
         let mut raw_vec = {
             profiling::scope!("vkCreateGraphicsPipelines");
+            let _serialized = self.shared.pipeline_creation_guard();
             unsafe {
                 self.shared
                     .raw
@@ -2251,6 +2261,7 @@ impl crate::Device for super::Device {
 
         let mut raw_vec = {
             profiling::scope!("vkCreateComputePipelines");
+            let _serialized = self.shared.pipeline_creation_guard();
             unsafe {
                 self.shared
                     .raw
@@ -2387,15 +2398,18 @@ impl crate::Device for super::Device {
             .ray_tracing_pipelines
             .as_ref()
             .unwrap();
-        let pipelines = unsafe {
-            fns.create_ray_tracing_pipelines(
-                vk::DeferredOperationKHR::null(),
-                pipeline_cache,
-                &create_infos,
-                None,
-            )
-            .map_err(|(_, e)| super::map_pipeline_err(e))
-        }?;
+        let pipelines = {
+            let _serialized = self.shared.pipeline_creation_guard();
+            unsafe {
+                fns.create_ray_tracing_pipelines(
+                    vk::DeferredOperationKHR::null(),
+                    pipeline_cache,
+                    &create_infos,
+                    None,
+                )
+                .map_err(|(_, e)| super::map_pipeline_err(e))
+            }?
+        };
 
         if let Some(raw_module) = compiled_ray_gen.temp_raw_module {
             unsafe { self.shared.raw.destroy_shader_module(raw_module, None) };

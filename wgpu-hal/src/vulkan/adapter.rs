@@ -2220,8 +2220,6 @@ impl super::Instance {
         &self,
         phd: vk::PhysicalDevice,
     ) -> Option<crate::ExposedAdapter<super::Api>> {
-        use crate::auxil::db;
-
         let (phd_capabilities, phd_features) = self.shared.inspect(phd);
 
         let mem_properties = {
@@ -2293,19 +2291,7 @@ impl super::Instance {
             transient_saves_memory: Some(supports_lazily_allocated),
             ..wgt::AdapterInfo::new(device_type, wgt::Backend::Vulkan)
         };
-        let mut workarounds = super::Workarounds::empty();
-        {
-            // TODO: only enable for particular devices
-            workarounds |= super::Workarounds::SEPARATE_ENTRY_POINTS;
-            workarounds.set(
-                super::Workarounds::EMPTY_RESOLVE_ATTACHMENT_LISTS,
-                phd_capabilities.properties.vendor_id == db::qualcomm::VENDOR,
-            );
-            workarounds.set(
-                super::Workarounds::FORCE_FILL_BUFFER_WITH_SIZE_GREATER_4096_ALIGNED_OFFSET_16,
-                phd_capabilities.properties.vendor_id == db::nvidia::VENDOR,
-            );
-        };
+        let workarounds = vendor_workarounds(phd_capabilities.properties.vendor_id);
 
         if let Some(driver) = phd_capabilities.driver {
             if driver.conformance_version.major == 0 {
@@ -2930,6 +2916,7 @@ impl super::Adapter {
             sampler_cache: Mutex::new(super::sampler::SamplerCache::new(
                 self.private_caps.maximum_samplers,
             )),
+            pipeline_creation: Mutex::new(()),
             memory_allocations_counter: Default::default(),
 
             texture_identity_factory: super::ResourceIdentityFactory::new(),
@@ -3403,6 +3390,27 @@ fn supports_bgra8unorm_storage(
     }
 }
 
+/// Driver workarounds selected from the adapter's PCI vendor ID.
+fn vendor_workarounds(vendor_id: u32) -> super::Workarounds {
+    use crate::auxil::db;
+
+    // TODO: only enable for particular devices
+    let mut workarounds = super::Workarounds::SEPARATE_ENTRY_POINTS;
+    workarounds.set(
+        super::Workarounds::EMPTY_RESOLVE_ATTACHMENT_LISTS,
+        vendor_id == db::qualcomm::VENDOR,
+    );
+    workarounds.set(
+        super::Workarounds::FORCE_FILL_BUFFER_WITH_SIZE_GREATER_4096_ALIGNED_OFFSET_16,
+        vendor_id == db::nvidia::VENDOR,
+    );
+    workarounds.set(
+        super::Workarounds::SERIALIZE_PIPELINE_CREATION,
+        vendor_id == db::arm::VENDOR,
+    );
+    workarounds
+}
+
 // For https://github.com/gfx-rs/wgpu/issues/4599
 // Intel iGPUs with outdated drivers can break rendering if `VK_EXT_robustness2` is used.
 // Driver version 31.0.101.2115 works, but there's probably an earlier functional version.
@@ -3548,4 +3556,26 @@ fn query_cooperative_matrix_properties(
         result.len()
     );
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{super::Workarounds, vendor_workarounds};
+    use crate::auxil::db;
+
+    #[test]
+    fn only_arm_serializes_pipeline_creation() {
+        assert!(
+            vendor_workarounds(db::arm::VENDOR).contains(Workarounds::SERIALIZE_PIPELINE_CREATION)
+        );
+        for vendor in [
+            db::amd::VENDOR,
+            db::imgtec::VENDOR,
+            db::intel::VENDOR,
+            db::nvidia::VENDOR,
+            db::qualcomm::VENDOR,
+        ] {
+            assert!(!vendor_workarounds(vendor).contains(Workarounds::SERIALIZE_PIPELINE_CREATION));
+        }
+    }
 }
