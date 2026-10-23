@@ -69,6 +69,7 @@ Bottom level categories:
 - Convert GLSL double `frexp` exponents to the 32-bit output parameter type.
 - Preserve SPIR-V `ModfStruct` and `FrexpStruct` result types when storing whole structs.
 - Support runtime GLSL texture gather offsets by shifting coordinates in texel units.
+- Mark shader model 5 HLSL loops containing implicit-derivative operations `[loop]`, so FXC no longer fails with X3511 trying to unroll them.
 
 ### Performance
 
