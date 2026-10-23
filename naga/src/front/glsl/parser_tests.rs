@@ -1048,7 +1048,7 @@ fn textures() {
 
     frontend
         .parse(
-            &Options::from(ShaderStage::Vertex),
+            &Options::from(ShaderStage::Fragment),
             r#"
         #version 450
         layout(location = 0) in vec2 v_uv;
@@ -1718,4 +1718,30 @@ fn compatibility_compute_implicit_texture_level_is_zero() {
                 ..
             }
         ))));
+}
+
+#[test]
+fn compatibility_texture_bias_requires_fragment_stage() {
+    let source = "#version 450\nlayout(binding=0) uniform texture2D source; layout(binding=1) uniform sampler sampling; void main() { vec4 v=texture(sampler2D(source,sampling),vec2(0.5),1.0); }";
+    for stage in [ShaderStage::Vertex, ShaderStage::Compute] {
+        let error = Frontend::default()
+            .parse(&Options::from(stage), source)
+            .unwrap_err();
+        assert!(error
+            .emit_to_string(source)
+            .contains("bias is only supported in fragment"));
+    }
+}
+
+#[test]
+fn compatibility_array_assignments_preserve_value_layouts() {
+    compatibility_module(ShaderStage::Fragment,"#version 450\nconst int N=2; struct Data { float a[N]; }; float[N] make() { float a[N]; a[0]=1.0; a[1]=2.0; return a; } layout(location=0) out vec4 color; void main() { Data d; d.a=make(); float a[N]; a=d.a; color=vec4(a[0],a[1],d.a[0],d.a[1]); }");
+}
+
+#[test]
+fn compatibility_array_layout_matching_keeps_element_identity() {
+    let source="#version 450\nstruct First { float v; }; struct Second { float v; }; float read(First a[2]) { return a[0].v; } layout(location=0) out vec4 color; void main() { Second a[2]; color=vec4(read(a)); }";
+    assert!(Frontend::default()
+        .parse(&Options::from(ShaderStage::Fragment), source)
+        .is_err());
 }

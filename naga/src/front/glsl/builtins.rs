@@ -1889,6 +1889,13 @@ impl MacroCall {
                         args.get(num_args)
                             .copied()
                             .map_or(SampleLevel::Auto, SampleLevel::Bias)
+                    } else if args.get(num_args).is_some() {
+                        return Err(Error {
+                            kind: ErrorKind::SemanticError(
+                                "Texture bias is only supported in fragment shaders".into(),
+                            ),
+                            meta,
+                        });
                     } else {
                         SampleLevel::Zero
                     };

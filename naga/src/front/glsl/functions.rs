@@ -2140,7 +2140,14 @@ fn same_value_type(module: &crate::Module, a: &TypeInner, b: &TypeInner) -> bool
             &TypeInner::Array {
                 base: b, size: sb, ..
             },
-        ) => sa == sb && same_value_type(module, &module.types[a].inner, &module.types[b].inner),
+        ) => {
+            sa == sb
+                && (a == b
+                    || matches!(
+                        (&module.types[a].inner, &module.types[b].inner),
+                        (&TypeInner::Array { .. }, &TypeInner::Array { .. })
+                    ) && same_value_type(module, &module.types[a].inner, &module.types[b].inner))
+        }
         _ => a == b,
     }
 }
@@ -2152,7 +2159,7 @@ fn same_value_type(module: &crate::Module, a: &TypeInner, b: &TypeInner) -> bool
 /// types carry a stride: an array member of a struct uses the std140 stride
 /// while a local `float[6](...)` uses the natural one. Such a value is rebuilt
 /// element by element with the target type.
-fn array_layout_conversion(
+pub(super) fn array_layout_conversion(
     ctx: &mut Context,
     expr: &mut Handle<Expression>,
     target: Handle<Type>,

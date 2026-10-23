@@ -495,9 +495,12 @@ impl<'a> Context<'a> {
     fn lower_store(
         &mut self,
         pointer: Handle<Expression>,
-        value: Handle<Expression>,
+        mut value: Handle<Expression>,
         meta: Span,
     ) -> Result<()> {
+        if let TypeInner::Pointer { base, .. } = *self.resolve_type(pointer, meta)? {
+            super::functions::array_layout_conversion(self, &mut value, base, meta)?;
+        }
         if let Expression::Swizzle {
             size,
             mut vector,
