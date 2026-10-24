@@ -1885,10 +1885,20 @@ impl MacroCall {
 
                 // Now go back and look for optional bias arg (if available)
                 if let TextureLevelType::None = level_type {
-                    level = args
-                        .get(num_args)
-                        .copied()
-                        .map_or(SampleLevel::Auto, SampleLevel::Bias);
+                    level = if frontend.meta.stage == crate::ShaderStage::Fragment {
+                        args.get(num_args)
+                            .copied()
+                            .map_or(SampleLevel::Auto, SampleLevel::Bias)
+                    } else if args.get(num_args).is_some() {
+                        return Err(Error {
+                            kind: ErrorKind::SemanticError(
+                                "Texture bias is only supported in fragment shaders".into(),
+                            ),
+                            meta,
+                        });
+                    } else {
+                        SampleLevel::Zero
+                    };
                 }
 
                 texture_call(ctx, args[0], level, comps, texture_offset, meta)?

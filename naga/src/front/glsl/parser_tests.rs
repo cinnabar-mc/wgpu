@@ -64,13 +64,13 @@ fn regression_inverse_matrix_range() {
         let k = module
             .constants
             .iter()
-            .find(|(_, constant)| constant.name.as_deref() == Some("k"))
+            .find(|&(_, constant)| constant.name.as_deref() == Some("k"))
             .unwrap()
             .1;
         let m = module
             .constants
             .iter()
-            .find(|(_, constant)| constant.name.as_deref() == Some("m"))
+            .find(|&(_, constant)| constant.name.as_deref() == Some("m"))
             .unwrap()
             .1;
         let crate::Expression::Compose { ref components, .. } = module.global_expressions[m.init]
@@ -249,7 +249,7 @@ fn regression_atomic_member_pointer() {
         let increments = function
             .expressions
             .iter()
-            .filter(|(_, expression)| {
+            .filter(|&(_, expression)| {
                 matches!(
                     expression,
                     crate::Expression::Binary {
@@ -386,7 +386,7 @@ fn regression_atomic_argument_evaluated_once() {
     let increments = function
         .expressions
         .iter()
-        .filter(|(_, expression)| {
+        .filter(|&(_, expression)| {
             matches!(
                 expression,
                 crate::Expression::Binary {
@@ -1048,7 +1048,7 @@ fn textures() {
 
     frontend
         .parse(
-            &Options::from(ShaderStage::Vertex),
+            &Options::from(ShaderStage::Fragment),
             r#"
         #version 450
         layout(location = 0) in vec2 v_uv;
@@ -1649,4 +1649,99 @@ fn expressions() {
         "#,
         )
         .unwrap();
+}
+
+/// Parses and validates a small original shader to exercise expression lowering.
+fn compatibility_module(stage: ShaderStage, source: &str) -> crate::Module {
+    let module = Frontend::default()
+        .parse(&Options::from(stage), source)
+        .unwrap_or_else(|error| panic!("{}", error.emit_to_string(source)));
+    crate::valid::Validator::new(
+        crate::valid::ValidationFlags::all(),
+        crate::valid::Capabilities::all(),
+    )
+    .validate(&module)
+    .unwrap();
+    module
+}
+
+#[test]
+fn compatibility_single_vector_matrix_constructor() {
+    compatibility_module(ShaderStage::Fragment, "#version 450\nlayout(location=0) in vec4 values; layout(location=0) out vec4 color; void main() { mat2 m = mat2(values); color = vec4(m[0], m[1]); }");
+}
+
+#[test]
+fn compatibility_void_sequence_preserves_calls_and_final_type() {
+    let m = compatibility_module(ShaderStage::Fragment, "#version 450\nlayout(location=0) out vec4 color; void writeColor() { color += vec4(1.0); } void main() { color=vec4(0.0); float x=(writeColor(), 2.0); (writeColor(),writeColor()); color*=x; }");
+    let main = m
+        .functions
+        .iter()
+        .find(|&(_, f)| f.name.as_deref() == Some("main"))
+        .unwrap()
+        .1;
+    assert_eq!(
+        main.body
+            .iter()
+            .filter(|s| matches!(s, crate::Statement::Call { .. }))
+            .count(),
+        3
+    );
+    let invalid = "#version 450\nvoid f() {} void main() { float x=(1.0,f()); }";
+    assert!(Frontend::default()
+        .parse(&Options::from(ShaderStage::Fragment), invalid)
+        .is_err());
+}
+
+#[test]
+fn compatibility_array_parameters_ignore_storage_stride() {
+    for qualifier in ["in", "out", "inout"] {
+        let source=alloc::format!("#version 450\nconst int N=2; struct Data {{ float a[N]; }}; void change({qualifier} float[N] values) {{ values[0]=1.0; }} layout(location=0) out vec4 color; void main() {{ Data d; d.a[0]=2.0; change(d.a); color=vec4(d.a[0]); }}");
+        if qualifier == "in" {
+            let source = source.replace("values[0]=1.0;", "float x=values[0];");
+            compatibility_module(ShaderStage::Fragment, &source);
+        } else {
+            compatibility_module(ShaderStage::Fragment, &source);
+        }
+    }
+}
+
+#[test]
+fn compatibility_compute_implicit_texture_level_is_zero() {
+    let m=compatibility_module(ShaderStage::Compute,"#version 450\nlayout(local_size_x=1) in; layout(binding=0) uniform texture2D source; layout(binding=1) uniform sampler sampling; layout(rgba32f,binding=2) uniform image2D resultImage; void main() { imageStore(resultImage,ivec2(0),texture(sampler2D(source,sampling),vec2(0.5))); }");
+    assert!(m
+        .functions
+        .iter()
+        .any(|(_, f)| f.expressions.iter().any(|(_, e)| matches!(
+            e,
+            crate::Expression::ImageSample {
+                level: crate::SampleLevel::Zero,
+                ..
+            }
+        ))));
+}
+
+#[test]
+fn compatibility_texture_bias_requires_fragment_stage() {
+    let source = "#version 450\nlayout(binding=0) uniform texture2D source; layout(binding=1) uniform sampler sampling; void main() { vec4 v=texture(sampler2D(source,sampling),vec2(0.5),1.0); }";
+    for stage in [ShaderStage::Vertex, ShaderStage::Compute] {
+        let error = Frontend::default()
+            .parse(&Options::from(stage), source)
+            .unwrap_err();
+        assert!(error
+            .emit_to_string(source)
+            .contains("bias is only supported in fragment"));
+    }
+}
+
+#[test]
+fn compatibility_array_assignments_preserve_value_layouts() {
+    compatibility_module(ShaderStage::Fragment,"#version 450\nconst int N=2; struct Data { float a[N]; }; float[N] make() { float a[N]; a[0]=1.0; a[1]=2.0; return a; } layout(location=0) out vec4 color; void main() { Data d; d.a=make(); float a[N]; a=d.a; color=vec4(a[0],a[1],d.a[0],d.a[1]); }");
+}
+
+#[test]
+fn compatibility_array_layout_matching_keeps_element_identity() {
+    let source="#version 450\nstruct First { float v; }; struct Second { float v; }; float read(First a[2]) { return a[0].v; } layout(location=0) out vec4 color; void main() { Second a[2]; color=vec4(read(a)); }";
+    assert!(Frontend::default()
+        .parse(&Options::from(ShaderStage::Fragment), source)
+        .is_err());
 }
