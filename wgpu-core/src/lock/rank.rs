@@ -115,6 +115,7 @@ define_lock_ranks! {
         DEVICE_USAGE_SCOPES,
         HUB_OTHER,
         SHARED_TRACKER_INDEX_ALLOCATOR_INNER,
+        STAGING_BUFFER_POOL,
     }
     rank DEVICE_SNATCHABLE_LOCK "Device::snatchable_lock" followed by {
         BUFFER_MAP_STATE,
@@ -134,6 +135,7 @@ define_lock_ranks! {
         TEXTURE_CLEAR_MODE,
         TEXTURE_VIEWS,
         QUERY_SET_INITIALIZED_SLOTS,
+        STAGING_BUFFER_POOL,
         // Uncomment this to see an interesting cycle.
         // COMMAND_BUFFER_DATA,
     }
@@ -144,6 +146,7 @@ define_lock_ranks! {
         COMMAND_ALLOCATOR_FREE_ENCODERS,
         DEVICE_DEFERRED_DESTROY,
         SHARED_TRACKER_INDEX_ALLOCATOR_INNER,
+        STAGING_BUFFER_POOL,
     }
     rank QUEUE_PENDING_WRITES "Queue::pending_writes" followed by {
         BUFFER_MAP_STATE,
@@ -152,6 +155,7 @@ define_lock_ranks! {
         BUFFER_INITIALIZATION_STATUS,
         TEXTURE_INITIALIZATION_STATUS,
         SHARED_TRACKER_INDEX_ALLOCATOR_INNER,
+        STAGING_BUFFER_POOL,
     }
     rank TEXTURE_INITIALIZATION_STATUS "Texture::initialization_status" followed by {
         DEVICE_TRACKERS,
@@ -167,6 +171,7 @@ define_lock_ranks! {
         DEVICE_DEFERRED_DESTROY,
         DEVICE_TRACE,
         SHARED_TRACKER_INDEX_ALLOCATOR_INNER,
+        STAGING_BUFFER_POOL,
     }
     rank BUFFER_MAP_STATE "Buffer::map_state" followed by {
         DEVICE_TRACE,
@@ -206,6 +211,7 @@ define_lock_ranks! {
     rank HUB_EXTERNAL_TEXTURES "Hub::external_textures" followed by { }
     rank SHARED_TRACKER_INDEX_ALLOCATOR_INNER "SharedTrackerIndexAllocator::inner" followed by { }
     rank QUERY_SET_INITIALIZED_SLOTS "QuerySet::initialized_slots" followed by { }
+    rank STAGING_BUFFER_POOL "Device::staging_buffers" followed by { }
     rank TEXTURE_BIND_GROUPS "Texture::bind_groups" followed by { }
     rank TEXTURE_CLEAR_MODE "Texture::clear_mode" followed by { }
     rank TEXTURE_VIEWS "Texture::views" followed by { }

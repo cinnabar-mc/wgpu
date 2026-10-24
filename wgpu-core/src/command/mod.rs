@@ -908,6 +908,18 @@ impl Drop for CommandBuffer {
     }
 }
 
+/// Barriers that move a device's tracked resources into the states a command buffer starts in.
+pub(crate) struct DeviceTransitions<'a> {
+    pub(crate) buffers: Vec<hal::BufferBarrier<'a, dyn hal::DynBuffer>>,
+    pub(crate) textures: Vec<hal::TextureBarrier<'a, dyn hal::DynTexture>>,
+}
+
+impl DeviceTransitions<'_> {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.buffers.is_empty() && self.textures.is_empty()
+    }
+}
+
 impl CommandEncoder {
     pub(crate) fn new(
         encoder: Box<dyn hal::DynCommandEncoder>,
@@ -1066,27 +1078,24 @@ impl CommandEncoder {
         }
     }
 
-    pub(crate) fn insert_barriers_from_device_tracker(
-        raw: &mut dyn hal::DynCommandEncoder,
-        base: &mut DeviceTracker,
-        head: &Tracker,
-        snatch_guard: &SnatchGuard,
-    ) {
-        profiling::scope!("insert_barriers_from_device_tracker");
+    /// Moves `base` to the states `head` ends in and returns the barriers that bring `base`'s
+    /// current states to the ones `head` starts in.
+    pub(crate) fn device_tracker_transitions<'a, 'b: 'a>(
+        base: &'a mut DeviceTracker,
+        head: &'a Tracker,
+        snatch_guard: &'b SnatchGuard<'b>,
+    ) -> DeviceTransitions<'a> {
+        profiling::scope!("device_tracker_transitions");
 
-        let buffer_barriers = base
-            .buffers
-            .set_from_tracker_and_drain_transitions(&head.buffers, snatch_guard)
-            .collect::<Vec<_>>();
-
-        let texture_barriers = base
-            .textures
-            .set_from_tracker_and_drain_transitions(&head.textures, snatch_guard)
-            .collect::<Vec<_>>();
-
-        unsafe {
-            raw.transition_buffers(&buffer_barriers);
-            raw.transition_textures(&texture_barriers);
+        DeviceTransitions {
+            buffers: base
+                .buffers
+                .set_from_tracker_and_drain_transitions(&head.buffers, snatch_guard)
+                .collect(),
+            textures: base
+                .textures
+                .set_from_tracker_and_drain_transitions(&head.textures, snatch_guard)
+                .collect(),
         }
     }
 
