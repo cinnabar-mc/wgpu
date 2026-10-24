@@ -779,6 +779,8 @@ pub struct Writer<'a, W> {
     /// [`AccessIndex`]: crate::Expression::AccessIndex
     temp_access_chain: Vec<storage::SubAccess>,
     need_bake_expressions: back::NeedBakeExpressions,
+    /// Functions that use implicit derivatives, directly or through a call.
+    gradient_functions: crate::arena::HandleSet<crate::Function>,
 
     function_task_payload_var:
         crate::FastHashMap<Handle<crate::Function>, Handle<crate::GlobalVariable>>,

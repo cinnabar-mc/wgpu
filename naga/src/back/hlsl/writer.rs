@@ -142,6 +142,38 @@ const fn is_subgroup_builtin_binding(binding: &Option<crate::Binding>) -> bool {
     )
 }
 
+/// Whether `block` evaluates an implicit-derivative operation (`Sample`, `SampleBias`,
+/// `SampleCmp`, `ddx`, `ddy`, `fwidth`) or calls one of `gradient_functions`.
+fn block_uses_gradients(
+    block: &crate::Block,
+    expressions: &crate::Arena<crate::Expression>,
+    gradient_functions: &crate::arena::HandleSet<crate::Function>,
+) -> bool {
+    use crate::{Expression as E, Statement as S};
+    let nested = |block| block_uses_gradients(block, expressions, gradient_functions);
+    block.iter().any(|statement| match *statement {
+        S::Emit(ref range) => range.clone().any(|handle| match expressions[handle] {
+            E::ImageSample { level, .. } => level.implicit_derivatives(),
+            E::Derivative { .. } => true,
+            _ => false,
+        }),
+        S::Block(ref block) => nested(block),
+        S::If {
+            ref accept,
+            ref reject,
+            ..
+        } => nested(accept) || nested(reject),
+        S::Switch { ref cases, .. } => cases.iter().any(|case| nested(&case.body)),
+        S::Loop {
+            ref body,
+            ref continuing,
+            ..
+        } => nested(body) || nested(continuing),
+        S::Call { function, .. } => gradient_functions.contains(function),
+        _ => false,
+    })
+}
+
 /// Information for how to generate a `binding_array<sampler>` access.
 struct BindingArraySamplerInfo {
     /// Variable name of the sampler heap
@@ -168,6 +200,7 @@ impl<'a, W: fmt::Write> super::Writer<'a, W> {
             continue_ctx: back::continue_forward::ContinueCtx::default(),
             temp_access_chain: Vec::new(),
             need_bake_expressions: Default::default(),
+            gradient_functions: crate::arena::HandleSet::new(),
             function_task_payload_var: Default::default(),
         }
     }
@@ -190,6 +223,17 @@ impl<'a, W: fmt::Write> super::Writer<'a, W> {
         self.continue_ctx.clear();
         self.need_bake_expressions.clear();
         self.function_task_payload_var.clear();
+        // Callees precede their callers in a validated module.
+        self.gradient_functions.clear_for_arena(&module.functions);
+        for (handle, function) in module.functions.iter() {
+            if block_uses_gradients(
+                &function.body,
+                &function.expressions,
+                &self.gradient_functions,
+            ) {
+                self.gradient_functions.insert(handle);
+            }
+        }
     }
 
     /// Generates statements to be inserted immediately before and at the very
@@ -2592,6 +2636,14 @@ impl<'a, W: fmt::Write> super::Writer<'a, W> {
                 break_if,
             } => {
                 let force_loop_bound_statements = self.gen_force_bounded_loop_statements(level);
+                // FXC tries to unroll a loop with a gradient operation and varying iteration
+                // count, cannot unroll the loops written here, and fails with X3511. `[loop]`
+                // keeps it a loop, where derivatives in divergent invocations are undefined as in
+                // GLSL. DXC (shader model 6+) compiles such loops without the attribute.
+                let fxc_gradient_loop = self.options.shader_model < ShaderModel::V6_0
+                    && [body, continuing].into_iter().any(|block| {
+                        block_uses_gradients(block, func_ctx.expressions, &self.gradient_functions)
+                    });
                 let gate_name = (!continuing.is_empty() || break_if.is_some())
                     .then(|| self.namer.call("loop_init"));
 
@@ -2603,7 +2655,8 @@ impl<'a, W: fmt::Write> super::Writer<'a, W> {
                 }
 
                 self.continue_ctx.enter_loop();
-                writeln!(self.out, "{level}while(true) {{")?;
+                let attribute = if fxc_gradient_loop { "[loop] " } else { "" };
+                writeln!(self.out, "{level}{attribute}while(true) {{")?;
                 if let Some((_, ref break_and_inc)) = force_loop_bound_statements {
                     writeln!(self.out, "{break_and_inc}")?;
                 }
