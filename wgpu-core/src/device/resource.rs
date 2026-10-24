@@ -272,6 +272,8 @@ pub struct Device {
     pub(crate) ordered_texture_usages: wgt::TextureUses,
     pub(crate) instance_flags: wgt::InstanceFlags,
     pub(crate) deferred_destroy: Mutex<Vec<DeferredDestroy>>,
+    /// Queue-write staging buffers ready for reuse.
+    pub(crate) staging_buffers: Mutex<resource::StagingBufferPool>,
     pub(crate) usage_scopes: UsageScopePool,
     pub(crate) indirect_validation: Option<crate::indirect_validation::IndirectValidation>,
     // Optional so that we can late-initialize this after the queue is created.
@@ -324,7 +326,11 @@ impl Drop for Device {
         if let Some(timestamp_normalizer) = self.timestamp_normalizer.take() {
             timestamp_normalizer.dispose(self.raw.as_ref());
         }
+        let staging_buffers = self.staging_buffers.lock().drain().collect::<Vec<_>>();
         unsafe {
+            for raw in staging_buffers {
+                self.raw.destroy_buffer(raw);
+            }
             self.raw.destroy_buffer(zero_buffer);
             self.raw.destroy_bind_group_layout(empty_bgl);
             self.raw
@@ -557,6 +563,7 @@ impl Device {
             ordered_texture_usages,
             instance_flags,
             deferred_destroy: Mutex::new(rank::DEVICE_DEFERRED_DESTROY, Vec::new()),
+            staging_buffers: Mutex::new(rank::STAGING_BUFFER_POOL, Default::default()),
             usage_scopes: Mutex::new(rank::DEVICE_USAGE_SCOPES, Default::default()),
             timestamp_normalizer: OnceCellOrLock::new(),
             indirect_validation,

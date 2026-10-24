@@ -1445,11 +1445,14 @@ impl Queue {
                         }
 
                         // execute resource transitions
-                        if let Err(e) = baked.encoder.open_pass(hal_label(
-                            Some("(wgpu internal) Transit"),
-                            self.device.instance_flags,
-                        )) {
-                            break 'error Err(e.into());
+                        let transit_label =
+                            hal_label(Some("(wgpu internal) Transit"), self.device.instance_flags);
+                        // Init updates may record clears, which need the list open first.
+                        let needs_init = baked.needs_memory_init();
+                        if needs_init {
+                            if let Err(e) = baked.encoder.open_pass(transit_label) {
+                                break 'error Err(e.into());
+                            }
                         }
 
                         //Note: locking the trackers has to be done after the storages
@@ -1469,15 +1472,31 @@ impl Queue {
 
                         //Note: stateless trackers are not merged:
                         // device already knows these resources exist.
-                        CommandEncoder::insert_barriers_from_device_tracker(
-                            baked.encoder.raw.as_mut(),
-                            &mut trackers,
-                            &baked.trackers,
-                            &submission.snatch_guard,
-                        );
-
-                        if let Err(e) = baked.encoder.close_and_push_front() {
-                            break 'error Err(e.into());
+                        {
+                            let transitions = CommandEncoder::device_tracker_transitions(
+                                &mut trackers,
+                                &baked.trackers,
+                                &submission.snatch_guard,
+                            );
+                            // A command buffer whose resources are already in the states it
+                            // starts with needs no transit list.
+                            if needs_init || !transitions.is_empty() {
+                                let raw = if needs_init {
+                                    baked.encoder.raw.as_mut()
+                                } else {
+                                    match baked.encoder.open_pass(transit_label) {
+                                        Ok(raw) => raw,
+                                        Err(e) => break 'error Err(e.into()),
+                                    }
+                                };
+                                unsafe {
+                                    raw.transition_buffers(&transitions.buffers);
+                                    raw.transition_textures(&transitions.textures);
+                                }
+                                if let Err(e) = baked.encoder.close_and_push_front() {
+                                    break 'error Err(e.into());
+                                }
+                            }
                         }
 
                         // Transition surface textures into `Present` state.
