@@ -21,13 +21,14 @@ use crate::{
 /// avoid confusion about encoder state, we set the convention that _the encoder
 /// in an `EncodingState` holding a bare HAL reference must always be open_.
 ///
-/// Compute and render passes are more complicated. Because they record a
-/// command buffer for a housekeeping pre-pass which is inserted before the pass
-/// itself, the first thing they will do is close and reopen the encoder if it
-/// is already open. Unnecessary empty HAL passes can be avoided by passing them
-/// the encoder in whatever state it happens to be. In this case, `E` is
-/// `InnerCommandEncoder`, which tracks the state of the encoder. The callee
-/// (the render or compute pass) will open and close the encoder as necessary.
+/// Compute and render passes, and query set resolves, are more complicated, so
+/// they receive the encoder in whatever state it happens to be. In this case,
+/// `E` is `InnerCommandEncoder`, which tracks the state of the encoder. A pass
+/// records its commands into a [`PassRecorder`], then opens the encoder if
+/// needed and encodes its barriers and housekeeping followed by the recorded
+/// pass. Resolving a query set may close the encoder.
+///
+/// [`PassRecorder`]: super::pass_recorder::PassRecorder
 ///
 /// This structure is not supported by cbindgen because it contains a trait
 /// object reference.

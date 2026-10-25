@@ -73,6 +73,10 @@ Bottom level categories:
 
 ### Performance
 
+#### General
+
+- Encode each render and compute pass's barriers, discarded-surface clears, query resets, and indirect draw validation into the open raw command buffer ahead of the pass, instead of recording the pass into its own raw command buffer and inserting a separate one for that preparation. A command buffer's passes and the commands between them now share one raw command buffer, where each pass used to take two plus one for the commands after it.
+
 #### Metal
 
 - Add opt-in bounded asynchronous windowed presentation, allowing Immediate rendering to run independently of display drawable recycling.

@@ -18,7 +18,9 @@ use crate::{
         bind::Binder,
         memory_init::{fixup_discarded_surfaces, SurfacesInDiscardState, TextureSurfaceDiscard},
         pass::{self, flush_bindings_helper},
-        pass_base, pass_try,
+        pass_base,
+        pass_recorder::PassRecorder,
+        pass_try,
         query::{
             end_occlusion_query, end_pipeline_statistics_query, record_pass_timestamp_writes,
             validate_and_begin_occlusion_query, validate_and_begin_pipeline_statistics_query,
@@ -2285,8 +2287,15 @@ impl Global {
     }
 }
 
+/// Encodes a render pass into the open raw command buffer.
+///
+/// The pass is first validated and recorded into `recorder`. Its barriers,
+/// discarded-surface fixups, query resets, and indirect draw validation are only
+/// known once that is done; they are then encoded into the current raw command
+/// buffer, followed by the recorded pass.
 pub(super) fn encode_render_pass(
     parent_state: &mut EncodingState<InnerCommandEncoder>,
+    recorder: &mut PassRecorder,
     mut base: BasePass<ArcRenderCommand, Infallible>,
     color_attachments: ColorAttachments<Arc<TextureView>>,
     mut depth_stencil_attachment: Option<
@@ -2302,17 +2311,8 @@ pub(super) fn encode_render_pass(
 
     let mut indirect_draw_validation_batcher = crate::indirect_validation::DrawBatcher::new();
 
-    // We automatically keep extending command buffers over time, and because
-    // we want to insert a command buffer _before_ what we're about to record,
-    // we need to make sure to close the previous one.
-    parent_state
-        .raw_encoder
-        .close_if_open()
-        .map_pass_err(pass_scope)?;
-    let raw_encoder = parent_state
-        .raw_encoder
-        .open_pass(base.label.as_deref())
-        .map_pass_err(pass_scope)?;
+    debug_assert!(recorder.is_empty());
+    let raw_encoder: &mut dyn hal::DynCommandEncoder = recorder;
 
     let (scope, pending_discard_init_fixups, mut pending_query_resets) = {
         let mut pending_query_resets = QueryResetMap::new();
@@ -2713,56 +2713,49 @@ pub(super) fn encode_render_pass(
 
         let pending_discard_init_fixups = state.pass.pending_discard_init_fixups;
 
-        parent_state.raw_encoder.close().map_pass_err(pass_scope)?;
         (trackers, pending_discard_init_fixups, pending_query_resets)
     };
 
-    let encoder = &mut parent_state.raw_encoder;
     let tracker = &mut parent_state.tracker;
+    let raw = parent_state
+        .raw_encoder
+        .open_if_closed()
+        .map_pass_err(pass_scope)?;
 
-    {
-        let transit = encoder
-            .open_pass(hal_label(
-                Some("(wgpu internal) Pre Pass"),
-                device.instance_flags,
-            ))
+    fixup_discarded_surfaces(
+        pending_discard_init_fixups.into_iter(),
+        raw,
+        &mut tracker.textures,
+        device,
+        parent_state.snatch_guard,
+    );
+
+    pending_query_resets
+        .reset_queries(raw, parent_state.snatch_guard)
+        .map_pass_err(pass_scope)?;
+
+    CommandEncoder::insert_barriers_from_scope(raw, tracker, &scope, parent_state.snatch_guard);
+
+    if let Some(indirect_validation) = &device.indirect_validation {
+        indirect_validation
+            .draw
+            .inject_validation_pass(
+                device,
+                parent_state.snatch_guard,
+                parent_state.indirect_draw_validation_resources,
+                parent_state.temp_resources,
+                raw,
+                indirect_draw_validation_batcher,
+            )
             .map_pass_err(pass_scope)?;
-
-        fixup_discarded_surfaces(
-            pending_discard_init_fixups.into_iter(),
-            transit,
-            &mut tracker.textures,
-            device,
-            parent_state.snatch_guard,
-        );
-
-        pending_query_resets
-            .reset_queries(transit, parent_state.snatch_guard)
-            .map_pass_err(pass_scope)?;
-
-        CommandEncoder::insert_barriers_from_scope(
-            transit,
-            tracker,
-            &scope,
-            parent_state.snatch_guard,
-        );
-
-        if let Some(ref indirect_validation) = device.indirect_validation {
-            indirect_validation
-                .draw
-                .inject_validation_pass(
-                    device,
-                    parent_state.snatch_guard,
-                    parent_state.indirect_draw_validation_resources,
-                    parent_state.temp_resources,
-                    transit,
-                    indirect_draw_validation_batcher,
-                )
-                .map_pass_err(pass_scope)?;
-        }
     }
 
-    encoder.close_and_swap().map_pass_err(pass_scope)?;
+    // SAFETY: `raw` is open and outside of any pass, which is where the pass
+    // was recorded to begin, and everything the recording references is kept
+    // alive by the command buffer and the snatch guard.
+    unsafe { recorder.replay(raw) }
+        .map_err(|e| device.handle_hal_error(e))
+        .map_pass_err(pass_scope)?;
 
     Ok(())
 }
