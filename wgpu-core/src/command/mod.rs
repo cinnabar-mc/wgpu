@@ -20,6 +20,7 @@ mod encoder_command;
 pub mod ffi;
 mod memory_init;
 mod pass;
+mod pass_recorder;
 mod query;
 mod ray_tracing;
 mod render;
@@ -583,7 +584,7 @@ impl EncodingApi {
 /// commands into the middle of a recorded stream. However, hal queue submission
 /// accepts a series of command buffers at once, so we can simply break the
 /// stream up into multiple buffers, and then reorder the buffers. See
-/// [`InnerCommandEncoder::close_and_swap`] for a specific example of this.
+/// [`InnerCommandEncoder::close_and_push_front`] for a specific example of this.
 ///
 /// [rce]: hal::Api::CommandEncoder
 /// [rcb]: hal::Api::CommandBuffer
@@ -631,45 +632,18 @@ pub(crate) struct InnerCommandEncoder {
 }
 
 impl InnerCommandEncoder {
-    /// Finish the current command buffer and insert it just before
-    /// the last element in [`self.list`][l].
+    /// Finish the current command buffer and insert it at the beginning
+    /// of [`self.list`][l].
     ///
     /// On return, the underlying hal encoder is closed.
     ///
     /// What is this for?
     ///
-    /// The `wgpu_hal` contract requires that each render or compute pass's
-    /// commands be preceded by calls to [`transition_buffers`] and
-    /// [`transition_textures`], to put the resources the pass operates on in
-    /// the appropriate state. Unfortunately, we don't know which transitions
-    /// are needed until we're done recording the pass itself. Rather than
-    /// iterating over the pass twice, we note the necessary transitions as we
-    /// record its commands, finish the raw command buffer for the actual pass,
-    /// record a new raw command buffer for the transitions, and jam that buffer
-    /// in just before the pass's. This is the function that jams in the
-    /// transitions' command buffer.
-    ///
-    /// # Panics
-    ///
-    /// - If the encoder is not open.
-    ///
-    /// # Warning
-    ///
-    /// Any [`DeferredQuerySetResolve::insertion_point`] pointing to the
-    /// last element will be invalidated.
-    ///
-    /// [l]: InnerCommandEncoder::list
-    /// [`transition_buffers`]: hal::CommandEncoder::transition_buffers
-    /// [`transition_textures`]: hal::CommandEncoder::transition_textures
-    /// [`DeferredQuerySetResolve::insertion_point`]: query::DeferredQuerySetResolve::insertion_point
-    fn close_and_swap(&mut self) -> Result<(), DeviceError> {
-        self.close_and_insert_at(self.list.len() - 1)
-    }
-
-    /// Finish the current command buffer and insert it at the beginning
-    /// of [`self.list`][l].
-    ///
-    /// On return, the underlying hal encoder is closed.
+    /// Queue submission only learns which transitions and memory
+    /// initialization a command buffer needs before it runs once the command
+    /// buffer is finished and its resources' current states are known. It
+    /// records them into a new raw command buffer and uses this function to
+    /// put that buffer in front of the ones already recorded.
     ///
     /// # Panics
     ///
@@ -785,8 +759,7 @@ impl InnerCommandEncoder {
         Ok(self.raw.as_mut())
     }
 
-    /// Begin recording a new command buffer for a render or compute pass, with
-    /// its own label.
+    /// Begin recording a new command buffer with its own label.
     ///
     /// The underlying hal encoder is put in the "recording" state.
     ///
@@ -1125,6 +1098,10 @@ impl CommandEncoder {
             );
         }
 
+        // Records each pass so its barriers can precede it in the same raw command buffer.
+        // Taken from the device's pool when the first pass is encoded.
+        let mut pass_recorder: Option<pass_recorder::PassRecorder> = None;
+
         for command in commands {
             if matches!(
                 command,
@@ -1166,8 +1143,12 @@ impl CommandEncoder {
                             "Begin encoding render pass with '{}' label",
                             pass.label.as_deref().unwrap_or("")
                         );
+                        let recorder = pass_recorder.get_or_insert_with(|| {
+                            device.command_allocator.acquire_pass_recorder()
+                        });
                         let res = render::encode_render_pass(
                             &mut state,
+                            recorder,
                             pass,
                             color_attachments,
                             depth_stencil_attachment,
@@ -1193,7 +1174,15 @@ impl CommandEncoder {
                             "Begin encoding compute pass with '{}' label",
                             pass.label.as_deref().unwrap_or("")
                         );
-                        let res = compute::encode_compute_pass(&mut state, pass, timestamp_writes);
+                        let recorder = pass_recorder.get_or_insert_with(|| {
+                            device.command_allocator.acquire_pass_recorder()
+                        });
+                        let res = compute::encode_compute_pass(
+                            &mut state,
+                            recorder,
+                            pass,
+                            timestamp_writes,
+                        );
                         match res.as_ref() {
                             Err(err) => {
                                 api_log!("Finished encoding compute pass ({err:?})")
@@ -1311,13 +1300,17 @@ impl CommandEncoder {
             }
         }
 
+        if let Some(recorder) = pass_recorder {
+            device.command_allocator.release_pass_recorder(recorder);
+        }
+
         if debug_scope_depth > 0 {
             Err(CommandEncoderError::DebugGroupError(
                 DebugGroupError::MissingPop,
             ))?;
         }
 
-        // Close the encoder, unless it was closed already by a render or compute pass.
+        // Close the encoder, unless nothing was encoded since it was last closed.
         cmd_buf_data.encoder.close_if_open()?;
 
         // Note: if we want to stop tracking the swapchain texture view,

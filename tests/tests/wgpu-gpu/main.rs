@@ -48,6 +48,7 @@ mod naga_capabilities;
 mod occlusion_query;
 mod oob_indexing;
 mod oom;
+mod pass_dependencies;
 mod pass_ops;
 mod passthrough;
 mod per_vertex;
@@ -123,6 +124,7 @@ fn all_tests() -> Vec<wgpu_test::GpuTestInitializer> {
     occlusion_query::all_tests(&mut tests);
     oob_indexing::all_tests(&mut tests);
     oom::all_tests(&mut tests);
+    pass_dependencies::all_tests(&mut tests);
     pass_ops::all_tests(&mut tests);
     passthrough::all_tests(&mut tests);
     per_vertex::all_tests(&mut tests);

@@ -17,7 +17,9 @@ use crate::{
         encoder::EncodingState,
         memory_init::{fixup_discarded_surfaces, SurfacesInDiscardState},
         pass::{self, flush_bindings_helper},
-        pass_base, pass_try,
+        pass_base,
+        pass_recorder::PassRecorder,
+        pass_try,
         query::{
             end_pipeline_statistics_query, record_pass_timestamp_writes,
             validate_and_begin_pipeline_statistics_query,
@@ -654,8 +656,16 @@ impl Global {
     }
 }
 
+/// Encodes a compute pass into the open raw command buffer.
+///
+/// The pass is first validated and recorded into `recorder`, including the
+/// barriers between its dispatches. The barriers into the states its first
+/// dispatches need, and its discarded-surface fixups, are only known once that is
+/// done; they are then encoded into the current raw command buffer, followed by
+/// the recorded pass.
 pub(super) fn encode_compute_pass(
     parent_state: &mut EncodingState<InnerCommandEncoder>,
+    recorder: &mut PassRecorder,
     mut base: BasePass<ArcComputeCommand, Infallible>,
     mut timestamp_writes: Option<ArcPassTimestampWrites>,
 ) -> Result<(), ComputePassError> {
@@ -663,17 +673,8 @@ pub(super) fn encode_compute_pass(
 
     let device = parent_state.device;
 
-    // We automatically keep extending command buffers over time, and because
-    // we want to insert a command buffer _before_ what we're about to record,
-    // we need to make sure to close the previous one.
-    parent_state
-        .raw_encoder
-        .close_if_open()
-        .map_pass_err(pass_scope)?;
-    let raw_encoder = parent_state
-        .raw_encoder
-        .open_pass(base.label.as_deref())
-        .map_pass_err(pass_scope)?;
+    debug_assert!(recorder.is_empty());
+    let raw_encoder: &mut dyn hal::DynCommandEncoder = recorder;
 
     let mut debug_scope_depth = 0;
 
@@ -924,36 +925,29 @@ pub(super) fn encode_compute_pass(
         ..
     } = state;
 
-    // Stop the current command encoder.
-    parent_state.raw_encoder.close().map_pass_err(pass_scope)?;
-
-    // Create a new command encoder, which we will insert _before_ the body of the compute pass.
-    //
-    // Use that buffer to insert barriers and clear discarded images.
-    let transit = parent_state
+    let raw = parent_state
         .raw_encoder
-        .open_pass(hal_label(
-            Some("(wgpu internal) Pre Pass"),
-            device.instance_flags,
-        ))
+        .open_if_closed()
         .map_pass_err(pass_scope)?;
     fixup_discarded_surfaces(
         pending_discard_init_fixups.into_iter(),
-        transit,
+        raw,
         &mut parent_state.tracker.textures,
         device,
         parent_state.snatch_guard,
     );
     CommandEncoder::insert_barriers_from_tracker(
-        transit,
+        raw,
         parent_state.tracker,
         &intermediate_trackers,
         parent_state.snatch_guard,
     );
-    // Close the command encoder, and swap it with the previous.
-    parent_state
-        .raw_encoder
-        .close_and_swap()
+
+    // SAFETY: `raw` is open and outside of any pass, which is where the pass
+    // was recorded to begin, and everything the recording references is kept
+    // alive by the command buffer and the snatch guard.
+    unsafe { recorder.replay(raw) }
+        .map_err(|e| device.handle_hal_error(e))
         .map_pass_err(pass_scope)?;
 
     Ok(())
