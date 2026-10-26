@@ -149,6 +149,15 @@ pub struct PhysicalDeviceFeatures {
 }
 
 impl PhysicalDeviceFeatures {
+    /// Either image-robustness feature satisfies checked image access.
+    fn robust_image_access(&self) -> bool {
+        self.robustness2
+            .is_some_and(|features| features.robust_image_access2 != 0)
+            || self
+                .image_robustness
+                .is_some_and(|features| features.robust_image_access != 0)
+    }
+
     pub fn get_core(&self) -> vk::PhysicalDeviceFeatures {
         self.core
     }
@@ -2412,12 +2421,7 @@ impl super::Instance {
             can_present: true,
             //TODO: make configurable
             robust_buffer_access: phd_features.core.robust_buffer_access != 0,
-            robust_image_access: phd_features
-                .robustness2
-                .is_some_and(|f| f.robust_image_access2 != 0)
-                || phd_features
-                    .image_robustness
-                    .is_some_and(|ext| ext.robust_image_access != 0),
+            robust_image_access: phd_features.robust_image_access(),
             robust_buffer_access2: has_robust_buffer_access2,
             robust_image_access2: phd_features
                 .robustness2
@@ -3561,7 +3565,38 @@ fn query_cooperative_matrix_properties(
 #[cfg(test)]
 mod tests {
     use super::{super::Workarounds, vendor_workarounds};
+    use super::{vk, PhysicalDeviceFeatures};
     use crate::auxil::db;
+
+    #[test]
+    fn robustness2_without_images_preserves_image_robustness() {
+        let features = PhysicalDeviceFeatures {
+            robustness2: Some(
+                vk::PhysicalDeviceRobustness2FeaturesEXT::default()
+                    .robust_buffer_access2(true)
+                    .robust_image_access2(false),
+            ),
+            image_robustness: Some(
+                vk::PhysicalDeviceImageRobustnessFeaturesEXT::default().robust_image_access(true),
+            ),
+            ..Default::default()
+        };
+        assert!(features.robust_image_access());
+    }
+
+    #[test]
+    fn image_robustness_requires_an_enabled_image_feature() {
+        let mut features = PhysicalDeviceFeatures::default();
+        assert!(!features.robust_image_access());
+        features.robustness2 =
+            Some(vk::PhysicalDeviceRobustness2FeaturesEXT::default().robust_buffer_access2(true));
+        features.image_robustness = Some(vk::PhysicalDeviceImageRobustnessFeaturesEXT::default());
+        assert!(!features.robust_image_access());
+        features.robustness2.as_mut().unwrap().robust_image_access2 = vk::TRUE;
+        assert!(features.robust_image_access());
+        features.image_robustness = None;
+        assert!(features.robust_image_access());
+    }
 
     #[test]
     fn only_arm_serializes_pipeline_creation() {

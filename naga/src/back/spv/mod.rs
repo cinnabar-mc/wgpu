@@ -103,6 +103,7 @@ mod image;
 mod index;
 mod instructions;
 mod layout;
+mod layout_free;
 mod mesh_shader;
 mod ray;
 mod reclaimable;
