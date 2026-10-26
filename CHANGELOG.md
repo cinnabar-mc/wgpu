@@ -50,9 +50,14 @@ Bottom level categories:
 
 ### Bug Fixes
 
+#### Vulkan
+
+- Fall back to image robustness when robustness2 reports no robust image access. By @raphlinus in [#10291](https://github.com/gfx-rs/wgpu/pull/10291).
+
 #### naga
 
 - Preserve GLSL atomic argument evaluation, member addresses, compare-and-swap semantics, image access restrictions, and image barrier scope. Keep aggregate subtrees without atomic fields usable.
+- Emit layout-free Function and Private allocations for SPIR-V 1.5 and later, retaining host buffer layouts and whole-value copies.
 - Preserve value types in GLSL conditional operands used by field selections and swizzles.
 - Preserve GLSL length queries on fixed-size and runtime-sized atomic arrays.
 - Report constant-expression errors for GLSL accesses with non-constant bases instead of panicking.
