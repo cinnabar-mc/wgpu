@@ -5166,8 +5166,8 @@ mod tests {
                 let overrides = Arena::new();
                 let mut expressions = Arena::new();
                 let left = expressions.append(Expression::Literal(input), crate::Span::UNDEFINED);
-                let right =
-                    expressions.append(Expression::Literal(Literal::U32(2)), crate::Span::UNDEFINED);
+                let right = expressions
+                    .append(Expression::Literal(Literal::U32(2)), crate::Span::UNDEFINED);
                 let mut tracker = ExpressionKindTracker::from_arena(&expressions);
                 let mut layouter = crate::proc::Layouter::default();
                 let mut evaluator = ConstantEvaluator {
@@ -5203,5 +5203,4 @@ mod tests {
             }
         }
     }
-
 }
