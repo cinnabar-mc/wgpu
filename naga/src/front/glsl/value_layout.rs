@@ -31,6 +31,12 @@ pub(super) fn normalize_value_layout(
     if !has_value_layout(source, &ctx.module.types) {
         return Ok(());
     }
+    let target = ordinary_type(ctx, source, meta)?;
+    convert_value_layout(ctx, expr, target, meta)
+}
+
+/// Returns the ordinary type used to compare aggregate values across buffer layouts.
+fn ordinary_type(ctx: &mut Context, source: Handle<Type>, meta: Span) -> Result<Handle<Type>> {
     let mut errors = Vec::new();
     let target = offset::calculate_offset(
         source,
@@ -43,7 +49,7 @@ pub(super) fn normalize_value_layout(
     if let Some(error) = errors.into_iter().next() {
         return Err(error);
     }
-    convert_value_layout(ctx, expr, target, meta)
+    Ok(target)
 }
 
 /// Rebuilds an array or a layout variant of the same declared struct for its destination.
@@ -64,29 +70,27 @@ pub(super) fn convert_value_layout(
     if source == target {
         return Ok(());
     }
-    let count = match (&target_inner, &ctx.module.types[source].inner) {
-        (
-            &TypeInner::Array {
-                size: crate::ArraySize::Constant(target_size),
-                ..
-            },
-            &TypeInner::Array {
+    let count = match target_inner {
+        TypeInner::Array {
+            size: crate::ArraySize::Constant(target_size),
+            ..
+        } => match ctx.module.types[source].inner {
+            TypeInner::Array {
                 size: crate::ArraySize::Constant(source_size),
                 ..
-            },
-        ) if target_size == source_size => target_size.get() as usize,
-        (
-            &TypeInner::Struct { ref members, .. },
-            &TypeInner::Struct {
-                members: ref source_members,
-                ..
-            },
-        ) if members.len() == source_members.len()
-            && ctx.module.types[target].name.is_some()
-            && ctx.module.types[target].name == ctx.module.types[source].name
-            && ctx.module.types.get_span(target) != Span::UNDEFINED
-            && ctx.module.types.get_span(target) == ctx.module.types.get_span(source) =>
-        {
+            } if target_size == source_size => target_size.get() as usize,
+            _ => return Ok(()),
+        },
+        TypeInner::Struct { ref members, .. } => {
+            if !matches!(ctx.module.types[source].inner, TypeInner::Struct { .. })
+                || !has_value_layout(source, &ctx.module.types)
+                || !has_value_layout(target, &ctx.module.types)
+            {
+                return Ok(());
+            }
+            if ordinary_type(ctx, source, meta)? != ordinary_type(ctx, target, meta)? {
+                return Ok(());
+            }
             members.len()
         }
         _ => return Ok(()),
