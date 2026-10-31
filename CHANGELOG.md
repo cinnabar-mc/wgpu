@@ -50,6 +50,10 @@ Bottom level categories:
 
 ### Bug Fixes
 
+#### Metal
+
+- Fix crashes when configuring HDR color spaces by dereferencing dynamically resolved CoreGraphics globals. By @stuartparmenter in [#10175](https://github.com/gfx-rs/wgpu/pull/10175).
+
 #### Vulkan
 
 - Fix crash on older Vulkan drivers when `poolSizeCount == 0`. By @lucasmerlin in [#10124](https://github.com/gfx-rs/wgpu/pull/10124).
