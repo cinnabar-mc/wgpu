@@ -13,6 +13,7 @@ use super::{
     context::{Context, ExprPos, StmtContext},
     error::{Error, ErrorKind},
     types::scalar_components,
+    value_layout::convert_value_layout,
     Frontend, Result,
 };
 use crate::{
@@ -543,7 +544,7 @@ impl Frontend {
                 if let Some(scalar) = scalar_components {
                     ctx.implicit_conversion(&mut arg, meta, scalar)?;
                 }
-                array_layout_conversion(ctx, &mut arg, member_ty, meta)?;
+                convert_value_layout(ctx, &mut arg, member_ty, meta)?;
 
                 components.push(arg)
             }
@@ -862,7 +863,6 @@ impl Frontend {
                     *parameter,
                     parameter_info,
                     handle,
-                    call_argument,
                     &mut proxy_writes,
                     &mut arguments,
                 )?;
@@ -879,7 +879,7 @@ impl Frontend {
                 ctx.implicit_conversion(&mut handle, meta, scalar)?;
             }
 
-            array_layout_conversion(ctx, &mut handle, *parameter, meta)?;
+            convert_value_layout(ctx, &mut handle, *parameter, meta)?;
             arguments.push(handle)
         }
 
@@ -933,7 +933,7 @@ impl Frontend {
             }
 
             if let TypeInner::Pointer { base, .. } = *ctx.resolve_type(proxy_write.target, meta)? {
-                array_layout_conversion(ctx, &mut value, base, meta)?;
+                convert_value_layout(ctx, &mut value, base, meta)?;
             }
             ctx.emit_restart();
 
@@ -959,7 +959,6 @@ impl Frontend {
         parameter_ty: Handle<Type>,
         parameter_info: &ParameterInfo,
         original: Handle<Expression>,
-        call_argument: &(Handle<Expression>, Span),
         proxy_writes: &mut Vec<ProxyWrite>,
         arguments: &mut Vec<Handle<Expression>>,
     ) -> Result<()> {
@@ -1020,10 +1019,10 @@ impl Frontend {
             original
         };
 
-        ctx.typifier_grow(call_argument.0, call_argument.1)?;
+        ctx.typifier_grow(value, meta)?;
 
         let overload_param_ty = &ctx.module.types[parameter_ty].inner;
-        let call_arg_ty = ctx.get_type(call_argument.0);
+        let call_arg_ty = ctx.get_type(value);
         let needs_conversion = call_arg_ty != overload_param_ty;
 
         let arg_scalar_comps = scalar_components(call_arg_ty);
@@ -1051,7 +1050,7 @@ impl Frontend {
             // If the argument is also copied in we must store the value of the
             // original variable to the spill variable.
             if let ParameterQualifier::InOut = parameter_info.qualifier {
-                array_layout_conversion(ctx, &mut value, ty, meta)?;
+                convert_value_layout(ctx, &mut value, ty, meta)?;
                 ctx.emit_restart();
                 ctx.body.push(
                     Statement::Store {
@@ -2150,55 +2149,6 @@ fn same_value_type(module: &crate::Module, a: &TypeInner, b: &TypeInner) -> bool
         }
         _ => a == b,
     }
-}
-
-/// Converts `expr`, an array value, to the array type `target` when the two only
-/// differ in their layout.
-///
-/// GLSL array types don't depend on where they are declared, but naga array
-/// types carry a stride: an array member of a struct uses the std140 stride
-/// while a local `float[6](...)` uses the natural one. Such a value is rebuilt
-/// element by element with the target type.
-pub(super) fn array_layout_conversion(
-    ctx: &mut Context,
-    expr: &mut Handle<Expression>,
-    target: Handle<Type>,
-    meta: Span,
-) -> Result<()> {
-    let target_inner = ctx.module.types[target].inner.clone();
-    let TypeInner::Array {
-        base: target_base,
-        size: crate::ArraySize::Constant(target_size),
-        ..
-    } = target_inner
-    else {
-        return Ok(());
-    };
-    match *ctx.resolve_type(*expr, meta)? {
-        ref source if *source == target_inner => return Ok(()),
-        TypeInner::Array {
-            size: crate::ArraySize::Constant(size),
-            ..
-        } if size == target_size => {}
-        _ => return Ok(()),
-    }
-
-    let mut components = Vec::with_capacity(target_size.get() as usize);
-    for index in 0..target_size.get() {
-        let mut element =
-            ctx.add_expression(Expression::AccessIndex { base: *expr, index }, meta)?;
-        array_layout_conversion(ctx, &mut element, target_base, meta)?;
-        components.push(element);
-    }
-    *expr = ctx.add_expression(
-        Expression::Compose {
-            ty: target,
-            components,
-        },
-        meta,
-    )?;
-
-    Ok(())
 }
 
 /// Helper function, returns the type of conversion from `source` to `target`, if a

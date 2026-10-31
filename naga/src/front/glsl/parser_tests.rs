@@ -1784,3 +1784,34 @@ fn regression_standalone_array_stride() {
         assert_eq!(span, expected * 2);
     }
 }
+
+/// Uniform layout variants remain usable as whole GLSL values across value boundaries.
+#[test]
+fn regression_uniform_struct_layout_values() {
+    let module = Frontend::default()
+        .parse(
+            &Options::from(ShaderStage::Compute),
+            include_str!("../../../tests/in/glsl/uniform-struct-layout-values.glsl"),
+        )
+        .unwrap();
+    crate::valid::Validator::new(
+        crate::valid::ValidationFlags::all(),
+        crate::valid::Capabilities::all(),
+    )
+    .validate(&module)
+    .unwrap();
+}
+
+/// Layout conversion must not make separately declared structs interchangeable.
+#[test]
+fn regression_distinct_struct_layout_values() {
+    let source = "#version 450\nstruct A { float values[2]; }; struct B { float values[2]; }; layout(std140, binding = 0) uniform U { A input_value; }; void main() { B value = input_value; }";
+    if let Ok(module) = Frontend::default().parse(&Options::from(ShaderStage::Compute), source) {
+        assert!(crate::valid::Validator::new(
+            crate::valid::ValidationFlags::all(),
+            crate::valid::Capabilities::all()
+        )
+        .validate(&module)
+        .is_err());
+    }
+}

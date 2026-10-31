@@ -479,7 +479,7 @@ impl<'a> Context<'a> {
     ) -> Result<(Handle<Expression>, Span)> {
         let (maybe_expr, meta) = self.lower_inner(stmt, frontend, expr, pos)?;
 
-        let expr = match maybe_expr {
+        let mut expr = match maybe_expr {
             Some(e) => e,
             None => {
                 return Err(Error {
@@ -488,6 +488,10 @@ impl<'a> Context<'a> {
                 })
             }
         };
+
+        if pos == ExprPos::Rhs {
+            super::value_layout::normalize_value_layout(self, &mut expr, meta)?;
+        }
 
         Ok((expr, meta))
     }
@@ -499,7 +503,7 @@ impl<'a> Context<'a> {
         meta: Span,
     ) -> Result<()> {
         if let TypeInner::Pointer { base, .. } = *self.resolve_type(pointer, meta)? {
-            super::functions::array_layout_conversion(self, &mut value, base, meta)?;
+            super::value_layout::convert_value_layout(self, &mut value, base, meta)?;
         }
         if let Expression::Swizzle {
             size,

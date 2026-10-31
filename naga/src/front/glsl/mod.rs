@@ -38,6 +38,7 @@ mod parser;
 mod parser_tests;
 mod token;
 mod types;
+mod value_layout;
 mod variables;
 
 type Result<T> = core::result::Result<T, Error>;
