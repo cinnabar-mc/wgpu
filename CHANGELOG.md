@@ -57,6 +57,7 @@ Bottom level categories:
 
 #### naga
 
+- Keep different macro-expanded GLSL structs incompatible when converting buffer layouts.
 - Discard high bits in constant GLSL left shifts while retaining WGSL overflow errors.
 - Match standalone GLSL struct array strides to ordinary arrays and preserve whole-value transfers to and from buffer interfaces.
 - Preserve GLSL atomic argument evaluation, member addresses, compare-and-swap semantics, image access restrictions, and image barrier scope. Keep aggregate subtrees without atomic fields usable.

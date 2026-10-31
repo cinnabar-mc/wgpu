@@ -1879,3 +1879,31 @@ fn regression_constant_shift_wgsl() {
         assert!(crate::front::wgsl::parse_str(&source).is_err(), "{source}");
     }
 }
+
+/// Macro expansions must not make different struct member names interchangeable.
+#[test]
+fn regression_macro_struct_identity() {
+    for source in [
+        "#version 450\n#define DECL(field) struct S { float field[2]; };\nDECL(a)\nlayout(std140, binding = 0) uniform U { S input_value; };\nvoid main() { DECL(b) S value; value = input_value; }",
+        "#version 450\n#define PROGRAM struct S { float a[2]; }; layout(std140, binding = 0) uniform U { S input_value; }; void main() { struct S { float b[2]; }; S value; value = input_value; }\nPROGRAM",
+    ] {
+        if let Ok(module) = Frontend::default().parse(&Options::from(ShaderStage::Compute), source) {
+            assert!(crate::valid::Validator::new(crate::valid::ValidationFlags::all(), crate::valid::Capabilities::all()).validate(&module).is_err(), "{source}");
+        }
+    }
+}
+
+/// A macro-declared struct still transfers between its own buffer and value layouts.
+#[test]
+fn regression_macro_struct_identity_transfer() {
+    let source = "#version 450\n#define DECL(field) struct S { float field[2]; };\nDECL(a)\nlayout(std140, binding = 0) uniform U { S input_value; };\nvoid main() { S value = input_value; S copy; copy = value; }";
+    let module = Frontend::default()
+        .parse(&Options::from(ShaderStage::Compute), source)
+        .unwrap();
+    crate::valid::Validator::new(
+        crate::valid::ValidationFlags::all(),
+        crate::valid::Capabilities::all(),
+    )
+    .validate(&module)
+    .unwrap();
+}
