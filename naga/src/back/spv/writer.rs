@@ -3914,8 +3914,16 @@ impl Writer {
         self.write_logical_layout(ir_module, info, ep_index, debug_info)?;
         self.write_physical_layout();
 
+        let start = words.len();
         self.physical_layout.in_words(words);
         self.logical_layout.in_words(words);
+        if start == 0 {
+            super::layout_free::legalize(words)?;
+        } else {
+            let mut module = words.split_off(start);
+            super::layout_free::legalize(&mut module)?;
+            words.extend(module);
+        }
         Ok(())
     }
 
