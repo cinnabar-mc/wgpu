@@ -1,7 +1,6 @@
 #version 450
-// Struct members are laid out with std140 strides while array constructors
-// use the natural stride, so array arguments of struct constructors must be
-// converted to the member's array type.
+// Standalone struct members and array constructors use ordinary strides,
+// including constant and runtime array arguments.
 
 struct Params {
     float a;

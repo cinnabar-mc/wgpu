@@ -21,13 +21,12 @@ fn main_1() {
     let _e25 = x_1;
     let _e26 = lo;
     let _e27 = x_1;
-    let _e31 = array<vec2<f32>, 2>(vec2(_e27), vec2(2f));
-    p = Params(_e25, array<f32, 6>(_e26[0], _e26[1], _e26[2], _e26[3], _e26[4], _e26[5]), array<vec2<f32>, 2>(_e31[0], _e31[1]));
-    let _e46 = c.lo[2];
-    let _e49 = p.lo[3];
-    let _e53 = p.b[1];
-    let _e55 = c.a;
-    o = vec4<f32>((_e46 + _e49), _e53.x, _e53.y, _e55);
+    p = Params(_e25, _e26, array<vec2<f32>, 2>(vec2(_e27), vec2(2f)));
+    let _e36 = c.lo[2];
+    let _e39 = p.lo[3];
+    let _e43 = p.b[1];
+    let _e45 = c.a;
+    o = vec4<f32>((_e36 + _e39), _e43.x, _e43.y, _e45);
     return;
 }
 
