@@ -530,9 +530,6 @@ impl super::Surface {
 mod color_space_tests {
     use super::*;
     use objc2_core_foundation::{CFGetTypeID, ConcreteType};
-    use objc2_core_graphics::{
-        kCGColorSpaceExtendedDisplayP3, kCGColorSpaceITUR_2100_HLG, kCGColorSpaceITUR_2100_PQ,
-    };
 
     /// Dynamic lookups must return the CFString object stored in each global.
     #[test]
@@ -542,13 +539,26 @@ mod color_space_tests {
             return;
         }
         let spaces = COLOR_SPACES.as_ref().unwrap();
-        for (name, native) in unsafe {
-            [
-                (spaces.extended_display_p3, kCGColorSpaceExtendedDisplayP3),
-                (spaces.itur_bt2100_pq, kCGColorSpaceITUR_2100_PQ),
-                (spaces.itur_bt2100_hlg, kCGColorSpaceITUR_2100_HLG),
-            ]
-        } {
+        let lib = unsafe {
+            libloading::Library::new(
+                "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics",
+            )
+        }
+        .unwrap();
+        for (name, symbol) in [
+            (
+                spaces.extended_display_p3,
+                c"kCGColorSpaceExtendedDisplayP3",
+            ),
+            (spaces.itur_bt2100_pq, c"kCGColorSpaceITUR_2100_PQ"),
+            (spaces.itur_bt2100_hlg, c"kCGColorSpaceITUR_2100_HLG"),
+        ] {
+            let native = unsafe {
+                let global = lib
+                    .get::<*const *const CFString>(symbol.to_bytes_with_nul())
+                    .unwrap();
+                (*global).read()
+            };
             // Check the address before passing the object to CoreFoundation.
             assert!(core::ptr::eq(name, native));
             assert_eq!(CFGetTypeID(Some(name.as_ref())), CFString::type_id());
