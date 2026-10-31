@@ -227,6 +227,17 @@ struct ColorSpaces {
     itur_bt2100_hlg: &'static CFString,
 }
 
+/// Resolves a CoreGraphics color-space global without requiring it at link time.
+fn lookup_color_space(
+    lib: &libloading::Library,
+    name: &[u8],
+) -> Result<&'static CFString, crate::SurfaceError> {
+    // The symbol points to the global holding the CFString reference.
+    let sym = unsafe { lib.get::<*const &'static CFString>(name) }
+        .map_err(|_| crate::SurfaceError::Other("error resolving symbol in CoreGraphics"))?;
+    Ok(unsafe { **sym })
+}
+
 static COLOR_SPACES: LazyLock<Result<ColorSpaces, crate::SurfaceError>> = LazyLock::new(|| {
     // Stable Rust doesn't support weak linkage, so objc2 doesn't
     // offer it. To avoid link errors on old OS versions, resolve
@@ -235,17 +246,9 @@ static COLOR_SPACES: LazyLock<Result<ColorSpaces, crate::SurfaceError>> = LazyLo
         libloading::Library::new("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics")
             .map_err(|_| crate::SurfaceError::Other("error loading CoreGraphics"))?
     };
-    fn lookup(
-        lib: &libloading::Library,
-        name: &[u8],
-    ) -> Result<&'static CFString, crate::SurfaceError> {
-        let sym = unsafe { lib.get(name) }
-            .map_err(|_| crate::SurfaceError::Other("error resolving symbol in CoreGraphics"))?;
-        Ok(*sym)
-    }
-    let extended_display_p3 = lookup(&lib, b"kCGColorSpaceExtendedDisplayP3\0")?;
-    let itur_bt2100_pq = lookup(&lib, b"kCGColorSpaceITUR_2100_PQ\0")?;
-    let itur_bt2100_hlg = lookup(&lib, b"kCGColorSpaceITUR_2100_HLG\0")?;
+    let extended_display_p3 = lookup_color_space(&lib, b"kCGColorSpaceExtendedDisplayP3\0")?;
+    let itur_bt2100_pq = lookup_color_space(&lib, b"kCGColorSpaceITUR_2100_PQ\0")?;
+    let itur_bt2100_hlg = lookup_color_space(&lib, b"kCGColorSpaceITUR_2100_HLG\0")?;
     Ok(ColorSpaces {
         extended_display_p3,
         itur_bt2100_pq,
@@ -520,5 +523,63 @@ impl super::Surface {
             },
             suboptimal: false,
         }
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod color_space_tests {
+    use super::*;
+    use objc2_core_foundation::{CFGetTypeID, ConcreteType};
+
+    /// Dynamic lookups must return the CFString object stored in each global.
+    #[test]
+    fn resolved_color_spaces_are_valid_strings() {
+        if !available!(macos = 11.0) {
+            eprintln!("missing fixture: HDR color-space globals require macOS 11");
+            return;
+        }
+        let spaces = COLOR_SPACES.as_ref().unwrap();
+        let lib = unsafe {
+            libloading::Library::new(
+                "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics",
+            )
+        }
+        .unwrap();
+        for (name, symbol) in [
+            (
+                spaces.extended_display_p3,
+                c"kCGColorSpaceExtendedDisplayP3",
+            ),
+            (spaces.itur_bt2100_pq, c"kCGColorSpaceITUR_2100_PQ"),
+            (spaces.itur_bt2100_hlg, c"kCGColorSpaceITUR_2100_HLG"),
+        ] {
+            let native = unsafe {
+                let global = lib
+                    .get::<*const *const CFString>(symbol.to_bytes_with_nul())
+                    .unwrap();
+                (*global).read()
+            };
+            // Check the address before passing the object to CoreFoundation.
+            assert!(core::ptr::eq(name, native));
+            assert_eq!(CFGetTypeID(Some(name.as_ref())), CFString::type_id());
+            assert!(CGColorSpace::with_name(Some(name)).is_some());
+        }
+    }
+
+    /// An unavailable global must remain a recoverable surface error.
+    #[test]
+    fn missing_color_space_is_recoverable() {
+        let lib = unsafe {
+            libloading::Library::new(
+                "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics",
+            )
+        }
+        .unwrap();
+        assert!(matches!(
+            lookup_color_space(&lib, b"wgpuMissingColorSpaceForTest\0"),
+            Err(crate::SurfaceError::Other(
+                "error resolving symbol in CoreGraphics"
+            ))
+        ));
     }
 }
