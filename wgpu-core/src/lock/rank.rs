@@ -118,6 +118,7 @@ define_lock_ranks! {
         STAGING_BUFFER_POOL,
     }
     rank DEVICE_SNATCHABLE_LOCK "Device::snatchable_lock" followed by {
+        COMMAND_ALLOCATOR_FREE_PASS_RECORDERS,
         BUFFER_MAP_STATE,
         DEVICE_COMMAND_INDICES,
         QUEUE_PENDING_WRITES,
@@ -205,6 +206,7 @@ define_lock_ranks! {
     rank BUFFER_BIND_GROUPS "Buffer::bind_groups" followed by { }
     rank BUFFER_INITIALIZATION_STATUS "Buffer::initialization_status" followed by { }
     rank BUFFER_POOL "BufferPool::buffers" followed by { }
+    rank COMMAND_ALLOCATOR_FREE_PASS_RECORDERS "CommandAllocator::free_pass_recorders" followed by { }
     rank DEVICE_DEFERRED_DESTROY "Device::deferred_destroy" followed by { }
     rank DEVICE_TRACE "Device::trace" followed by { }
     rank DEVICE_USAGE_SCOPES "Device::usage_scopes" followed by { }
