@@ -114,11 +114,13 @@ impl ParsingContext<'_> {
                 let ty_name = self.expect_ident(frontend)?.0;
                 self.expect(frontend, TokenValue::LeftBrace)?;
                 let mut members = Vec::new();
+                // Match ordinary array strides in standalone structs. Interface blocks
+                // calculate their own layouts separately.
                 let span = self.parse_struct_declaration_list(
                     frontend,
                     ctx,
                     &mut members,
-                    StructLayout::Std140,
+                    StructLayout::Std430,
                 )?;
                 let end_meta = self.expect(frontend, TokenValue::RightBrace)?.meta;
                 meta.subsume(end_meta);

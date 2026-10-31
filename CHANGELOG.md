@@ -57,6 +57,7 @@ Bottom level categories:
 
 #### naga
 
+- Match standalone GLSL struct member array strides to ordinary arrays while preserving buffer-interface layouts.
 - Preserve GLSL atomic argument evaluation, member addresses, compare-and-swap semantics, image access restrictions, and image barrier scope. Keep aggregate subtrees without atomic fields usable.
 - Emit layout-free Function and Private allocations for SPIR-V 1.5 and later, retaining host buffer layouts and whole-value copies.
 - Preserve value types in GLSL conditional operands used by field selections and swizzles.
