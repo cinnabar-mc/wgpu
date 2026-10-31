@@ -309,7 +309,7 @@ fn create_descriptor_pool(
         capacity = (u32::MAX / count.max(1)).min(capacity);
     }
 
-    let pool_sizes = counts
+    let mut pool_sizes = counts
         .into_iter()
         .filter(|&(_, count)| count != 0)
         .map(|(ty, count)| vk::DescriptorPoolSize {
@@ -317,6 +317,16 @@ fn create_descriptor_pool(
             descriptor_count: count * capacity,
         })
         .collect::<ArrayVec<_, NR_OF_DESCRIPTOR_TYPES>>();
+
+    // Prior to Vulkan 1.3.215 `poolSizeCount` was required to be non-zero, so
+    // add a single small sampler entry if `pool_sizes` would otherwise be
+    // empty.
+    if pool_sizes.is_empty() {
+        pool_sizes.push(vk::DescriptorPoolSize {
+            ty: Dt::SAMPLER,
+            descriptor_count: 1,
+        });
+    }
 
     let mut flags = vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET;
     if key.update_after_bind {
