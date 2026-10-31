@@ -1763,7 +1763,7 @@ fn regression_constant_shift_glsl() {
         let constant = module
             .constants
             .iter()
-            .find(|(_, c)| c.name.as_deref() == Some(name))
+            .find(|&(_, c)| c.name.as_deref() == Some(name))
             .unwrap()
             .1;
         assert_eq!(
@@ -1774,7 +1774,7 @@ fn regression_constant_shift_glsl() {
     let vector = module
         .constants
         .iter()
-        .find(|(_, c)| c.name.as_deref() == Some("vector_wrap"))
+        .find(|&(_, c)| c.name.as_deref() == Some("vector_wrap"))
         .unwrap()
         .1;
     let crate::Expression::Compose { ref components, .. } = module.global_expressions[vector.init]
