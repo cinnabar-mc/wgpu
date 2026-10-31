@@ -1746,6 +1746,76 @@ fn compatibility_array_layout_matching_keeps_element_identity() {
         .is_err());
 }
 
+/// Standalone arrays compose with struct members without changing buffer layouts.
+#[test]
+fn regression_standalone_array_stride() {
+    let module = Frontend::default()
+        .parse(
+            &Options::from(ShaderStage::Compute),
+            include_str!("../../../tests/in/glsl/standalone-array-stride.glsl"),
+        )
+        .unwrap();
+    crate::valid::Validator::new(
+        crate::valid::ValidationFlags::all(),
+        crate::valid::Capabilities::all(),
+    )
+    .validate(&module)
+    .unwrap();
+    for (_, global) in module.global_variables.iter() {
+        let Some(ref binding) = global.binding else {
+            continue;
+        };
+        let crate::TypeInner::Struct { ref members, .. } = module.types[global.ty].inner else {
+            panic!("expected interface block");
+        };
+        let crate::TypeInner::Struct { ref members, span } = module.types[members[0].ty].inner
+        else {
+            panic!("expected Samples member");
+        };
+        let crate::TypeInner::Array { stride, .. } = module.types[members[0].ty].inner else {
+            panic!("expected array member");
+        };
+        let expected = match binding.binding {
+            0 => 16,
+            1 => 4,
+            _ => panic!("unexpected binding"),
+        };
+        assert_eq!(stride, expected);
+        assert_eq!(span, expected * 2);
+    }
+}
+
+/// Uniform layout variants remain usable as whole GLSL values across value boundaries.
+#[test]
+fn regression_uniform_struct_layout_values() {
+    let module = Frontend::default()
+        .parse(
+            &Options::from(ShaderStage::Compute),
+            include_str!("../../../tests/in/glsl/uniform-struct-layout-values.glsl"),
+        )
+        .unwrap();
+    crate::valid::Validator::new(
+        crate::valid::ValidationFlags::all(),
+        crate::valid::Capabilities::all(),
+    )
+    .validate(&module)
+    .unwrap();
+}
+
+/// Layout conversion must not make separately declared structs interchangeable.
+#[test]
+fn regression_distinct_struct_layout_values() {
+    let source = "#version 450\nstruct A { float values[2]; }; struct B { float values[2]; }; layout(std140, binding = 0) uniform U { A input_value; }; void main() { B value = input_value; }";
+    if let Ok(module) = Frontend::default().parse(&Options::from(ShaderStage::Compute), source) {
+        assert!(crate::valid::Validator::new(
+            crate::valid::ValidationFlags::all(),
+            crate::valid::Capabilities::all()
+        )
+        .validate(&module)
+        .is_err());
+    }
+}
+
 /// GLSL constant shifts discard high bits for scalars, vectors and folded expressions.
 #[test]
 fn regression_constant_shift_glsl() {
