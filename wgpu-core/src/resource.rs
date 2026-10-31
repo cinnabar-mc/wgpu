@@ -1234,9 +1234,9 @@ unsafe impl Sync for StagingBuffer {}
 /// operations like [`queue_write_texture`] that need to upload data to the GPU,
 /// but that don't belong to any particular wgpu command buffer.
 ///
-/// Used `StagingBuffer`s are accumulated in [`Device::pending_writes`], to be
-/// freed once their associated operation's queue submission has finished
-/// execution.
+/// Used `StagingBuffer`s are accumulated in [`Device::pending_writes`]. Once their associated
+/// operation's queue submission has finished execution, buffers of a pooled capacity return to
+/// the device's [`StagingBufferPool`] for later writes and larger ones are freed.
 ///
 /// [`queue_create_staging_buffer`]: crate::global::Global::queue_create_staging_buffer
 /// [`queue_write_staging_buffer`]: crate::global::Global::queue_write_staging_buffer
@@ -1247,6 +1247,8 @@ pub struct StagingBuffer {
     raw: Box<dyn hal::DynBuffer>,
     device: Arc<Device>,
     pub(crate) size: wgt::BufferSize,
+    /// The pooled capacity `raw` was created with, or `None` when it belongs to this write only.
+    class: Option<StagingClass>,
     is_coherent: bool,
     ptr: NonNull<u8>,
 }
@@ -1254,16 +1256,22 @@ pub struct StagingBuffer {
 impl StagingBuffer {
     pub(crate) fn new(device: &Arc<Device>, size: wgt::BufferSize) -> Result<Self, DeviceError> {
         profiling::scope!("StagingBuffer::new");
-        let stage_desc = hal::BufferDescriptor {
-            label: hal_label(Some("(wgpu internal) Staging"), device.instance_flags),
-            size: size.get(),
-            usage: wgt::BufferUses::MAP_WRITE | wgt::BufferUses::COPY_SRC,
-            memory_flags: hal::MemoryFlags::TRANSIENT,
+        let class = StagingClass::of(size.get());
+        let pooled = class.and_then(|class| device.staging_buffers.lock().take(class));
+        let raw = match pooled {
+            Some(raw) => raw,
+            None => {
+                let stage_desc = hal::BufferDescriptor {
+                    label: hal_label(Some("(wgpu internal) Staging"), device.instance_flags),
+                    size: class.map_or(size.get(), StagingClass::capacity),
+                    usage: wgt::BufferUses::MAP_WRITE | wgt::BufferUses::COPY_SRC,
+                    memory_flags: hal::MemoryFlags::TRANSIENT,
+                };
+                // Nothing is recorded yet, so running out of memory fails only this write.
+                unsafe { device.raw().create_buffer(&stage_desc) }
+                    .map_err(|e| device.handle_hal_error_with_nonfatal_oom(e))?
+            }
         };
-
-        // Nothing is recorded yet, so running out of memory fails only this write.
-        let raw = unsafe { device.raw().create_buffer(&stage_desc) }
-            .map_err(|e| device.handle_hal_error_with_nonfatal_oom(e))?;
         let mapping = unsafe { device.raw().map_buffer(raw.as_ref(), 0..size.get()) }
             .map_err(|e| device.handle_hal_error(e))?;
 
@@ -1271,6 +1279,7 @@ impl StagingBuffer {
             raw,
             device: device.clone(),
             size,
+            class,
             is_coherent: mapping.is_coherent,
             ptr: mapping.ptr,
         };
@@ -1341,13 +1350,18 @@ impl StagingBuffer {
         unsafe { device.unmap_buffer(self.raw.as_ref()) };
 
         let StagingBuffer {
-            raw, device, size, ..
+            raw,
+            device,
+            size,
+            class,
+            ..
         } = self;
 
         FlushedStagingBuffer {
             raw: ManuallyDrop::new(raw),
             device,
             size,
+            class,
         }
     }
 }
@@ -1360,6 +1374,7 @@ pub struct FlushedStagingBuffer {
     raw: ManuallyDrop<Box<dyn hal::DynBuffer>>,
     device: Arc<Device>,
     pub(crate) size: wgt::BufferSize,
+    class: Option<StagingClass>,
 }
 
 impl FlushedStagingBuffer {
@@ -1370,10 +1385,85 @@ impl FlushedStagingBuffer {
 
 impl Drop for FlushedStagingBuffer {
     fn drop(&mut self) {
-        resource_log!("Destroy raw StagingBuffer");
         // SAFETY: We are in the Drop impl and we don't use self.raw anymore after this point.
         let raw = unsafe { ManuallyDrop::take(&mut self.raw) };
-        unsafe { self.device.raw().destroy_buffer(raw) };
+        // The submission that read this buffer has completed, or it was never submitted.
+        let unpooled = match self.class {
+            Some(class) => self.device.staging_buffers.lock().put(class, raw),
+            None => Some(raw),
+        };
+        if let Some(raw) = unpooled {
+            resource_log!("Destroy raw StagingBuffer");
+            unsafe { self.device.raw().destroy_buffer(raw) };
+        }
+    }
+}
+
+/// A power-of-two staging capacity small enough to recycle.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct StagingClass(u32);
+
+impl StagingClass {
+    const MIN_LOG2: u32 = 8;
+    const MAX_LOG2: u32 = 20;
+    const COUNT: usize = (Self::MAX_LOG2 - Self::MIN_LOG2 + 1) as usize;
+
+    /// The class holding `size` bytes, or `None` when a write that large gets its own buffer.
+    fn of(size: wgt::BufferAddress) -> Option<Self> {
+        let log2 = size
+            .max(1 << Self::MIN_LOG2)
+            .checked_next_power_of_two()?
+            .trailing_zeros();
+        (log2 <= Self::MAX_LOG2).then_some(Self(log2))
+    }
+
+    fn capacity(self) -> wgt::BufferAddress {
+        1 << self.0
+    }
+
+    fn index(self) -> usize {
+        (self.0 - Self::MIN_LOG2) as usize
+    }
+}
+
+/// Unmapped staging buffers whose submissions have completed, by [`StagingClass`].
+///
+/// Recurring queue writes would otherwise create, name and free a buffer per call (DX12
+/// `CreatePlacedResource`, `SetName` and `Release`).
+#[derive(Debug, Default)]
+pub(crate) struct StagingBufferPool {
+    classes: [Vec<Box<dyn hal::DynBuffer>>; StagingClass::COUNT],
+    retained_bytes: wgt::BufferAddress,
+}
+
+impl StagingBufferPool {
+    /// Retained memory stays bounded however large a burst of writes was.
+    const MAX_RETAINED_BYTES: wgt::BufferAddress = 16 << 20;
+
+    fn take(&mut self, class: StagingClass) -> Option<Box<dyn hal::DynBuffer>> {
+        let raw = self.classes[class.index()].pop()?;
+        self.retained_bytes -= class.capacity();
+        Some(raw)
+    }
+
+    /// Keeps `raw` for reuse, or returns it when the pool is full.
+    fn put(
+        &mut self,
+        class: StagingClass,
+        raw: Box<dyn hal::DynBuffer>,
+    ) -> Option<Box<dyn hal::DynBuffer>> {
+        if self.retained_bytes + class.capacity() > Self::MAX_RETAINED_BYTES {
+            return Some(raw);
+        }
+        self.retained_bytes += class.capacity();
+        self.classes[class.index()].push(raw);
+        None
+    }
+
+    /// Empties the pool for destruction with its device.
+    pub(crate) fn drain(&mut self) -> impl Iterator<Item = Box<dyn hal::DynBuffer>> + '_ {
+        self.retained_bytes = 0;
+        self.classes.iter_mut().flat_map(|class| class.drain(..))
     }
 }
 

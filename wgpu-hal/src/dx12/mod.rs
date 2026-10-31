@@ -1794,7 +1794,9 @@ impl crate::Queue for Queue {
             }
         }
 
-        {
+        // An empty submission only advances the fence; the queue orders its Signal after all
+        // earlier work without an ExecuteCommandLists call.
+        if !temp_lists.is_empty() {
             profiling::scope!("ID3D12CommandQueue::ExecuteCommandLists");
             unsafe { self.raw.ExecuteCommandLists(&temp_lists) }
         }

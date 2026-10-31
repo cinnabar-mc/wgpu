@@ -156,6 +156,13 @@ pub(crate) fn fixup_discarded_surfaces<InitIter: Iterator<Item = TextureSurfaceD
 }
 
 impl BakedCommands {
+    /// Whether submitting these commands must first update resource init states, which may
+    /// record clears. Without it, [`Self::initialize_texture_memory`] records nothing.
+    pub(crate) fn needs_memory_init(&self) -> bool {
+        !self.buffer_memory_init_actions.is_empty()
+            || !self.texture_memory_actions.init_actions.is_empty()
+    }
+
     // inserts all buffer initializations that are going to be needed for
     // executing the commands and updates resource init states accordingly
     pub(crate) fn initialize_buffer_memory(
