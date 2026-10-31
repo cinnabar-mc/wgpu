@@ -1745,3 +1745,67 @@ fn compatibility_array_layout_matching_keeps_element_identity() {
         .parse(&Options::from(ShaderStage::Fragment), source)
         .is_err());
 }
+
+/// GLSL constant shifts discard high bits for scalars, vectors and folded expressions.
+#[test]
+fn regression_constant_shift_glsl() {
+    let module = Frontend::default()
+        .parse(
+            &Options::from(ShaderStage::Compute),
+            include_str!("../../../tests/in/glsl/constant-shifts.glsl"),
+        )
+        .unwrap();
+    for (name, expected) in [
+        ("unsigned_wrap", crate::Literal::U32(2)),
+        ("signed_wrap", crate::Literal::I32(4)),
+        ("negative_wrap", crate::Literal::I32(2)),
+    ] {
+        let constant = module
+            .constants
+            .iter()
+            .find(|&(_, c)| c.name.as_deref() == Some(name))
+            .unwrap()
+            .1;
+        assert_eq!(
+            module.global_expressions[constant.init],
+            crate::Expression::Literal(expected)
+        );
+    }
+    let vector = module
+        .constants
+        .iter()
+        .find(|&(_, c)| c.name.as_deref() == Some("vector_wrap"))
+        .unwrap()
+        .1;
+    let crate::Expression::Compose { ref components, .. } = module.global_expressions[vector.init]
+    else {
+        panic!("expected vector");
+    };
+    for (&component, expected) in components.iter().zip([0xfffffffe, 4]) {
+        assert_eq!(
+            module.global_expressions[component],
+            crate::Expression::Literal(crate::Literal::U32(expected))
+        );
+    }
+    crate::valid::Validator::new(
+        crate::valid::ValidationFlags::all(),
+        crate::valid::Capabilities::all(),
+    )
+    .validate(&module)
+    .unwrap();
+}
+
+/// WGSL continues to reject constant shifts that lose significant bits.
+#[cfg(feature = "wgsl-in")]
+#[test]
+fn regression_constant_shift_wgsl() {
+    for expression in [
+        "0x80000001u << 1u",
+        "0x40000001i << 2u",
+        "-2147483647i << 1u",
+        "1u << 32u",
+    ] {
+        let source = alloc::format!("const value = {expression};");
+        assert!(crate::front::wgsl::parse_str(&source).is_err(), "{source}");
+    }
+}

@@ -57,6 +57,7 @@ Bottom level categories:
 
 #### naga
 
+- Discard high bits in constant GLSL left shifts while retaining WGSL overflow errors.
 - Preserve GLSL atomic argument evaluation, member addresses, compare-and-swap semantics, image access restrictions, and image barrier scope. Keep aggregate subtrees without atomic fields usable.
 - Emit layout-free Function and Private allocations for SPIR-V 1.5 and later, retaining host buffer layouts and whole-value copies.
 - Preserve value types in GLSL conditional operands used by field selections and swizzles.

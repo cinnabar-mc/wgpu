@@ -2947,6 +2947,7 @@ impl<'a> ConstantEvaluator<'a> {
     ) -> Result<Handle<Expression>, ConstantEvaluatorError> {
         let left = self.eval_zero_value_and_splat(left, span)?;
         let right = self.eval_zero_value_and_splat(right, span)?;
+        let glsl = matches!(self.behavior, Behavior::Glsl(_));
 
         // Note: in most cases constant evaluation checks for overflow, but for
         // i32/u32, it uses wrapping arithmetic. See
@@ -3007,7 +3008,9 @@ impl<'a> ConstantEvaluator<'a> {
                         }),
                         (Literal::I16(a), Literal::U32(b)) => Literal::I16(match op {
                             BinaryOperator::ShiftLeft => {
-                                if (if a.is_negative() { !a } else { a }).leading_zeros() <= b {
+                                if !glsl
+                                    && (if a.is_negative() { !a } else { a }).leading_zeros() <= b
+                                {
                                     return Err(ConstantEvaluatorError::Overflow("<<".to_string()));
                                 }
                                 a.checked_shl(b)
@@ -3034,6 +3037,9 @@ impl<'a> ConstantEvaluator<'a> {
                             _ => return Err(ConstantEvaluatorError::InvalidBinaryOpArgs),
                         }),
                         (Literal::U16(a), Literal::U32(b)) => Literal::U16(match op {
+                            BinaryOperator::ShiftLeft if glsl => a
+                                .checked_shl(b)
+                                .ok_or(ConstantEvaluatorError::ShiftedMoreThan32Bits)?,
                             BinaryOperator::ShiftLeft => a
                                 .checked_mul(
                                     1u16.checked_shl(b)
@@ -3070,7 +3076,9 @@ impl<'a> ConstantEvaluator<'a> {
                         }),
                         (Literal::I32(a), Literal::U32(b)) => Literal::I32(match op {
                             BinaryOperator::ShiftLeft => {
-                                if (if a.is_negative() { !a } else { a }).leading_zeros() <= b {
+                                if !glsl
+                                    && (if a.is_negative() { !a } else { a }).leading_zeros() <= b
+                                {
                                     return Err(ConstantEvaluatorError::Overflow("<<".to_string()));
                                 }
                                 a.checked_shl(b)
@@ -3094,6 +3102,9 @@ impl<'a> ConstantEvaluator<'a> {
                             BinaryOperator::And => a & b,
                             BinaryOperator::ExclusiveOr => a ^ b,
                             BinaryOperator::InclusiveOr => a | b,
+                            BinaryOperator::ShiftLeft if glsl => a
+                                .checked_shl(b)
+                                .ok_or(ConstantEvaluatorError::ShiftedMoreThan32Bits)?,
                             BinaryOperator::ShiftLeft => a
                                 .checked_mul(
                                     1u32.checked_shl(b)
@@ -5138,6 +5149,58 @@ mod tests {
         };
         if !pass {
             panic!("unexpected evaluation result")
+        }
+    }
+    /// The GLSL bit-pattern rule applies to every concrete integer width.
+    #[test]
+    fn constant_shift_integer_widths() {
+        for (input, expected) in [
+            (Literal::I16(0x4001), Literal::I16(4)),
+            (Literal::U16(0x8001), Literal::U16(4)),
+            (Literal::I32(0x40000001), Literal::I32(4)),
+            (Literal::U32(0x80000001), Literal::U32(4)),
+        ] {
+            for glsl in [false, true] {
+                let mut types = UniqueArena::new();
+                let constants = Arena::new();
+                let overrides = Arena::new();
+                let mut expressions = Arena::new();
+                let left = expressions.append(Expression::Literal(input), crate::Span::UNDEFINED);
+                let right = expressions
+                    .append(Expression::Literal(Literal::U32(2)), crate::Span::UNDEFINED);
+                let mut tracker = ExpressionKindTracker::from_arena(&expressions);
+                let mut layouter = crate::proc::Layouter::default();
+                let mut evaluator = ConstantEvaluator {
+                    behavior: if glsl {
+                        Behavior::Glsl(super::GlslRestrictions::Const)
+                    } else {
+                        Behavior::Wgsl(WgslRestrictions::Const(None))
+                    },
+                    types: &mut types,
+                    constants: &constants,
+                    overrides: &overrides,
+                    expressions: &mut expressions,
+                    expression_kind_tracker: &mut tracker,
+                    layouter: &mut layouter,
+                };
+                let result = evaluator.binary_op(
+                    BinaryOperator::ShiftLeft,
+                    left,
+                    right,
+                    crate::Span::UNDEFINED,
+                );
+                if glsl {
+                    assert_eq!(
+                        evaluator.expressions[result.unwrap()],
+                        Expression::Literal(expected)
+                    );
+                } else {
+                    assert!(matches!(
+                        result,
+                        Err(super::ConstantEvaluatorError::Overflow(_))
+                    ));
+                }
+            }
         }
     }
 }
