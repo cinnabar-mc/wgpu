@@ -7,23 +7,30 @@ layout(r32ui) uniform uimage2D _group_0_binding_0_cs;
 
 layout(r32i) uniform iimage2D _group_0_binding_1_cs;
 
+layout(r32ui) uniform uimage2DArray _group_0_binding_2_cs;
+
 uint gen_gl_LocalInvocationIndex_1 = 0u;
 
 
 void main_1() {
     uint previous = 0u;
     int owner = 0;
-    uint _e5 = gen_gl_LocalInvocationIndex_1;
-    uint _e6 = imageAtomicExchange(_group_0_binding_0_cs, ivec2(0), _e5);
-    previous = _e6;
-    uint _e11 = previous;
-    int _e13 = imageAtomicCompSwap(_group_0_binding_1_cs, ivec2(0), -1, int(_e11));
-    owner = _e13;
-    uint _e18 = previous;
-    uint _e20 = imageAtomicCompSwap(_group_0_binding_0_cs, ivec2(1, 0), _e18, 7u);
-    uint _e21 = gen_gl_LocalInvocationIndex_1;
-    int _e25 = owner;
-    imageStore(_group_0_binding_1_cs, ivec2(int(_e21), 1), ivec4(_e25));
+    uint layer = 0u;
+    uint _e6 = gen_gl_LocalInvocationIndex_1;
+    uint _e7 = imageAtomicExchange(_group_0_binding_0_cs, ivec2(0), _e6);
+    previous = _e7;
+    uint _e12 = previous;
+    int _e14 = imageAtomicCompSwap(_group_0_binding_1_cs, ivec2(0), -1, int(_e12));
+    owner = _e14;
+    uint _e19 = previous;
+    uint _e21 = imageAtomicCompSwap(_group_0_binding_0_cs, ivec2(1, 0), _e19, 7u);
+    uint _e26 = previous;
+    uint _e28 = imageAtomicCompSwap(_group_0_binding_2_cs, ivec2(ivec2(0, 0), 1), 0u, _e26);
+    layer = _e28;
+    uint _e30 = gen_gl_LocalInvocationIndex_1;
+    int _e34 = owner;
+    uint _e35 = layer;
+    imageStore(_group_0_binding_1_cs, ivec2(int(_e30), 1), ivec4((_e34 + int(_e35))));
     return;
 }
 
