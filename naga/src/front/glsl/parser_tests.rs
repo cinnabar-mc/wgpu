@@ -657,6 +657,10 @@ fn image_atomics_return_the_original_value() {
             ShaderStage::Fragment,
             "layout(r32ui, binding = 0) uniform uimage2D counter;\nlayout(location = 0) out vec4 color;\nvoid main() { color = vec4(float(imageAtomicOr(counter, ivec2(gl_FragCoord.xy), 2u) & 1u)); }",
         ),
+        (
+            ShaderStage::Compute,
+            "layout(local_size_x = 4) in;\nlayout(r32i, binding = 0) uniform iimage2D lock;\nvoid main() { int old = imageAtomicExchange(lock, ivec2(0), 1); imageStore(lock, ivec2(2, 0), ivec4(imageAtomicCompSwap(lock, ivec2(1, 0), old, 2))); }",
+        ),
     ];
     for (stage, body) in cases {
         let source = alloc::format!("#version 450\n{body}");

@@ -4037,8 +4037,12 @@ impl<'a, W: Write> Writer<'a, W> {
         )?;
 
         // Separate the coordinate from the value to write and write the expression
-        // of the value to write.
+        // of the value to write, after `imageAtomicCompSwap`'s comparator.
         write!(self.out, ", ")?;
+        if let crate::AtomicFunction::Exchange { compare: Some(cmp) } = fun {
+            self.write_expr(cmp, ctx)?;
+            write!(self.out, ", ")?;
+        }
         self.write_expr(value, ctx)?;
         // End the call to `imageAtomic` and the statement.
         writeln!(self.out, ");")?;

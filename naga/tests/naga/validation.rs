@@ -244,6 +244,94 @@ fn image_atomic_result() {
     ));
 }
 
+/// 32-bit image atomics may exchange or compare-exchange texels. Like buffer
+/// exchanges, they must return a value, and the comparator must have the
+/// texel's type.
+#[test]
+fn image_atomic_exchange() {
+    use naga::{AtomicFunction, Literal, Statement, Type, TypeInner};
+
+    /// Parses `source`, turns its first image atomic into an exchange with
+    /// `compare` (`None`, the atomic's own value, or an `i32` literal), gives
+    /// it a `u32` result when `with_result` is set, then validates it.
+    fn validate(
+        source: &str,
+        compare: Option<bool>,
+        with_result: bool,
+    ) -> Result<ModuleInfo, naga::WithSpan<naga::valid::ValidationError>> {
+        let mut module = naga::front::wgsl::parse_str(source).unwrap();
+        let ty = module.types.insert(
+            Type {
+                name: None,
+                inner: TypeInner::Scalar(Scalar::U32),
+            },
+            naga::Span::default(),
+        );
+        let fun = &mut module.entry_points[0].function;
+        let result = fun.expressions.append(
+            Expression::AtomicResult {
+                ty,
+                comparison: false,
+            },
+            naga::Span::default(),
+        );
+        let signed = fun
+            .expressions
+            .append(Expression::Literal(Literal::I32(0)), naga::Span::default());
+        let statement = fun
+            .body
+            .iter_mut()
+            .find(|statement| matches!(**statement, Statement::ImageAtomic { .. }))
+            .unwrap();
+        let Statement::ImageAtomic {
+            ref mut fun,
+            value,
+            result: ref mut slot,
+            ..
+        } = *statement
+        else {
+            unreachable!();
+        };
+        *fun = AtomicFunction::Exchange {
+            compare: compare.map(|same_type| if same_type { value } else { signed }),
+        };
+        if with_result {
+            *slot = Some(result);
+        }
+        valid::Validator::new(ValidationFlags::all(), Capabilities::all()).validate(&module)
+    }
+
+    const ADD_32: &str = "
+        @group(0) @binding(0) var image: texture_storage_2d<r32uint, atomic>;
+        @compute @workgroup_size(1) fn main() { textureAtomicAdd(image, vec2(0), 1u); }
+    ";
+    const MAX_64: &str = "
+        @group(0) @binding(0) var image: texture_storage_2d<r64uint, atomic>;
+        @compute @workgroup_size(1) fn main() { textureAtomicMax(image, vec2(0), 1lu); }
+    ";
+
+    let function_error = |source, compare, with_result| {
+        let error = validate(source, compare, with_result)
+            .unwrap_err()
+            .into_inner();
+        let valid::ValidationError::EntryPoint {
+            source: valid::EntryPointError::Function(error),
+            ..
+        } = error
+        else {
+            panic!("unexpected error: {error:?}");
+        };
+        format!("{error:?}")
+    };
+
+    validate(ADD_32, None, true).expect("exchange should validate");
+    validate(ADD_32, Some(true), true).expect("compare-exchange should validate");
+    assert!(function_error(ADD_32, None, false).contains("MissingReturnValue"));
+    assert!(function_error(ADD_32, Some(true), false).contains("MissingReturnValue"));
+    assert!(function_error(ADD_32, Some(false), true).starts_with("InvalidImageAtomicValue"));
+    assert!(function_error(MAX_64, None, false).starts_with("InvalidImageAtomicFunction"));
+}
+
 #[test]
 fn populate_call_result() {
     use naga::{Module, Type, TypeInner};

@@ -1,0 +1,83 @@
+; SPIR-V
+; Version: 1.0
+; Generator: rspirv
+; Bound: 61
+OpCapability Shader
+%1 = OpExtInstImport "GLSL.std.450"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %56 "main" %53
+OpExecutionMode %56 LocalSize 16 1 1
+OpDecorate %8 DescriptorSet 0
+OpDecorate %8 Binding 0
+OpDecorate %10 DescriptorSet 0
+OpDecorate %10 Binding 1
+OpDecorate %53 BuiltIn LocalInvocationIndex
+%2 = OpTypeVoid
+%3 = OpTypeInt 32 0
+%5 = OpTypeInt 32 1
+%4 = OpTypeVector %5 2
+%6 = OpTypeImage %3 2D 0 0 0 2 R32ui
+%7 = OpTypeImage %5 2D 0 0 0 2 R32i
+%9 = OpTypePointer UniformConstant %6
+%8 = OpVariable  %9  UniformConstant
+%11 = OpTypePointer UniformConstant %7
+%10 = OpVariable  %11  UniformConstant
+%13 = OpTypePointer Private %3
+%14 = OpConstantNull  %3
+%12 = OpVariable  %13  Private %14
+%17 = OpTypeFunction %2
+%20 = OpConstant  %5  0
+%21 = OpConstantComposite  %4  %20 %20
+%22 = OpConstant  %5  -1
+%23 = OpConstant  %5  1
+%24 = OpConstantComposite  %4  %23 %20
+%25 = OpConstant  %3  7
+%27 = OpTypePointer Function %3
+%28 = OpConstantNull  %3
+%30 = OpTypePointer Function %5
+%31 = OpConstantNull  %5
+%34 = OpTypePointer Image %3
+%36 = OpConstant  %3  0
+%40 = OpTypePointer Image %5
+%50 = OpTypeVector %5 4
+%54 = OpTypePointer Input %3
+%53 = OpVariable  %54  Input
+%16 = OpFunction  %2  None %17
+%15 = OpLabel
+%26 = OpVariable  %27  Function %28
+%29 = OpVariable  %30  Function %31
+%18 = OpLoad  %6  %8
+%19 = OpLoad  %7  %10
+OpBranch %32
+%32 = OpLabel
+%33 = OpLoad  %3  %12
+%35 = OpImageTexelPointer  %34  %8 %21 %36
+%37 = OpAtomicExchange  %3  %35 %23 %36 %33
+OpStore %26 %37
+%38 = OpLoad  %3  %26
+%39 = OpBitcast  %5  %38
+%41 = OpImageTexelPointer  %40  %10 %21 %36
+%42 = OpAtomicCompareExchange  %5  %41 %23 %36 %36 %39 %22
+OpStore %29 %42
+%43 = OpLoad  %3  %26
+%44 = OpImageTexelPointer  %34  %8 %24 %36
+%45 = OpAtomicCompareExchange  %3  %44 %23 %36 %36 %25 %43
+%46 = OpLoad  %3  %12
+%47 = OpBitcast  %5  %46
+%48 = OpCompositeConstruct  %4  %47 %23
+%49 = OpLoad  %5  %29
+%51 = OpCompositeConstruct  %50  %49 %49 %49 %49
+OpImageWrite %19 %48 %51
+OpReturn
+OpFunctionEnd
+%56 = OpFunction  %2  None %17
+%52 = OpLabel
+%55 = OpLoad  %3  %53
+%57 = OpLoad  %6  %8
+%58 = OpLoad  %7  %10
+OpBranch %59
+%59 = OpLabel
+OpStore %12 %55
+%60 = OpFunctionCall  %2  %16
+OpReturn
+OpFunctionEnd

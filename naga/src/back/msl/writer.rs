@@ -1564,7 +1564,9 @@ impl<W: Write> Writer<W> {
         context: &StatementContext,
     ) -> BackendResult {
         write!(self.out, "{level}")?;
-        let wide = context.expression.resolve_type(value).scalar_width() == Some(8);
+        let value_scalar = context.expression.resolve_type(value).scalar();
+        let wide = value_scalar.is_some_and(|scalar| scalar.width == 8);
+        let mut result_name = None;
         if let Some(result) = result {
             // Metal's 64-bit texture `atomic_min`/`atomic_max` return nothing.
             if wide {
@@ -1574,22 +1576,51 @@ impl<W: Write> Writer<W> {
             }
             let name = Baked(result).to_string();
             self.start_baking_expression(result, &context.expression, &name)?;
-            self.named_expressions.insert(result, name);
+            self.named_expressions.insert(result, name.clone());
+            result_name = Some(name);
         }
-        self.put_expression(image, &context.expression, false)?;
-        let op = if wide {
-            fun.to_msl_64_bit()?
+        if let crate::AtomicFunction::Exchange { compare: Some(cmp) } = fun {
+            let (Some(name), Some(scalar)) = (result_name, value_scalar) else {
+                return Err(Error::GenericValidation(
+                    "image compare-exchange without a scalar result".to_string(),
+                ));
+            };
+            // Metal's texture compare-exchange is weak: it can fail spuriously,
+            // and on failure it stores the texel in `expected`. Retry until it
+            // succeeds or the texel differs from `cmp`.
+            self.put_expression(cmp, &context.expression, true)?;
+            writeln!(self.out, ";")?;
+            let expected = format!("{name}_expected");
+            let mut texel_ty = String::new();
+            put_numeric_type(&mut texel_ty, scalar, &[crate::VectorSize::Quad])?;
+            writeln!(
+                self.out,
+                "{level}{texel_ty} {expected} = {texel_ty}({name});"
+            )?;
+            write!(self.out, "{level}while (!")?;
+            self.put_expression(image, &context.expression, false)?;
+            write!(self.out, ".atomic_compare_exchange_weak(")?;
+            self.put_cast_to_uint_scalar_or_vector(address.coordinate, &context.expression)?;
+            write!(self.out, ", &{expected}, ")?;
+            self.put_expression(value, &context.expression, true)?;
+            writeln!(self.out, ") && {expected}.x == {name}) {{}}")?;
+            writeln!(self.out, "{level}{name} = {expected}.x;")?;
         } else {
-            fun.to_msl()
-        };
-        write!(self.out, ".atomic_{op}(")?;
-        // coordinates in IR are int, but Metal expects uint
-        self.put_cast_to_uint_scalar_or_vector(address.coordinate, &context.expression)?;
-        write!(self.out, ", ")?;
-        self.put_expression(value, &context.expression, true)?;
-        // Texture atomics return the original texel as a 4-component vector.
-        let component = if result.is_some() { ".x" } else { "" };
-        writeln!(self.out, "){component};")?;
+            self.put_expression(image, &context.expression, false)?;
+            let op = if wide {
+                fun.to_msl_64_bit()?
+            } else {
+                fun.to_msl()
+            };
+            write!(self.out, ".atomic_{op}(")?;
+            // coordinates in IR are int, but Metal expects uint
+            self.put_cast_to_uint_scalar_or_vector(address.coordinate, &context.expression)?;
+            write!(self.out, ", ")?;
+            self.put_expression(value, &context.expression, true)?;
+            // Texture atomics return the original texel as a 4-component vector.
+            let component = if result.is_some() { ".x" } else { "" };
+            writeln!(self.out, "){component};")?;
+        }
 
         // Workaround for Apple Metal TBDR driver bug: fragment shader atomic
         // texture writes randomly drop unless followed by a standard texture

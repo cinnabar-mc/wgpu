@@ -1,0 +1,11 @@
+#version 450
+// Image exchanges and compare-exchanges, which return the texel's original value.
+layout(local_size_x = 16) in;
+layout(r32ui, binding = 0) uniform uimage2D lock;
+layout(r32i, binding = 1) uniform iimage2D owners;
+void main() {
+    uint previous = imageAtomicExchange(lock, ivec2(0), gl_LocalInvocationIndex);
+    int owner = imageAtomicCompSwap(owners, ivec2(0), -1, int(previous));
+    imageAtomicCompSwap(lock, ivec2(1, 0), previous, 7u);
+    imageStore(owners, ivec2(int(gl_LocalInvocationIndex), 1), ivec4(owner));
+}

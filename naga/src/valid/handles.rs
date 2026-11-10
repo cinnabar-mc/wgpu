@@ -777,13 +777,16 @@ impl super::Validator {
                 image,
                 coordinate,
                 array_index,
-                fun: _,
+                fun,
                 value,
                 result,
             } => {
                 validate_expr(image)?;
                 validate_expr(coordinate)?;
                 validate_expr_opt(array_index)?;
+                if let crate::AtomicFunction::Exchange { compare } = fun {
+                    validate_expr_opt(compare)?;
+                }
                 validate_expr(value)?;
                 validate_expr_opt(result)?;
                 Ok(())

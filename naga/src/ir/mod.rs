@@ -2285,6 +2285,13 @@ pub enum Statement {
         array_index: Option<Handle<Expression>>,
 
         /// The kind of atomic operation to perform on the texel.
+        ///
+        /// Unlike [`Atomic`]'s, an [`Exchange`] with a `compare` value is a
+        /// strong compare-exchange: it fails only when the texel differs from
+        /// `compare`, which must have the texel's scalar type.
+        ///
+        /// [`Atomic`]: Statement::Atomic
+        /// [`Exchange`]: AtomicFunction::Exchange
         fun: AtomicFunction,
 
         /// The value with which to perform the atomic operation.
@@ -2295,9 +2302,10 @@ pub enum Statement {
         ///
         /// Its type must be the image format's texel scalar type, and its
         /// `comparison` flag must be `false`. This must be `None` for
-        /// 64-bit texels.
+        /// 64-bit texels, and `Some` when `fun` is an [`Exchange`].
         ///
         /// [`AtomicResult`]: crate::Expression::AtomicResult
+        /// [`Exchange`]: AtomicFunction::Exchange
         result: Option<Handle<Expression>>,
     },
     /// Load uniformly from a uniform pointer in the workgroup address space.
