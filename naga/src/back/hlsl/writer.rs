@@ -2866,7 +2866,8 @@ impl<'a, W: fmt::Write> super::Writer<'a, W> {
             } => {
                 write!(self.out, "{level}")?;
                 // `Interlocked*` returns the texel's original value through an
-                // optional `out` argument.
+                // `out` argument, which only `Exchange` and `CompareExchange`
+                // require.
                 let result_name = if let Some(result) = result {
                     let name = Baked(result).to_string();
                     match func_ctx.info[result].ty {
@@ -2896,6 +2897,10 @@ impl<'a, W: fmt::Write> super::Writer<'a, W> {
                 )?;
                 write!(self.out, "],")?;
 
+                if let crate::AtomicFunction::Exchange { compare: Some(cmp) } = fun {
+                    self.write_expr(module, cmp, func_ctx)?;
+                    write!(self.out, ", ")?;
+                }
                 self.write_expr(module, value, func_ctx)?;
                 if let Some(name) = result_name {
                     write!(self.out, ", {name}")?;

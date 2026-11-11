@@ -508,8 +508,10 @@ pub fn inject_builtin(
         | "imageAtomicAnd"
         | "imageAtomicOr"
         | "imageAtomicXor"
-        | "imageAtomicExchange" => {
+        | "imageAtomicExchange"
+        | "imageAtomicCompSwap" => {
             let fun = atomic_function(&name["imageAtomic".len()..]);
+            let compare = name == "imageAtomicCompSwap";
             let f = |kind: Sk, dim, arrayed, _, _| {
                 // Atomics need 32-bit integer texels, and naga has no cube storage images
                 if dim == Dim::Cube || kind == Sk::Float {
@@ -525,11 +527,12 @@ pub fn inject_builtin(
                     },
                 };
                 let coord_size = image_dims_to_coords_size(dim) + arrayed as usize;
-                let args = vec![
-                    image,
-                    make_coords_arg(coord_size, Sk::Sint),
-                    TypeInner::Scalar(Scalar { kind, width: 4 }),
-                ];
+                let texel = TypeInner::Scalar(Scalar { kind, width: 4 });
+                let mut args = vec![image, make_coords_arg(coord_size, Sk::Sint), texel.clone()];
+                if compare {
+                    // `imageAtomicCompSwap(image, P, compare, data)`
+                    args.push(texel);
+                }
 
                 // Like GLSL's, these return the texel's original value.
                 declaration
@@ -544,7 +547,8 @@ pub fn inject_builtin(
 }
 
 /// The operation of an `atomic*` or `imageAtomic*` built-in, given its name
-/// without that prefix (`Add`, `Or`, …).
+/// without that prefix (`Add`, `Or`, …). `CompSwap` maps to an exchange whose
+/// comparator the call fills in.
 fn atomic_function(operation: &str) -> AtomicFunction {
     match operation {
         "Add" => AtomicFunction::Add,
@@ -1748,7 +1752,9 @@ pub enum MacroCall {
     Atomic(AtomicFunction),
     /// `atomicCompSwap(inout mem, compare, data)`.
     AtomicCompSwap,
-    /// `imageAtomic*(image, coord, data)`, which returns the texel's original value.
+    /// `imageAtomic*(image, coord, data)` or
+    /// `imageAtomicCompSwap(image, coord, compare, data)`, which return the
+    /// texel's original value.
     ImageAtomic(AtomicFunction),
     /// SmoothStep needs a separate variant because it might need it's inputs
     /// to be splatted depending on the overload
@@ -2536,7 +2542,18 @@ impl MacroCall {
             MacroCall::ImageAtomic(fun) => {
                 frontend.allow_image_atomics(ctx, args[0], meta)?;
                 let comps = frontend.coordinate_components(ctx, args[0], args[1], None, meta)?;
-                let ty = ctx.resolve_type_handle(args[2], meta)?;
+                let (fun, value) = match args[2..] {
+                    [value] => (fun, value),
+                    // Naga's image compare-exchange is strong, like GLSL's.
+                    [compare, value] => (
+                        AtomicFunction::Exchange {
+                            compare: Some(compare),
+                        },
+                        value,
+                    ),
+                    _ => unreachable!("imageAtomic overloads take one or two values"),
+                };
+                let ty = ctx.resolve_type_handle(value, meta)?;
                 ctx.emit_end();
                 let result = ctx.add_expression(
                     Expression::AtomicResult {
@@ -2551,7 +2568,7 @@ impl MacroCall {
                         coordinate: comps.coordinate,
                         array_index: comps.array_index,
                         fun,
-                        value: args[2],
+                        value,
                         result: Some(result),
                     },
                     meta,

@@ -86,7 +86,7 @@ impl FunctionTracer<'_> {
                         image,
                         coordinate,
                         array_index,
-                        fun: _,
+                        ref fun,
                         value,
                         result,
                     } => {
@@ -95,6 +95,7 @@ impl FunctionTracer<'_> {
                         if let Some(array_index) = array_index {
                             self.expressions_used.insert(array_index);
                         }
+                        self.trace_atomic_function(fun);
                         self.expressions_used.insert(value);
                         if let Some(result) = result {
                             self.expressions_used.insert(result);
@@ -318,7 +319,7 @@ impl FunctionMap {
                         ref mut image,
                         ref mut coordinate,
                         ref mut array_index,
-                        fun: _,
+                        ref mut fun,
                         ref mut value,
                         ref mut result,
                     } => {
@@ -327,6 +328,7 @@ impl FunctionMap {
                         if let Some(ref mut array_index) = *array_index {
                             adjust(array_index);
                         }
+                        self.adjust_atomic_function(fun);
                         adjust(value);
                         if let Some(ref mut result) = *result {
                             adjust(result);

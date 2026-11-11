@@ -1471,8 +1471,9 @@ impl super::Validator {
                                                 | crate::AtomicFunction::ExclusiveOr
                                                 | crate::AtomicFunction::InclusiveOr
                                                 | crate::AtomicFunction::Min
-                                                | crate::AtomicFunction::Max => {}
-                                                _ => {
+                                                | crate::AtomicFunction::Max
+                                                | crate::AtomicFunction::Exchange { .. } => {}
+                                                crate::AtomicFunction::Subtract => {
                                                     return Err(
                                                         FunctionError::InvalidImageAtomicFunction(
                                                             fun,
@@ -1515,6 +1516,22 @@ impl super::Validator {
                     if *context.resolve_type_inner(value, &self.valid_expression_set)? != value_ty {
                         return Err(FunctionError::InvalidImageAtomicValue(value)
                             .with_span_handle(value, context.expressions));
+                    }
+                    if let crate::AtomicFunction::Exchange { compare } = fun {
+                        if let Some(compare) = compare {
+                            if *context.resolve_type_inner(compare, &self.valid_expression_set)?
+                                != value_ty
+                            {
+                                return Err(FunctionError::InvalidImageAtomicValue(compare)
+                                    .with_span_handle(compare, context.expressions));
+                            }
+                        }
+                        // As with buffer atomics, exchanges must produce a value.
+                        if result.is_none() {
+                            return Err(AtomicError::MissingReturnValue
+                                .with_span_static(span, "image atomic exchange")
+                                .into_other());
+                        }
                     }
                     if let Some(result) = result {
                         self.validate_image_atomic_result(result, &value_ty, context)?;

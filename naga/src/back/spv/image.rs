@@ -1358,8 +1358,9 @@ impl BlockContext<'_> {
             crate::AtomicFunction::Min => spirv::Op::AtomicUMin,
             crate::AtomicFunction::Max if signed => spirv::Op::AtomicSMax,
             crate::AtomicFunction::Max => spirv::Op::AtomicUMax,
-            crate::AtomicFunction::Exchange { .. } => {
-                return Err(Error::Validation("Exchange atomics are not supported yet"))
+            crate::AtomicFunction::Exchange { compare: None } => spirv::Op::AtomicExchange,
+            crate::AtomicFunction::Exchange { compare: Some(_) } => {
+                spirv::Op::AtomicCompareExchange
             }
         };
         let result_type_id = self.get_expression_type_id(&self.fun_info[value].ty);
@@ -1370,15 +1371,31 @@ impl BlockContext<'_> {
         let semantics_id = self.get_index_constant(semantics.bits());
         let value_id = self.cached[value];
 
-        block.body.push(Instruction::image_atomic(
-            op,
-            result_type_id,
-            id,
-            pointer_id,
-            scope_constant_id,
-            semantics_id,
-            value_id,
-        ));
+        let instruction = if let crate::AtomicFunction::Exchange { compare: Some(cmp) } = fun {
+            // `OpAtomicCompareExchange` is a strong compare-exchange. It takes
+            // the semantics for a failed comparison, then the comparator.
+            let mut instruction = Instruction::new(op);
+            instruction.set_type(result_type_id);
+            instruction.set_result(id);
+            instruction.add_operand(pointer_id);
+            instruction.add_operand(scope_constant_id);
+            instruction.add_operand(semantics_id);
+            instruction.add_operand(semantics_id);
+            instruction.add_operand(value_id);
+            instruction.add_operand(self.cached[cmp]);
+            instruction
+        } else {
+            Instruction::image_atomic(
+                op,
+                result_type_id,
+                id,
+                pointer_id,
+                scope_constant_id,
+                semantics_id,
+                value_id,
+            )
+        };
+        block.body.push(instruction);
         // The atomic instruction's result is the texel's original value.
         if let Some(result) = result {
             self.cached[result] = id;

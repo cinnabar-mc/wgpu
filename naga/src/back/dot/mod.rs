@@ -262,7 +262,7 @@ impl StatementGraph {
                     image,
                     coordinate,
                     array_index,
-                    fun: _,
+                    ref fun,
                     value,
                     result,
                 } => {
@@ -275,6 +275,9 @@ impl StatementGraph {
                         self.dependencies.push((id, expr, "array_index"));
                     }
                     self.dependencies.push((id, value, "value"));
+                    if let crate::AtomicFunction::Exchange { compare: Some(cmp) } = *fun {
+                        self.dependencies.push((id, cmp, "cmp"));
+                    }
                     "ImageAtomic"
                 }
                 S::WorkGroupUniformLoad { pointer, result } => {

@@ -813,7 +813,7 @@ fn adjust_stmt(new_pos: &HandleVec<Expression, Handle<Expression>>, stmt: &mut S
             ref mut image,
             ref mut coordinate,
             ref mut array_index,
-            fun: _,
+            ref mut fun,
             ref mut value,
             ref mut result,
         } => {
@@ -821,6 +821,12 @@ fn adjust_stmt(new_pos: &HandleVec<Expression, Handle<Expression>>, stmt: &mut S
             adjust(coordinate);
             if let Some(ref mut array_index) = *array_index {
                 adjust(array_index);
+            }
+            if let crate::AtomicFunction::Exchange {
+                compare: Some(ref mut compare),
+            } = *fun
+            {
+                adjust(compare);
             }
             adjust(value);
             if let Some(ref mut result) = *result {

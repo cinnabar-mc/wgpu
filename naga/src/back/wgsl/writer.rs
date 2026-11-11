@@ -887,7 +887,13 @@ impl<W: Write> Writer<W> {
                 result,
             } => {
                 // WGSL's `textureAtomic*` functions return nothing, so only an
-                // unused result can be written.
+                // unused result can be written, and there is no exchange.
+                if let crate::AtomicFunction::Exchange { .. } = *fun {
+                    return Err(Error::Unsupported {
+                        kind: "image atomic function",
+                        value: format!("{fun:?}"),
+                    });
+                }
                 if let Some(result) = result {
                     if func_ctx.info[result].ref_count > 0 {
                         return Err(Error::Unsupported {
