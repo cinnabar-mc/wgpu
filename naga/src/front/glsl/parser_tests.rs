@@ -688,6 +688,34 @@ fn image_atomics_return_the_original_value() {
     }
 }
 
+/// Image atomics in culled dead code don't leave results that no statement visits.
+#[test]
+fn image_atomics_in_unreachable_code() {
+    let source = "#version 450
+layout(r32ui, binding = 0) uniform uimage2D counter;
+layout(location = 0) out vec4 color;
+void main() {
+    if (gl_FragCoord.x > 1.0) {
+        discard;
+        uint old = imageAtomicCompSwap(counter, ivec2(1, 0), 0u, 1u);
+        color = vec4(float(old));
+    }
+    color = vec4(1.0);
+    return;
+    imageAtomicAdd(counter, ivec2(0), 1u);
+    imageAtomicExchange(counter, ivec2(2, 0), 3u);
+}";
+    let module = Frontend::default()
+        .parse(&Options::from(ShaderStage::Fragment), source)
+        .unwrap();
+    crate::valid::Validator::new(
+        crate::valid::ValidationFlags::all(),
+        crate::valid::Capabilities::all(),
+    )
+    .validate(&module)
+    .unwrap();
+}
+
 /// Check that gather layers round up at half integers before integer conversion.
 #[test]
 fn texture_gather_array_layer_rounding() {

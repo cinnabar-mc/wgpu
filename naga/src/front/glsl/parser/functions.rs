@@ -752,6 +752,10 @@ fn cull_unreachable(ctx: &mut Context, from: usize) {
                 | Statement::Atomic {
                     result: Some(result),
                     ..
+                }
+                | Statement::ImageAtomic {
+                    result: Some(result),
+                    ..
                 } => results.push(result),
                 Statement::Block(ref block) => orphan_results(block, results),
                 Statement::If {
