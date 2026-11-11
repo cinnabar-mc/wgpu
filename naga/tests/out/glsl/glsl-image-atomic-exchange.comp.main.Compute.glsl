@@ -25,7 +25,7 @@ void main_1() {
     uint _e19 = previous;
     uint _e21 = imageAtomicCompSwap(_group_0_binding_0_cs, ivec2(1, 0), _e19, 7u);
     uint _e26 = previous;
-    uint _e28 = imageAtomicCompSwap(_group_0_binding_2_cs, ivec2(ivec2(0, 0), 1), 0u, _e26);
+    uint _e28 = imageAtomicCompSwap(_group_0_binding_2_cs, ivec3(ivec2(0, 0), 1), 0u, _e26);
     layer = _e28;
     uint _e30 = gen_gl_LocalInvocationIndex_1;
     int _e34 = owner;
