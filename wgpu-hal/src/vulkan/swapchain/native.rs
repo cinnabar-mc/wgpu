@@ -249,13 +249,13 @@ impl Surface for NativeSurface {
                     }
                     // We don't use VK_EXT_image_compression_control
                     // VK_ERROR_COMPRESSION_EXHAUSTED_EXT
-                    other => map_host_device_oom_and_lost_err(other).into(),
+                    other => map_host_device_oom_and_lost_err(other, "vkCreateSwapchainKHR").into(),
                 });
             }
         };
 
         let images = unsafe { functor.get_swapchain_images(raw) }
-            .map_err(crate::vulkan::map_host_device_oom_err)?;
+            .map_err(|e| crate::vulkan::map_host_device_oom_err(e, "vkGetSwapchainImagesKHR"))?;
 
         // This fence is only used to throttle acquisition on Windows. It is very important to
         // avoid bad frame pacing when the Vulkan driver is using a DXGI swapchain. See
@@ -271,7 +271,7 @@ impl Surface for NativeSurface {
                     .shared
                     .raw
                     .create_fence(&vk::FenceCreateInfo::default(), None)
-                    .map_err(crate::vulkan::map_host_device_oom_err)?
+                    .map_err(|e| crate::vulkan::map_host_device_oom_err(e, "vkCreateFence"))?
             };
             Some(raw)
         } else {
@@ -391,7 +391,7 @@ impl Swapchain for NativeSwapchain {
                     .shared
                     .raw
                     .device_wait_idle()
-                    .map_err(map_host_device_oom_and_lost_err)
+                    .map_err(|e| map_host_device_oom_and_lost_err(e, "vkDeviceWaitIdle"))
             };
         };
 
@@ -497,7 +497,9 @@ impl Swapchain for NativeSwapchain {
                     vk::Result::ERROR_SURFACE_LOST_KHR => Err(crate::SurfaceError::Lost),
                     // We don't use VK_EXT_full_screen_exclusive
                     // VK_ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT
-                    other => Err(map_host_device_oom_and_lost_err(other).into()),
+                    other => {
+                        Err(map_host_device_oom_and_lost_err(other, "vkAcquireNextImageKHR").into())
+                    }
                 };
             }
         };
@@ -508,12 +510,12 @@ impl Swapchain for NativeSwapchain {
                 self.device
                     .raw
                     .wait_for_fences(&[fence], true, timeout_ns)
-                    .map_err(map_host_device_oom_and_lost_err)?;
+                    .map_err(|e| map_host_device_oom_and_lost_err(e, "vkWaitForFences"))?;
 
                 self.device
                     .raw
                     .reset_fences(&[fence])
-                    .map_err(map_host_device_oom_and_lost_err)?;
+                    .map_err(|e| map_host_device_oom_and_lost_err(e, "vkResetFences"))?;
             }
         }
 
@@ -622,7 +624,7 @@ impl Swapchain for NativeSwapchain {
                     vk::Result::ERROR_SURFACE_LOST_KHR => crate::SurfaceError::Lost,
                     // We don't use VK_EXT_full_screen_exclusive
                     // VK_ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT
-                    _ => map_host_device_oom_and_lost_err(error).into(),
+                    _ => map_host_device_oom_and_lost_err(error, "vkQueuePresentKHR").into(),
                 }
             })?
         };
