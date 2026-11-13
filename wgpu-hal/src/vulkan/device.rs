@@ -274,6 +274,44 @@ struct CompiledStage {
     temp_raw_module: Option<vk::ShaderModule>,
 }
 
+/// Returns the shader stages that `desc` links into its render pipeline.
+fn render_pipeline_stages(
+    desc: &crate::RenderPipelineDescriptor<
+        super::PipelineLayout,
+        super::ShaderModule,
+        super::PipelineCache,
+    >,
+) -> wgt::ShaderStages {
+    let mut stages = match desc.vertex_processor {
+        crate::VertexProcessor::Standard { .. } => wgt::ShaderStages::VERTEX,
+        crate::VertexProcessor::Mesh { ref task_stage, .. } => {
+            let mut stages = wgt::ShaderStages::MESH;
+            stages.set(wgt::ShaderStages::TASK, task_stage.is_some());
+            stages
+        }
+    };
+    stages.set(wgt::ShaderStages::FRAGMENT, desc.fragment_stage.is_some());
+    stages
+}
+
+/// Returns the shader stages that `desc` links into its ray tracing pipeline.
+fn ray_tracing_pipeline_stages(
+    desc: &crate::RayTracingPipelineDescriptor<
+        super::PipelineLayout,
+        super::ShaderModule,
+        super::PipelineCache,
+    >,
+) -> wgt::ShaderStages {
+    let mut stages = wgt::ShaderStages::RAY_GENERATION | wgt::ShaderStages::MISS;
+    for group in desc.intersection {
+        stages |= wgt::ShaderStages::CLOSEST_HIT;
+        if group.any_hit.is_some() {
+            stages |= wgt::ShaderStages::ANY_HIT;
+        }
+    }
+    stages
+}
+
 struct MemoryProperties {
     base: vk::PhysicalDeviceMemoryProperties,
     heap_budget: ArrayVec<vk::DeviceSize, { vk::MAX_MEMORY_HEAPS }>,
@@ -690,7 +728,7 @@ impl super::Device {
         &self,
         spv: &[u32],
         label: &crate::Label<'_>,
-    ) -> Result<vk::ShaderModule, crate::DeviceError> {
+    ) -> Result<vk::ShaderModule, super::PipelineCreationError> {
         let vk_info = vk::ShaderModuleCreateInfo::default()
             .flags(vk::ShaderModuleCreateFlags::empty())
             .code(spv);
@@ -701,13 +739,8 @@ impl super::Device {
             self.shared
                 .raw
                 .create_shader_module(&vk_info, None)
-                .map_err(map_err)?
+                .map_err(|err| super::map_pipeline_err(err, "vkCreateShaderModule"))?
         };
-        fn map_err(err: vk::Result) -> crate::DeviceError {
-            // We don't use VK_NV_glsl_shader
-            // VK_ERROR_INVALID_SHADER_NV
-            super::map_host_device_oom_err(err)
-        }
 
         if let Some(label) = label {
             unsafe { self.shared.set_object_name(raw, label) };
@@ -721,6 +754,7 @@ impl super::Device {
         stage: &crate::ProgrammableStage<super::ShaderModule>,
         naga_stage: naga::ShaderStage,
         binding_map: &naga::back::spv::BindingMap,
+        pipeline_label: crate::Label<'_>,
     ) -> Result<CompiledStage, crate::PipelineError> {
         let stage_flags = crate::auxil::map_naga_stage(naga_stage);
         let vk_module = match *stage.module {
@@ -802,7 +836,8 @@ impl super::Device {
                     naga::back::spv::write_vec(&module, &info, options, Some(&pipeline_options))
                 }
                 .map_err(|e| crate::PipelineError::Linkage(stage_flags, format!("{e}")))?;
-                self.create_shader_module_impl(&spv, &None)?
+                self.create_shader_module_impl(&spv, &None)
+                    .map_err(|err| err.into_pipeline_error(stage_flags, pipeline_label))?
             }
         };
 
@@ -1916,11 +1951,15 @@ impl crate::Device for super::Device {
                     None,
                 )
                 .map_err(|e| crate::ShaderError::Compilation(format!("{e}")))?;
-                super::ShaderModule::Raw(self.create_shader_module_impl(&spv, &desc.label)?)
+                super::ShaderModule::Raw(
+                    self.create_shader_module_impl(&spv, &desc.label)
+                        .map_err(|err| err.into_shader_error(desc.label))?,
+                )
             }
-            crate::ShaderInput::SpirV(data) => {
-                super::ShaderModule::Raw(self.create_shader_module_impl(data, &desc.label)?)
-            }
+            crate::ShaderInput::SpirV(data) => super::ShaderModule::Raw(
+                self.create_shader_module_impl(data, &desc.label)
+                    .map_err(|err| err.into_shader_error(desc.label))?,
+            ),
             crate::ShaderInput::MetalLib { .. }
             | crate::ShaderInput::Msl { .. }
             | crate::ShaderInput::Dxil { .. }
@@ -2017,6 +2056,7 @@ impl crate::Device for super::Device {
                     vertex_stage,
                     naga::ShaderStage::Vertex,
                     &desc.layout.binding_map,
+                    desc.label,
                 )?);
                 stages.push(compiled_vs.as_ref().unwrap().create_info);
             }
@@ -2029,6 +2069,7 @@ impl crate::Device for super::Device {
                         t,
                         naga::ShaderStage::Task,
                         &desc.layout.binding_map,
+                        desc.label,
                     )?);
                     stages.push(compiled_ts.as_ref().unwrap().create_info);
                 }
@@ -2036,6 +2077,7 @@ impl crate::Device for super::Device {
                     mesh_stage,
                     naga::ShaderStage::Mesh,
                     &desc.layout.binding_map,
+                    desc.label,
                 )?);
                 stages.push(compiled_ms.as_ref().unwrap().create_info);
             }
@@ -2046,6 +2088,7 @@ impl crate::Device for super::Device {
                     stage,
                     naga::ShaderStage::Fragment,
                     &desc.layout.binding_map,
+                    desc.label,
                 )?;
                 stages.push(compiled.create_info);
                 Some(compiled)
@@ -2202,7 +2245,10 @@ impl crate::Device for super::Device {
                         .flatten(),
                 )
             };
-            created.map_err(|(_, e)| super::map_pipeline_err(e))?
+            created.map_err(|(_, e)| {
+                super::map_pipeline_err(e, "vkCreateGraphicsPipelines")
+                    .into_pipeline_error(render_pipeline_stages(desc), desc.label)
+            })?
         };
 
         let raw = raw_vec.pop().unwrap();
@@ -2236,6 +2282,7 @@ impl crate::Device for super::Device {
             &desc.stage,
             naga::ShaderStage::Compute,
             &desc.layout.binding_map,
+            desc.label,
         )?;
 
         let vk_infos = [{
@@ -2258,7 +2305,10 @@ impl crate::Device for super::Device {
                     .create_compute_pipelines(pipeline_cache, &vk_infos, None)
             };
             unsafe { self.shared.destroy_temp_modules([compiled]) };
-            created.map_err(|(_, e)| super::map_pipeline_err(e))?
+            created.map_err(|(_, e)| {
+                super::map_pipeline_err(e, "vkCreateComputePipelines")
+                    .into_pipeline_error(wgt::ShaderStages::COMPUTE, desc.label)
+            })?
         };
 
         let raw = raw_vec.pop().unwrap();
@@ -2292,6 +2342,7 @@ impl crate::Device for super::Device {
             &desc.ray_generation,
             naga::ShaderStage::RayGeneration,
             &desc.layout.binding_map,
+            desc.label,
         )?;
 
         groups.push(
@@ -2309,6 +2360,7 @@ impl crate::Device for super::Device {
             &desc.miss,
             naga::ShaderStage::Miss,
             &desc.layout.binding_map,
+            desc.label,
         )?;
 
         groups.push(
@@ -2331,6 +2383,7 @@ impl crate::Device for super::Device {
                 &group.closest_hit,
                 naga::ShaderStage::ClosestHit,
                 &desc.layout.binding_map,
+                desc.label,
             )?;
 
             let closest_idx = stages.len();
@@ -2352,6 +2405,7 @@ impl crate::Device for super::Device {
                     any_hit,
                     naga::ShaderStage::AnyHit,
                     &desc.layout.binding_map,
+                    desc.label,
                 )?;
 
                 let any_idx = stages.len();
@@ -2402,7 +2456,10 @@ impl crate::Device for super::Device {
                         .chain(compiled_stages),
                 )
             };
-            created.map_err(|(_, e)| super::map_pipeline_err(e))?
+            created.map_err(|(_, e)| {
+                super::map_pipeline_err(e, "vkCreateRayTracingPipelinesKHR")
+                    .into_pipeline_error(ray_tracing_pipeline_stages(desc), desc.label)
+            })?
         };
 
         self.counters.ray_tracing_pipelines.add(1);

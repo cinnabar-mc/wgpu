@@ -1,7 +1,11 @@
 #![allow(unused_variables)]
 
 use alloc::{string::String, sync::Arc, vec, vec::Vec};
-use core::{ptr, sync::atomic::Ordering, time::Duration};
+use core::{
+    ptr,
+    sync::atomic::{AtomicU8, Ordering},
+    time::Duration,
+};
 
 #[cfg(supports_64bit_atomics)]
 use core::sync::atomic::AtomicU64;
@@ -21,6 +25,63 @@ pub struct Api;
 #[derive(Debug)]
 pub struct Context {
     options: Arc<wgt::NoopBackendOptions>,
+    /// The [`PipelineFailure`] the next pipeline creation reports, as its discriminant, or
+    /// zero for none.
+    next_pipeline_failure: AtomicU8,
+}
+
+/// A way for pipeline creation to fail, for testing how callers handle it.
+///
+/// See [`Context::fail_next_pipeline_creation`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum PipelineFailure {
+    /// The driver could not build this pipeline. The device remains usable.
+    Driver = 1,
+    /// The device was lost.
+    DeviceLost = 2,
+    /// The device ran out of memory.
+    OutOfMemory = 3,
+}
+
+impl PipelineFailure {
+    /// The message of the [`crate::PipelineError::Linkage`] reported for
+    /// [`PipelineFailure::Driver`].
+    pub const DRIVER_MESSAGE: &'static str = "noop backend: injected driver failure";
+}
+
+impl Context {
+    /// Returns a context for any of the backend's objects.
+    fn new(options: Arc<wgt::NoopBackendOptions>) -> Self {
+        Self {
+            options,
+            next_pipeline_failure: AtomicU8::new(0),
+        }
+    }
+
+    /// Makes the next render or compute pipeline creation on this device fail with `failure`.
+    /// Creations after that one succeed again.
+    pub fn fail_next_pipeline_creation(&self, failure: PipelineFailure) {
+        self.next_pipeline_failure
+            .store(failure as u8, Ordering::Release);
+    }
+
+    /// Returns the error of a pending [`Context::fail_next_pipeline_creation`] for a
+    /// pipeline made of `stages`, and clears it.
+    fn take_pipeline_failure(&self, stages: wgt::ShaderStages) -> Result<(), crate::PipelineError> {
+        const DRIVER: u8 = PipelineFailure::Driver as u8;
+        const DEVICE_LOST: u8 = PipelineFailure::DeviceLost as u8;
+        const OUT_OF_MEMORY: u8 = PipelineFailure::OutOfMemory as u8;
+        match self.next_pipeline_failure.swap(0, Ordering::AcqRel) {
+            DRIVER => Err(crate::PipelineError::Linkage(
+                stages,
+                String::from(PipelineFailure::DRIVER_MESSAGE),
+            )),
+            DEVICE_LOST => Err(crate::DeviceError::Lost.into()),
+            OUT_OF_MEMORY => Err(crate::DeviceError::OutOfMemory.into()),
+            _ => Ok(()),
+        }
+    }
 }
 #[derive(Debug)]
 pub struct Encoder;
@@ -97,7 +158,7 @@ impl crate::Instance for Context {
     unsafe fn init(desc: &crate::InstanceDescriptor<'_>) -> Result<Self, crate::InstanceError> {
         let options = Arc::new(desc.backend_options.noop.clone());
         if options.enable {
-            Ok(Context { options })
+            Ok(Context::new(options))
         } else {
             Err(crate::InstanceError::new(String::from(
                 "noop backend disabled because NoopBackendOptions::enable is false",
@@ -109,9 +170,7 @@ impl crate::Instance for Context {
         _display_handle: raw_window_handle::RawDisplayHandle,
         _window_handle: raw_window_handle::RawWindowHandle,
     ) -> Result<Context, crate::InstanceError> {
-        Ok(Context {
-            options: Arc::clone(&self.options),
-        })
+        Ok(Context::new(Arc::clone(&self.options)))
     }
     unsafe fn enumerate_adapters(
         &self,
@@ -145,9 +204,7 @@ impl crate::Instance for Context {
         };
 
         vec![crate::ExposedAdapter {
-            adapter: Context {
-                options: Arc::clone(&self.options),
-            },
+            adapter: Context::new(Arc::clone(&self.options)),
             info,
             features,
             capabilities,
@@ -227,12 +284,8 @@ impl crate::Adapter for Context {
         _memory_hints: &wgt::MemoryHints,
     ) -> DeviceResult<crate::OpenDevice<Api>> {
         Ok(crate::OpenDevice {
-            device: Context {
-                options: Arc::clone(&self.options),
-            },
-            queue: Context {
-                options: Arc::clone(&self.options),
-            },
+            device: Context::new(Arc::clone(&self.options)),
+            queue: Context::new(Arc::clone(&self.options)),
         })
     }
     unsafe fn texture_format_capabilities(
@@ -385,6 +438,12 @@ impl crate::Device for Context {
         &self,
         desc: &crate::RenderPipelineDescriptor<Resource, Resource, Resource>,
     ) -> Result<Resource, crate::PipelineError> {
+        let mut stages = match desc.vertex_processor {
+            crate::VertexProcessor::Standard { .. } => wgt::ShaderStages::VERTEX,
+            crate::VertexProcessor::Mesh { .. } => wgt::ShaderStages::MESH,
+        };
+        stages.set(wgt::ShaderStages::FRAGMENT, desc.fragment_stage.is_some());
+        self.take_pipeline_failure(stages)?;
         Ok(Resource)
     }
     unsafe fn destroy_render_pipeline(&self, pipeline: Resource) {}
@@ -392,6 +451,7 @@ impl crate::Device for Context {
         &self,
         desc: &crate::ComputePipelineDescriptor<Resource, Resource, Resource>,
     ) -> Result<Resource, crate::PipelineError> {
+        self.take_pipeline_failure(wgt::ShaderStages::COMPUTE)?;
         Ok(Resource)
     }
     unsafe fn destroy_compute_pipeline(&self, pipeline: Resource) {}

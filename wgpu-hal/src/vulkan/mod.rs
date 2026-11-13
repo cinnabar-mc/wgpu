@@ -33,13 +33,15 @@ mod descriptor;
 mod device;
 mod drm;
 mod instance;
+#[cfg(test)]
+mod pipeline_error_tests;
 mod sampler;
 mod semaphore_list;
 mod swapchain;
 
 pub use adapter::PhysicalDeviceFeatures;
 
-use alloc::{boxed::Box, ffi::CString, sync::Arc, vec::Vec};
+use alloc::{boxed::Box, ffi::CString, format, string::String, sync::Arc, vec::Vec};
 use core::{borrow::Borrow, ffi::CStr, fmt, marker::PhantomData, mem, num::NonZeroU32};
 
 use arrayvec::ArrayVec;
@@ -1669,18 +1671,91 @@ fn map_host_oom_and_ioca_err(err: vk::Result) -> crate::DeviceError {
     map_host_oom_err(err)
 }
 
-/// Maps
+/// Why `vkCreateShaderModule` or one of the `vkCreate*Pipelines` commands failed.
+#[derive(Debug, PartialEq, Eq)]
+enum PipelineCreationError {
+    /// The device ran out of memory or was lost.
+    Device(crate::DeviceError),
+    /// The driver refused this one shader module or pipeline. The device remains usable.
+    Driver {
+        /// The Vulkan command that failed.
+        call: &'static str,
+        /// What it returned.
+        result: vk::Result,
+    },
+}
+
+impl PipelineCreationError {
+    /// Returns the error for creating the pipeline labelled `label` out of the shader
+    /// `stages`. A driver failure becomes [`crate::PipelineError::Linkage`], whose message
+    /// names the command, its `VkResult` and the pipeline.
+    fn into_pipeline_error(
+        self,
+        stages: wgt::ShaderStages,
+        label: crate::Label<'_>,
+    ) -> crate::PipelineError {
+        match self {
+            Self::Device(error) => crate::PipelineError::Device(error),
+            Self::Driver { call, result } => crate::PipelineError::Linkage(
+                stages,
+                driver_failure_message(call, result, "pipeline", label),
+            ),
+        }
+    }
+
+    /// Returns the error for creating the shader module labelled `label`. A driver failure
+    /// becomes [`crate::ShaderError::Compilation`], whose message names the command, its
+    /// `VkResult` and the module.
+    fn into_shader_error(self, label: crate::Label<'_>) -> crate::ShaderError {
+        match self {
+            Self::Device(error) => crate::ShaderError::Device(error),
+            Self::Driver { call, result } => crate::ShaderError::Compilation(
+                driver_failure_message(call, result, "shader module", label),
+            ),
+        }
+    }
+}
+
+/// Describes `call` returning `result` while creating the `kind` object labelled `label`.
+fn driver_failure_message(
+    call: &str,
+    result: vk::Result,
+    kind: &str,
+    label: crate::Label<'_>,
+) -> String {
+    let raw = result.as_raw();
+    match label {
+        Some(label) => format!("{call} failed with {result:?} ({raw}) for {kind} {label:?}"),
+        None => format!("{call} failed with {result:?} ({raw}) for an unlabeled {kind}"),
+    }
+}
+
+/// Maps the result of `call`, which is `vkCreateShaderModule` or one of the
+/// `vkCreate*Pipelines` commands.
 ///
 /// - VK_ERROR_OUT_OF_HOST_MEMORY
 /// - VK_ERROR_OUT_OF_DEVICE_MEMORY
-/// - VK_PIPELINE_COMPILE_REQUIRED_EXT
-/// - VK_ERROR_INVALID_SHADER_NV
-fn map_pipeline_err(err: vk::Result) -> crate::DeviceError {
-    // We don't use VK_EXT_pipeline_creation_cache_control
-    // VK_PIPELINE_COMPILE_REQUIRED_EXT
-    // We don't use VK_NV_glsl_shader
-    // VK_ERROR_INVALID_SHADER_NV
-    map_host_device_oom_err(err)
+/// - VK_ERROR_DEVICE_LOST
+///
+/// Every other code, such as VK_ERROR_UNKNOWN, VK_ERROR_INITIALIZATION_FAILED or
+/// VK_ERROR_INVALID_SHADER_NV, means the driver could not build this object from this
+/// input. That leaves the device usable, so it becomes [`PipelineCreationError::Driver`]
+/// instead of [`crate::DeviceError::Unexpected`], which would lose the device. Panics on
+/// those codes if the `internal_error_panic` feature flag is enabled.
+fn map_pipeline_err(err: vk::Result, call: &'static str) -> PipelineCreationError {
+    match err {
+        vk::Result::ERROR_OUT_OF_HOST_MEMORY | vk::Result::ERROR_OUT_OF_DEVICE_MEMORY => {
+            PipelineCreationError::Device(get_oom_err(err))
+        }
+        vk::Result::ERROR_DEVICE_LOST => PipelineCreationError::Device(get_lost_err()),
+        result => {
+            #[cfg(feature = "internal_error_panic")]
+            panic!("Unexpected Vulkan error: {call} failed with {result:?}");
+
+            #[allow(unreachable_code)]
+            PipelineCreationError::Driver { call, result }
+        }
+    }
 }
 
 /// Returns [`crate::DeviceError::Unexpected`] or panics if the `internal_error_panic`
