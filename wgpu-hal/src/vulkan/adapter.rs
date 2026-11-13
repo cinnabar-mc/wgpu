@@ -2892,7 +2892,7 @@ impl super::Adapter {
         let empty_descriptor_set_layout = unsafe {
             raw_device
                 .create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default(), None)
-                .map_err(super::map_host_device_oom_err)?
+                .map_err(|e| super::map_host_device_oom_err(e, "vkCreateDescriptorSetLayout"))?
         };
 
         let shared = Arc::new(super::DeviceShared {
@@ -3042,7 +3042,7 @@ impl super::Adapter {
                 vk::Result::ERROR_EXTENSION_NOT_PRESENT | vk::Result::ERROR_FEATURE_NOT_PRESENT => {
                     crate::hal_usage_error(err)
                 }
-                other => super::map_host_device_oom_and_lost_err(other),
+                other => super::map_host_device_oom_and_lost_err(other, "vkCreateDevice"),
             }
         }
 

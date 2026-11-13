@@ -32,6 +32,8 @@ pub mod conv;
 mod descriptor;
 mod device;
 mod drm;
+#[cfg(test)]
+mod error_mapping_tests;
 mod instance;
 #[cfg(test)]
 mod pipeline_error_tests;
@@ -1298,7 +1300,7 @@ impl Fence {
                         // Don't need to clone as active should be from a read or
                         // write lock which means this is already synchronised.
                         .get_fence_status(**raw)
-                        .map_err(map_host_device_oom_and_lost_err)?
+                        .map_err(|e| map_host_device_oom_and_lost_err(e, "vkGetFenceStatus"))?
                 {
                     last_completed = value;
                 }
@@ -1318,12 +1320,16 @@ impl Fence {
         match *self {
             Self::TimelineSemaphore(raw) => unsafe {
                 Ok(match *extension.unwrap() {
-                    ExtensionFn::Extension(ref ext) => ext
-                        .get_semaphore_counter_value(raw)
-                        .map_err(map_host_device_oom_and_lost_err)?,
-                    ExtensionFn::Promoted => device
-                        .get_semaphore_counter_value(raw)
-                        .map_err(map_host_device_oom_and_lost_err)?,
+                    ExtensionFn::Extension(ref ext) => {
+                        ext.get_semaphore_counter_value(raw).map_err(|e| {
+                            map_host_device_oom_and_lost_err(e, "vkGetSemaphoreCounterValue")
+                        })?
+                    }
+                    ExtensionFn::Promoted => {
+                        device.get_semaphore_counter_value(raw).map_err(|e| {
+                            map_host_device_oom_and_lost_err(e, "vkGetSemaphoreCounterValue")
+                        })?
+                    }
                 })
             },
             Self::FencePool(ref pool) => {
@@ -1379,7 +1385,7 @@ impl Fence {
 
                 if free.len() != base_free {
                     unsafe { device.reset_fences(&free[base_free..]) }
-                        .map_err(map_device_oom_err)?
+                        .map_err(|e| map_device_oom_err(e, "vkResetFences"))?
                 }
                 *last_completed = latest;
             }
@@ -1484,7 +1490,7 @@ impl crate::Queue for Queue {
                             .device
                             .raw
                             .create_fence(&vk::FenceCreateInfo::default(), None)
-                            .map_err(map_host_device_oom_err)?;
+                            .map_err(|e| map_host_device_oom_err(e, "vkCreateFence"))?;
                         Arc::new(fence)
                     },
                 };
@@ -1512,7 +1518,7 @@ impl crate::Queue for Queue {
             self.device
                 .raw
                 .queue_submit(self.raw, &[vk_info], fence_raw)
-                .map_err(map_host_device_oom_and_lost_err)?
+                .map_err(|e| map_host_device_oom_and_lost_err(e, "vkQueueSubmit"))?
         };
         Ok(())
     }
@@ -1533,7 +1539,7 @@ impl crate::Queue for Queue {
 
     unsafe fn wait_for_idle(&self) -> Result<(), crate::DeviceError> {
         unsafe { self.device.raw.queue_wait_idle(self.raw) }
-            .map_err(map_host_device_oom_and_lost_err)
+            .map_err(|e| map_host_device_oom_and_lost_err(e, "vkQueueWaitIdle"))
     }
 }
 
@@ -1597,12 +1603,14 @@ impl Queue {
 ///
 /// - VK_ERROR_OUT_OF_HOST_MEMORY
 /// - VK_ERROR_OUT_OF_DEVICE_MEMORY
-fn map_host_device_oom_err(err: vk::Result) -> crate::DeviceError {
+///
+/// `call` names the Vulkan command that returned `err`; it is logged when `err` is unexpected.
+fn map_host_device_oom_err(err: vk::Result, call: &'static str) -> crate::DeviceError {
     match err {
         vk::Result::ERROR_OUT_OF_HOST_MEMORY | vk::Result::ERROR_OUT_OF_DEVICE_MEMORY => {
             get_oom_err(err)
         }
-        e => get_unexpected_err(e),
+        e => get_unexpected_err(e, call, None),
     }
 }
 
@@ -1611,10 +1619,12 @@ fn map_host_device_oom_err(err: vk::Result) -> crate::DeviceError {
 /// - VK_ERROR_OUT_OF_HOST_MEMORY
 /// - VK_ERROR_OUT_OF_DEVICE_MEMORY
 /// - VK_ERROR_DEVICE_LOST
-fn map_host_device_oom_and_lost_err(err: vk::Result) -> crate::DeviceError {
+///
+/// `call` names the Vulkan command that returned `err`; it is logged when `err` is unexpected.
+fn map_host_device_oom_and_lost_err(err: vk::Result, call: &'static str) -> crate::DeviceError {
     match err {
         vk::Result::ERROR_DEVICE_LOST => get_lost_err(),
-        other => map_host_device_oom_err(other),
+        other => map_host_device_oom_err(other, call),
     }
 }
 
@@ -1623,10 +1633,15 @@ fn map_host_device_oom_and_lost_err(err: vk::Result) -> crate::DeviceError {
 /// - VK_ERROR_OUT_OF_HOST_MEMORY
 /// - VK_ERROR_OUT_OF_DEVICE_MEMORY
 /// - VK_ERROR_FRAGMENTATION
-fn map_host_device_oom_and_fragmentation_err(err: vk::Result) -> crate::DeviceError {
+///
+/// `call` names the Vulkan command that returned `err`; it is logged when `err` is unexpected.
+fn map_host_device_oom_and_fragmentation_err(
+    err: vk::Result,
+    call: &'static str,
+) -> crate::DeviceError {
     match err {
         vk::Result::ERROR_FRAGMENTATION => get_oom_err(err),
-        other => map_host_device_oom_err(other),
+        other => map_host_device_oom_err(other, call),
     }
 }
 
@@ -1635,29 +1650,35 @@ fn map_host_device_oom_and_fragmentation_err(err: vk::Result) -> crate::DeviceEr
 /// - VK_ERROR_OUT_OF_HOST_MEMORY
 /// - VK_ERROR_OUT_OF_DEVICE_MEMORY
 /// - VK_ERROR_INVALID_OPAQUE_CAPTURE_ADDRESS_KHR
-fn map_host_device_oom_and_ioca_err(err: vk::Result) -> crate::DeviceError {
+///
+/// `call` names the Vulkan command that returned `err`; it is logged when `err` is unexpected.
+fn map_host_device_oom_and_ioca_err(err: vk::Result, call: &'static str) -> crate::DeviceError {
     // We don't use VK_KHR_buffer_device_address
     // VK_ERROR_INVALID_OPAQUE_CAPTURE_ADDRESS_KHR
-    map_host_device_oom_err(err)
+    map_host_device_oom_err(err, call)
 }
 
 /// Maps
 ///
 /// - VK_ERROR_OUT_OF_HOST_MEMORY
-fn map_host_oom_err(err: vk::Result) -> crate::DeviceError {
+///
+/// `call` names the Vulkan command that returned `err`; it is logged when `err` is unexpected.
+fn map_host_oom_err(err: vk::Result, call: &'static str) -> crate::DeviceError {
     match err {
         vk::Result::ERROR_OUT_OF_HOST_MEMORY => get_oom_err(err),
-        e => get_unexpected_err(e),
+        e => get_unexpected_err(e, call, None),
     }
 }
 
 /// Maps
 ///
 /// - VK_ERROR_OUT_OF_DEVICE_MEMORY
-fn map_device_oom_err(err: vk::Result) -> crate::DeviceError {
+///
+/// `call` names the Vulkan command that returned `err`; it is logged when `err` is unexpected.
+fn map_device_oom_err(err: vk::Result, call: &'static str) -> crate::DeviceError {
     match err {
         vk::Result::ERROR_OUT_OF_DEVICE_MEMORY => get_oom_err(err),
-        e => get_unexpected_err(e),
+        e => get_unexpected_err(e, call, None),
     }
 }
 
@@ -1665,10 +1686,12 @@ fn map_device_oom_err(err: vk::Result) -> crate::DeviceError {
 ///
 /// - VK_ERROR_OUT_OF_HOST_MEMORY
 /// - VK_ERROR_INVALID_OPAQUE_CAPTURE_ADDRESS_KHR
-fn map_host_oom_and_ioca_err(err: vk::Result) -> crate::DeviceError {
+///
+/// `call` names the Vulkan command that returned `err`; it is logged when `err` is unexpected.
+fn map_host_oom_and_ioca_err(err: vk::Result, call: &'static str) -> crate::DeviceError {
     // We don't use VK_KHR_buffer_device_address
     // VK_ERROR_INVALID_OPAQUE_CAPTURE_ADDRESS_KHR
-    map_host_oom_err(err)
+    map_host_oom_err(err, call)
 }
 
 /// Why `vkCreateShaderModule` or one of the `vkCreate*Pipelines` commands failed.
@@ -1758,14 +1781,48 @@ fn map_pipeline_err(err: vk::Result, call: &'static str) -> PipelineCreationErro
     }
 }
 
-/// Returns [`crate::DeviceError::Unexpected`] or panics if the `internal_error_panic`
-/// feature flag is enabled.
-fn get_unexpected_err(_err: vk::Result) -> crate::DeviceError {
+/// Logs `err`, the Vulkan command `call` that returned it, and the label of the object
+/// being created, if any, at error level. Then returns [`crate::DeviceError::Unexpected`],
+/// or panics if the `internal_error_panic` feature flag is enabled.
+///
+/// The display text of [`crate::DeviceError::Unexpected`] carries none of this, so this log
+/// line is the only record of which call failed and with which code.
+#[cold]
+#[inline(never)]
+fn get_unexpected_err(
+    err: vk::Result,
+    call: &'static str,
+    label: crate::Label<'_>,
+) -> crate::DeviceError {
+    let report = UnexpectedVkResult { err, call, label };
+    log::error!("Vulkan: {report}");
+
     #[cfg(feature = "internal_error_panic")]
-    panic!("Unexpected Vulkan error: {_err:?}");
+    panic!("Unexpected Vulkan error: {report}");
 
     #[allow(unreachable_code)]
     crate::DeviceError::Unexpected
+}
+
+/// Describes a `VkResult` that a Vulkan command was not expected to return, for example
+/// `vkCreateGraphicsPipelines returned unexpected ERROR_UNKNOWN (-13) for "terrain"`.
+///
+/// The raw value is included because codes unknown to `ash` print only as a number.
+struct UnexpectedVkResult<'a> {
+    err: vk::Result,
+    call: &'static str,
+    label: crate::Label<'a>,
+}
+
+impl fmt::Display for UnexpectedVkResult<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self { err, call, label } = self;
+        write!(f, "{call} returned unexpected {err:?} ({})", err.as_raw())?;
+        if let Some(label) = label {
+            write!(f, " for {label:?}")?;
+        }
+        Ok(())
+    }
 }
 
 /// Returns [`crate::DeviceError::OutOfMemory`].

@@ -106,7 +106,7 @@ impl super::CommandEncoder {
                         layer_count: 1,
                     });
                 let raw = unsafe { self.device.raw.create_image_view(&vk_info, None) }
-                    .map_err(super::map_host_device_oom_and_ioca_err)?;
+                    .map_err(|e| super::map_host_device_oom_and_ioca_err(e, "vkCreateImageView"))?;
 
                 let identity = self.device.texture_view_identity_factory.next();
 
@@ -128,7 +128,7 @@ impl crate::CommandEncoder for super::CommandEncoder {
                 self.device
                     .raw
                     .allocate_command_buffers(&vk_info)
-                    .map_err(super::map_host_device_oom_err)?
+                    .map_err(|e| super::map_host_device_oom_err(e, "vkAllocateCommandBuffers"))?
             };
             self.free.extend(cmd_buf_vec);
         }
@@ -145,7 +145,7 @@ impl crate::CommandEncoder for super::CommandEncoder {
         let vk_info = vk::CommandBufferBeginInfo::default()
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
         unsafe { self.device.raw.begin_command_buffer(raw, &vk_info) }
-            .map_err(super::map_host_device_oom_err)?;
+            .map_err(|e| super::map_host_device_oom_err(e, "vkBeginCommandBuffer"))?;
         self.active = raw;
 
         Ok(())
@@ -158,7 +158,7 @@ impl crate::CommandEncoder for super::CommandEncoder {
         fn map_err(err: vk::Result) -> crate::DeviceError {
             // We don't use VK_KHR_video_encode_queue
             // VK_ERROR_INVALID_VIDEO_STD_PARAMETERS_KHR
-            super::map_host_device_oom_err(err)
+            super::map_host_device_oom_err(err, "vkEndCommandBuffer")
         }
         Ok(super::CommandBuffer { raw })
     }
