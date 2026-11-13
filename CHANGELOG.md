@@ -59,6 +59,7 @@ Bottom level categories:
 
 - Serialize shader-module and pipeline creation on PowerVR Rogue and BXM-8-256 GPUs to avoid concurrent compiler crashes.
 - Serialize shader-module and pipeline creation on Qualcomm's proprietary Adreno driver to avoid concurrent compiler crashes.
+- Write SPIR-V 1.3 (1.4 when mesh shaders are enabled) on Qualcomm's proprietary Adreno driver and Arm's proprietary Mali driver, so their shaders contain no `OpCopyLogical`, which Dawn and ANGLE report those compilers mishandling. Other drivers keep the newest version their Vulkan version accepts.
 - On drivers that serialize shader compilation, also destroy shader modules and create, read and destroy pipeline caches under the same lock, and destroy a pipeline's temporary shader modules when its creation fails.
 - Fix crash on older Vulkan drivers when `poolSizeCount == 0`. By @lucasmerlin in [#10124](https://github.com/gfx-rs/wgpu/pull/10124).
 - Fall back to image robustness when robustness2 reports no robust image access. By @raphlinus in [#10291](https://github.com/gfx-rs/wgpu/pull/10291).

@@ -468,6 +468,15 @@ bitflags::bitflags!(
         /// creation, shader-module destruction and pipeline-cache creation, reads and
         /// destruction per device.
         const SERIALIZE_SHADER_COMPILATION = 0x8;
+        /// Keep `OpCopyLogical` out of shaders by writing SPIR-V below
+        /// [`naga::back::spv::COPY_LOGICAL_MIN_LANG_VERSION`], as devices without Vulkan 1.2
+        /// already get.
+        ///
+        /// Dawn and ANGLE turn SPIR-V 1.4 off on Qualcomm's proprietary Adreno driver, whose
+        /// compiler crashes in pipeline creation or miscopies structs when given the
+        /// instruction. Dawn also turns it off on Arm's proprietary Mali driver on Android
+        /// for an unresolved driver bug.
+        const AVOID_SPIRV_COPY_LOGICAL = 0x10;
     }
 );
 
