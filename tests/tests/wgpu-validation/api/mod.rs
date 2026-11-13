@@ -10,5 +10,6 @@ mod experimental;
 mod external_texture;
 mod immediates;
 mod instance;
+mod pipeline_creation_failure;
 mod render_pipeline;
 mod texture;
