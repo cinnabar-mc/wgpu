@@ -2821,15 +2821,11 @@ impl super::Adapter {
                 capabilities.extend(&[spv::Capability::Int8]);
             }
             spv::Options {
-                lang_version: match self.phd_capabilities.device_api_version {
-                    // Use maximum supported SPIR-V version according to
-                    // <https://github.com/KhronosGroup/Vulkan-Docs/blob/19b7651/appendices/spirvenv.adoc?plain=1#L21-L40>.
-                    vk::API_VERSION_1_0..vk::API_VERSION_1_1 => (1, 0),
-                    vk::API_VERSION_1_1..vk::API_VERSION_1_2 => (1, 3),
-                    vk::API_VERSION_1_2..vk::API_VERSION_1_3 => (1, 5),
-                    vk::API_VERSION_1_3.. => (1, 6),
-                    _ => unreachable!(),
-                },
+                lang_version: spirv_lang_version(
+                    self.phd_capabilities.device_api_version,
+                    self.workarounds,
+                    features.contains(wgt::Features::EXPERIMENTAL_MESH_SHADER),
+                ),
                 flags,
                 capabilities: Some(capabilities.iter().cloned().collect()),
                 bounds_check_policies: naga::proc::BoundsCheckPolicies {
@@ -3411,6 +3407,12 @@ fn vendor_workarounds(
 ) -> super::Workarounds {
     use crate::auxil::db;
 
+    // Mesa's Turnip and PanVK drivers share a vendor with these but not their compilers.
+    let qualcomm_proprietary =
+        vendor_id == db::qualcomm::VENDOR && driver_id != Some(vk::DriverId::MESA_TURNIP);
+    let arm_proprietary =
+        vendor_id == db::arm::VENDOR && driver_id != Some(vk::DriverId::MESA_PANVK);
+
     // TODO: only enable for particular devices
     let mut workarounds = super::Workarounds::SEPARATE_ENTRY_POINTS;
     workarounds.set(
@@ -3427,10 +3429,41 @@ fn vendor_workarounds(
             || (vendor_id == db::imgtec::VENDOR
                 && (device_name.contains("Rogue") || device_name.contains("BXM-8-256")))
             // Qualcomm's proprietary compiler; Mesa's Turnip driver is unaffected.
-            || (vendor_id == db::qualcomm::VENDOR
-                && driver_id != Some(vk::DriverId::MESA_TURNIP)),
+            || qualcomm_proprietary,
+    );
+    workarounds.set(
+        super::Workarounds::AVOID_SPIRV_COPY_LOGICAL,
+        qualcomm_proprietary || arm_proprietary,
     );
     workarounds
+}
+
+/// The SPIR-V version naga writes for a device.
+///
+/// This is the highest version the device's Vulkan version accepts, unless `workarounds`
+/// holds [`AVOID_SPIRV_COPY_LOGICAL`](super::Workarounds::AVOID_SPIRV_COPY_LOGICAL). That
+/// caps it at 1.3, the version Vulkan 1.1 devices get, or at 1.4 when `mesh_shaders` are
+/// enabled, because naga writes mesh shaders only for SPIR-V 1.4 and later. Vulkan 1.2
+/// guarantees both.
+fn spirv_lang_version(
+    device_api_version: u32,
+    workarounds: super::Workarounds,
+    mesh_shaders: bool,
+) -> (u8, u8) {
+    let supported = match device_api_version {
+        // Use maximum supported SPIR-V version according to
+        // <https://github.com/KhronosGroup/Vulkan-Docs/blob/19b7651/appendices/spirvenv.adoc?plain=1#L21-L40>.
+        vk::API_VERSION_1_0..vk::API_VERSION_1_1 => (1, 0),
+        vk::API_VERSION_1_1..vk::API_VERSION_1_2 => (1, 3),
+        vk::API_VERSION_1_2..vk::API_VERSION_1_3 => (1, 5),
+        vk::API_VERSION_1_3.. => (1, 6),
+        _ => unreachable!(),
+    };
+    if workarounds.contains(super::Workarounds::AVOID_SPIRV_COPY_LOGICAL) {
+        supported.min(if mesh_shaders { (1, 4) } else { (1, 3) })
+    } else {
+        supported
+    }
 }
 
 // For https://github.com/gfx-rs/wgpu/issues/4599
@@ -3582,7 +3615,7 @@ fn query_cooperative_matrix_properties(
 
 #[cfg(test)]
 mod tests {
-    use super::{super::Workarounds, vendor_workarounds};
+    use super::{super::Workarounds, spirv_lang_version, vendor_workarounds};
     use super::{vk, PhysicalDeviceFeatures};
     use crate::auxil::db;
 
@@ -3650,6 +3683,135 @@ mod tests {
             Some(vk::DriverId::MESA_TURNIP)
         )
         .contains(Workarounds::SERIALIZE_SHADER_COMPILATION));
+    }
+
+    /// The adapters whose shaders must not contain `OpCopyLogical`.
+    fn copy_logical_averse_workarounds() -> [Workarounds; 4] {
+        [
+            vendor_workarounds(
+                db::qualcomm::VENDOR,
+                "Adreno (TM) 740",
+                Some(vk::DriverId::QUALCOMM_PROPRIETARY),
+            ),
+            vendor_workarounds(db::qualcomm::VENDOR, "Adreno (TM) 610", None),
+            vendor_workarounds(
+                db::arm::VENDOR,
+                "Mali-G715",
+                Some(vk::DriverId::ARM_PROPRIETARY),
+            ),
+            vendor_workarounds(db::arm::VENDOR, "Mali-G57", None),
+        ]
+    }
+
+    const VULKAN_VERSIONS: [u32; 5] = [
+        vk::API_VERSION_1_0,
+        vk::API_VERSION_1_1,
+        vk::API_VERSION_1_2,
+        vk::API_VERSION_1_3,
+        vk::make_api_version(0, 1, 4, 0),
+    ];
+
+    #[test]
+    fn qualcomm_and_arm_proprietary_drivers_get_spirv_without_copy_logical() {
+        let vulkan_1_1 = spirv_lang_version(vk::API_VERSION_1_1, Workarounds::empty(), false);
+        for workarounds in copy_logical_averse_workarounds() {
+            assert!(workarounds.contains(Workarounds::AVOID_SPIRV_COPY_LOGICAL));
+            for version in VULKAN_VERSIONS {
+                let newest = spirv_lang_version(version, Workarounds::empty(), false);
+                for mesh_shaders in [false, true] {
+                    let capped = spirv_lang_version(version, workarounds, mesh_shaders);
+                    assert!(capped < naga::back::spv::COPY_LOGICAL_MIN_LANG_VERSION);
+                    assert!(capped <= newest);
+                    if mesh_shaders {
+                        // naga writes mesh shaders only for SPIR-V 1.4 and later.
+                        assert_eq!(capped >= (1, 4), newest >= (1, 4));
+                    } else {
+                        // The version devices without Vulkan 1.2 already get.
+                        assert_eq!(capped, newest.min(vulkan_1_1));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn other_drivers_keep_the_newest_spirv() {
+        let unaffected = [
+            vendor_workarounds(
+                db::qualcomm::VENDOR,
+                "Turnip Adreno (TM) 740",
+                Some(vk::DriverId::MESA_TURNIP),
+            ),
+            vendor_workarounds(db::arm::VENDOR, "Mali-G610", Some(vk::DriverId::MESA_PANVK)),
+            vendor_workarounds(db::imgtec::VENDOR, "PowerVR Rogue GE8320", None),
+            vendor_workarounds(db::amd::VENDOR, "", Some(vk::DriverId::MESA_RADV)),
+            vendor_workarounds(db::intel::VENDOR, "", None),
+            vendor_workarounds(db::nvidia::VENDOR, "", None),
+            vendor_workarounds(db::mesa::VENDOR, "llvmpipe", None),
+        ];
+        let newest = [(1, 0), (1, 3), (1, 5), (1, 6), (1, 6)];
+        for workarounds in unaffected {
+            assert!(!workarounds.contains(Workarounds::AVOID_SPIRV_COPY_LOGICAL));
+            for (version, newest) in VULKAN_VERSIONS.into_iter().zip(newest) {
+                for mesh_shaders in [false, true] {
+                    assert_eq!(
+                        spirv_lang_version(version, workarounds, mesh_shaders),
+                        newest
+                    );
+                }
+            }
+        }
+    }
+
+    /// Whether a SPIR-V module holds an `OpCopyLogical` instruction.
+    fn copies_logically(words: &[u32]) -> bool {
+        // <https://registry.khronos.org/SPIR-V/specs/unified1/SPIRV.html#OpCopyLogical>
+        const OP_COPY_LOGICAL: u32 = 400;
+        // Instructions follow the five header words; each starts with its length and opcode.
+        let mut offset = 5;
+        while offset < words.len() {
+            if words[offset] & 0xffff == OP_COPY_LOGICAL {
+                return true;
+            }
+            offset += (words[offset] >> 16) as usize;
+        }
+        false
+    }
+
+    #[test]
+    fn capped_spirv_copies_structs_without_copy_logical() {
+        // A struct loaded from a buffer into a local and stored back, which SPIR-V 1.5 and
+        // later can only write with `OpCopyLogical`.
+        let module = naga::front::wgsl::parse_str(
+            "struct Pair { a: u32, b: u32 }
+            @group(0) @binding(0) var<storage, read_write> pairs: array<Pair>;
+            @compute @workgroup_size(1)
+            fn main() {
+                var local = pairs[0];
+                local.a += 1u;
+                pairs[1] = local;
+            }",
+        )
+        .unwrap();
+        let info = naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        )
+        .validate(&module)
+        .unwrap();
+        let write = |workarounds, mesh_shaders| {
+            let options = naga::back::spv::Options {
+                lang_version: spirv_lang_version(vk::API_VERSION_1_3, workarounds, mesh_shaders),
+                ..Default::default()
+            };
+            naga::back::spv::write_vec(&module, &info, &options, None).unwrap()
+        };
+        assert!(copies_logically(&write(Workarounds::empty(), false)));
+        for workarounds in copy_logical_averse_workarounds() {
+            for mesh_shaders in [false, true] {
+                assert!(!copies_logically(&write(workarounds, mesh_shaders)));
+            }
+        }
     }
 
     #[test]
