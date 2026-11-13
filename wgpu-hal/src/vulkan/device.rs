@@ -241,7 +241,7 @@ impl super::DeviceShared {
                 let raw = unsafe {
                     self.raw
                         .create_render_pass(&vk_info, None)
-                        .map_err(super::map_host_device_oom_err)?
+                        .map_err(|e| super::map_host_device_oom_err(e, "vkCreateRenderPass"))?
                 };
 
                 *e.insert(raw)
@@ -443,7 +443,7 @@ impl super::Device {
         fn map_err(err: vk::Result) -> crate::DeviceError {
             // We don't use VK_EXT_image_compression_control
             // VK_ERROR_COMPRESSION_EXHAUSTED_EXT
-            super::map_host_device_oom_and_ioca_err(err)
+            super::map_host_device_oom_and_ioca_err(err, "vkCreateImage")
         }
         let mut req = unsafe { self.shared.raw.get_image_memory_requirements(raw) };
 
@@ -515,10 +515,10 @@ impl super::Device {
             .memory_type_index(mem_type_index as _)
             .push_next(&mut import_memory_info);
         let memory = unsafe { self.shared.raw.allocate_memory(&memory_allocate_info, None) }
-            .map_err(super::map_host_device_oom_err)?;
+            .map_err(|e| super::map_host_device_oom_err(e, "vkAllocateMemory"))?;
 
         unsafe { self.shared.raw.bind_image_memory(image.raw, memory, 0) }
-            .map_err(super::map_host_device_oom_err)?;
+            .map_err(|e| super::map_host_device_oom_err(e, "vkBindImageMemory"))?;
 
         Ok(unsafe {
             self.texture_from_raw(
@@ -644,7 +644,7 @@ impl super::Device {
         }
         .map_err(|e| {
             unsafe { libc::close(fd_raw) };
-            super::map_host_device_oom_err(e)
+            super::map_host_device_oom_err(e, "vkGetMemoryFdPropertiesKHR")
         })?;
 
         let mem_type_index = self
@@ -674,13 +674,13 @@ impl super::Device {
         let memory = unsafe { self.shared.raw.allocate_memory(&memory_allocate_info, None) }
             .map_err(|e| {
                 unsafe { libc::close(fd_raw) };
-                super::map_host_device_oom_err(e)
+                super::map_host_device_oom_err(e, "vkAllocateMemory")
             })?;
 
         // From this point, the fd is consumed. Only VkDeviceMemory needs cleanup on error.
         unsafe { self.shared.raw.bind_image_memory(image, memory, 0) }.map_err(|e| {
             unsafe { self.shared.raw.free_memory(memory, None) };
-            super::map_host_device_oom_err(e)
+            super::map_host_device_oom_err(e, "vkBindImageMemory")
         })?;
 
         Ok(memory)
@@ -701,13 +701,8 @@ impl super::Device {
             self.shared
                 .raw
                 .create_shader_module(&vk_info, None)
-                .map_err(map_err)?
+                .map_err(|err| super::map_pipeline_err(err, "vkCreateShaderModule", *label))?
         };
-        fn map_err(err: vk::Result) -> crate::DeviceError {
-            // We don't use VK_NV_glsl_shader
-            // VK_ERROR_INVALID_SHADER_NV
-            super::map_host_device_oom_err(err)
-        }
 
         if let Some(label) = label {
             unsafe { self.shared.set_object_name(raw, label) };
@@ -721,6 +716,7 @@ impl super::Device {
         stage: &crate::ProgrammableStage<super::ShaderModule>,
         naga_stage: naga::ShaderStage,
         binding_map: &naga::back::spv::BindingMap,
+        pipeline_label: crate::Label<'_>,
     ) -> Result<CompiledStage, crate::PipelineError> {
         let stage_flags = crate::auxil::map_naga_stage(naga_stage);
         let vk_module = match *stage.module {
@@ -802,7 +798,16 @@ impl super::Device {
                     naga::back::spv::write_vec(&module, &info, options, Some(&pipeline_options))
                 }
                 .map_err(|e| crate::PipelineError::Linkage(stage_flags, format!("{e}")))?;
-                self.create_shader_module_impl(&spv, &None)?
+                self.create_shader_module_impl(&spv, &None)
+                    .inspect_err(|err| {
+                        if matches!(err, crate::DeviceError::Unexpected) {
+                            log::error!(
+                                "Vulkan: the rejected shader module is the {naga_stage:?} stage \
+                                 (entry point {:?}) of pipeline {pipeline_label:?}",
+                                stage.entry_point
+                            );
+                        }
+                    })?
             }
         };
 
@@ -1017,7 +1022,7 @@ impl crate::Device for super::Device {
             self.shared
                 .raw
                 .create_buffer(&vk_info, None)
-                .map_err(super::map_host_device_oom_and_ioca_err)?
+                .map_err(|e| super::map_host_device_oom_and_ioca_err(e, "vkCreateBuffer"))?
         };
 
         let mut requirements = unsafe { self.shared.raw.get_buffer_memory_requirements(raw) };
@@ -1071,7 +1076,7 @@ impl crate::Device for super::Device {
                 .raw
                 .bind_buffer_memory(raw, allocation.memory(), allocation.offset())
         }
-        .map_err(super::map_host_device_oom_and_ioca_err)
+        .map_err(|e| super::map_host_device_oom_and_ioca_err(e, "vkBindBufferMemory"))
         .inspect_err(|_| {
             unsafe { self.shared.raw.destroy_buffer(raw, None) };
         })?;
@@ -1234,7 +1239,7 @@ impl crate::Device for super::Device {
                 .raw
                 .bind_image_memory(image.raw, allocation.memory(), allocation.offset())
         }
-        .map_err(super::map_host_device_oom_err)
+        .map_err(|e| super::map_host_device_oom_err(e, "vkBindImageMemory"))
         .inspect_err(|_| {
             unsafe { self.shared.raw.destroy_image(image.raw, None) };
         })?;
@@ -1299,7 +1304,7 @@ impl crate::Device for super::Device {
         }
 
         let raw = unsafe { self.shared.raw.create_image_view(&vk_info, None) }
-            .map_err(super::map_host_device_oom_and_ioca_err)?;
+            .map_err(|e| super::map_host_device_oom_and_ioca_err(e, "vkCreateImageView"))?;
 
         if let Some(label) = desc.label {
             unsafe { self.shared.set_object_name(raw, label) };
@@ -1401,7 +1406,7 @@ impl crate::Device for super::Device {
             self.shared
                 .raw
                 .create_command_pool(&vk_info, None)
-                .map_err(super::map_host_device_oom_err)?
+                .map_err(|e| super::map_host_device_oom_err(e, "vkCreateCommandPool"))?
         };
 
         self.counters.command_encoders.add(1);
@@ -1531,7 +1536,7 @@ impl crate::Device for super::Device {
             self.shared
                 .raw
                 .create_descriptor_set_layout(&vk_info, None)
-                .map_err(super::map_host_device_oom_err)?
+                .map_err(|e| super::map_host_device_oom_err(e, "vkCreateDescriptorSetLayout"))?
         };
 
         if let Some(label) = desc.label {
@@ -1620,7 +1625,7 @@ impl crate::Device for super::Device {
                 self.shared
                     .raw
                     .create_pipeline_layout(&vk_info, None)
-                    .map_err(super::map_host_device_oom_err)?
+                    .map_err(|e| super::map_host_device_oom_err(e, "vkCreatePipelineLayout"))?
             }
         };
 
@@ -2017,6 +2022,7 @@ impl crate::Device for super::Device {
                     vertex_stage,
                     naga::ShaderStage::Vertex,
                     &desc.layout.binding_map,
+                    desc.label,
                 )?);
                 stages.push(compiled_vs.as_ref().unwrap().create_info);
             }
@@ -2029,6 +2035,7 @@ impl crate::Device for super::Device {
                         t,
                         naga::ShaderStage::Task,
                         &desc.layout.binding_map,
+                        desc.label,
                     )?);
                     stages.push(compiled_ts.as_ref().unwrap().create_info);
                 }
@@ -2036,6 +2043,7 @@ impl crate::Device for super::Device {
                     mesh_stage,
                     naga::ShaderStage::Mesh,
                     &desc.layout.binding_map,
+                    desc.label,
                 )?);
                 stages.push(compiled_ms.as_ref().unwrap().create_info);
             }
@@ -2046,6 +2054,7 @@ impl crate::Device for super::Device {
                     stage,
                     naga::ShaderStage::Fragment,
                     &desc.layout.binding_map,
+                    desc.label,
                 )?;
                 stages.push(compiled.create_info);
                 Some(compiled)
@@ -2202,7 +2211,9 @@ impl crate::Device for super::Device {
                         .flatten(),
                 )
             };
-            created.map_err(|(_, e)| super::map_pipeline_err(e))?
+            created.map_err(|(_, e)| {
+                super::map_pipeline_err(e, "vkCreateGraphicsPipelines", desc.label)
+            })?
         };
 
         let raw = raw_vec.pop().unwrap();
@@ -2236,6 +2247,7 @@ impl crate::Device for super::Device {
             &desc.stage,
             naga::ShaderStage::Compute,
             &desc.layout.binding_map,
+            desc.label,
         )?;
 
         let vk_infos = [{
@@ -2258,7 +2270,9 @@ impl crate::Device for super::Device {
                     .create_compute_pipelines(pipeline_cache, &vk_infos, None)
             };
             unsafe { self.shared.destroy_temp_modules([compiled]) };
-            created.map_err(|(_, e)| super::map_pipeline_err(e))?
+            created.map_err(|(_, e)| {
+                super::map_pipeline_err(e, "vkCreateComputePipelines", desc.label)
+            })?
         };
 
         let raw = raw_vec.pop().unwrap();
@@ -2292,6 +2306,7 @@ impl crate::Device for super::Device {
             &desc.ray_generation,
             naga::ShaderStage::RayGeneration,
             &desc.layout.binding_map,
+            desc.label,
         )?;
 
         groups.push(
@@ -2309,6 +2324,7 @@ impl crate::Device for super::Device {
             &desc.miss,
             naga::ShaderStage::Miss,
             &desc.layout.binding_map,
+            desc.label,
         )?;
 
         groups.push(
@@ -2331,6 +2347,7 @@ impl crate::Device for super::Device {
                 &group.closest_hit,
                 naga::ShaderStage::ClosestHit,
                 &desc.layout.binding_map,
+                desc.label,
             )?;
 
             let closest_idx = stages.len();
@@ -2352,6 +2369,7 @@ impl crate::Device for super::Device {
                     any_hit,
                     naga::ShaderStage::AnyHit,
                     &desc.layout.binding_map,
+                    desc.label,
                 )?;
 
                 let any_idx = stages.len();
@@ -2402,7 +2420,9 @@ impl crate::Device for super::Device {
                         .chain(compiled_stages),
                 )
             };
-            created.map_err(|(_, e)| super::map_pipeline_err(e))?
+            created.map_err(|(_, e)| {
+                super::map_pipeline_err(e, "vkCreateRayTracingPipelinesKHR", desc.label)
+            })?
         };
 
         self.counters.ray_tracing_pipelines.add(1);
@@ -2441,7 +2461,7 @@ impl crate::Device for super::Device {
                     .ray_tracing_pipeline_group_data_size) as usize,
             )
         }
-        .map_err(super::map_host_device_oom_err)
+        .map_err(|e| super::map_host_device_oom_err(e, "vkGetRayTracingShaderGroupHandlesKHR"))
     }
 
     unsafe fn create_pipeline_cache(
@@ -2457,7 +2477,7 @@ impl crate::Device for super::Device {
             let _serialized = self.shared.shader_compilation_guard();
             unsafe { self.shared.raw.create_pipeline_cache(&info, None) }
         }
-        .map_err(super::map_host_device_oom_err)?;
+        .map_err(|e| super::map_host_device_oom_err(e, "vkCreatePipelineCache"))?;
 
         Ok(super::PipelineCache { raw })
     }
@@ -2506,7 +2526,7 @@ impl crate::Device for super::Device {
             .pipeline_statistics(pipeline_statistics);
 
         let raw = unsafe { self.shared.raw.create_query_pool(&vk_info, None) }
-            .map_err(super::map_host_device_oom_err)?;
+            .map_err(|e| super::map_host_device_oom_err(e, "vkCreateQueryPool"))?;
         if let Some(label) = desc.label {
             unsafe { self.shared.set_object_name(raw, label) };
         }
@@ -2530,7 +2550,7 @@ impl crate::Device for super::Device {
                 vk::SemaphoreTypeCreateInfo::default().semaphore_type(vk::SemaphoreType::TIMELINE);
             let vk_info = vk::SemaphoreCreateInfo::default().push_next(&mut sem_type_info);
             let raw = unsafe { self.shared.raw.create_semaphore(&vk_info, None) }
-                .map_err(super::map_host_device_oom_err)?;
+                .map_err(|e| super::map_host_device_oom_err(e, "vkCreateSemaphore"))?;
 
             super::Fence::TimelineSemaphore(raw)
         } else {
@@ -2819,7 +2839,7 @@ impl crate::Device for super::Device {
                 .shared
                 .raw
                 .create_buffer(&vk_buffer_info, None)
-                .map_err(super::map_host_device_oom_and_ioca_err)?;
+                .map_err(|e| super::map_host_device_oom_and_ioca_err(e, "vkCreateBuffer"))?;
 
             let requirements = self.shared.raw.get_buffer_memory_requirements(raw_buffer);
 
@@ -2852,7 +2872,7 @@ impl crate::Device for super::Device {
             self.shared
                 .raw
                 .bind_buffer_memory(raw_buffer, allocation.memory(), allocation.offset())
-                .map_err(super::map_host_device_oom_and_ioca_err)
+                .map_err(|e| super::map_host_device_oom_and_ioca_err(e, "vkBindBufferMemory"))
                 .inspect_err(|_| {
                     self.shared.raw.destroy_buffer(raw_buffer, None);
                 })?;
@@ -2870,7 +2890,9 @@ impl crate::Device for super::Device {
             let raw_acceleration_structure = ray_tracing_functions
                 .acceleration_structure
                 .create_acceleration_structure(&vk_info, None)
-                .map_err(super::map_host_oom_and_ioca_err)
+                .map_err(|e| {
+                    super::map_host_oom_and_ioca_err(e, "vkCreateAccelerationStructureKHR")
+                })
                 .inspect_err(|_| {
                     self.shared.raw.destroy_buffer(raw_buffer, None);
                 })?;
@@ -2889,7 +2911,7 @@ impl crate::Device for super::Device {
                     .shared
                     .raw
                     .create_query_pool(&vk_info, None)
-                    .map_err(super::map_host_device_oom_err)
+                    .map_err(|e| super::map_host_device_oom_err(e, "vkCreateQueryPool"))
                     .inspect_err(|_| {
                         ray_tracing_functions
                             .acceleration_structure
@@ -3032,7 +3054,7 @@ impl super::DeviceShared {
             let semaphore = self
                 .raw
                 .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
-                .map_err(super::map_host_device_oom_err)?;
+                .map_err(|e| super::map_host_device_oom_err(e, "vkCreateSemaphore"))?;
 
             self.set_object_name(semaphore, name);
 
@@ -3066,7 +3088,10 @@ impl super::DeviceShared {
                 match result {
                     Ok(()) => Ok(true),
                     Err(vk::Result::TIMEOUT) => Ok(false),
-                    Err(other) => Err(super::map_host_device_oom_and_lost_err(other)),
+                    Err(other) => Err(super::map_host_device_oom_and_lost_err(
+                        other,
+                        "vkWaitSemaphores",
+                    )),
                 }
             }
             super::Fence::FencePool(ref pool) => {
@@ -3093,7 +3118,10 @@ impl super::DeviceShared {
                             } {
                                 Ok(()) => Ok(true),
                                 Err(vk::Result::TIMEOUT) => Ok(false),
-                                Err(other) => Err(super::map_host_device_oom_and_lost_err(other)),
+                                Err(other) => Err(super::map_host_device_oom_and_lost_err(
+                                    other,
+                                    "vkWaitForFences",
+                                )),
                             }
                         }
                         None => {

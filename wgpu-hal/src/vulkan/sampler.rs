@@ -103,7 +103,7 @@ impl SamplerCache {
     ) -> Result<vk::Sampler, crate::DeviceError> {
         if self.passthrough {
             return unsafe { device.create_sampler(&create_info, None) }
-                .map_err(super::map_host_device_oom_and_ioca_err);
+                .map_err(|e| super::map_host_device_oom_and_ioca_err(e, "vkCreateSampler"));
         };
 
         // Get the number of used samplers. Needs to be done before to appease the borrow checker.
@@ -127,7 +127,7 @@ impl SamplerCache {
 
                 // Create the sampler.
                 let sampler = unsafe { device.create_sampler(&create_info, None) }
-                    .map_err(super::map_host_device_oom_and_ioca_err)?;
+                    .map_err(|e| super::map_host_device_oom_and_ioca_err(e, "vkCreateSampler"))?;
 
                 // Insert the new sampler into the mapping.
                 vacant_entry.insert(CacheEntry {

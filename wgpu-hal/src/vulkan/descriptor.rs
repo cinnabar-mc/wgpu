@@ -245,7 +245,12 @@ impl DescriptorAllocator {
                                     vk::Result::ERROR_FRAGMENTED_POOL
                                     | vk::Result::ERROR_OUT_OF_POOL_MEMORY,
                                 ) => {}
-                                Err(err) => return Err(super::map_host_device_oom_err(err)),
+                                Err(err) => {
+                                    return Err(super::map_host_device_oom_err(
+                                        err,
+                                        "vkAllocateDescriptorSets",
+                                    ))
+                                }
                             }
                         }
                     }
@@ -262,7 +267,12 @@ impl DescriptorAllocator {
                         .iter()
                         .position(|pool| !pool.fragmented && pool.available != 0);
                 }
-                Err(err) => return Err(super::map_host_device_oom_err(err)),
+                Err(err) => {
+                    return Err(super::map_host_device_oom_err(
+                        err,
+                        "vkAllocateDescriptorSets",
+                    ))
+                }
             }
         };
 
@@ -416,8 +426,9 @@ fn create_descriptor_pool(
         .max_sets(capacity)
         .pool_sizes(&pool_sizes);
 
-    let raw = unsafe { device.create_descriptor_pool(&vk_info, None) }
-        .map_err(super::map_host_device_oom_and_fragmentation_err)?;
+    let raw = unsafe { device.create_descriptor_pool(&vk_info, None) }.map_err(|e| {
+        super::map_host_device_oom_and_fragmentation_err(e, "vkCreateDescriptorPool")
+    })?;
 
     Ok(Pool {
         raw,
