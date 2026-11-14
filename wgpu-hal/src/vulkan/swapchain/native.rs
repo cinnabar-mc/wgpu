@@ -374,6 +374,7 @@ pub(crate) struct NativeSwapchain {
 impl Drop for NativeSwapchain {
     fn drop(&mut self) {
         unsafe {
+            self.device.release_swapchain_views(&self.images);
             self.functor.destroy_swapchain(self.raw, None);
         }
     }
@@ -398,6 +399,9 @@ impl Swapchain for NativeSwapchain {
         if let Some(fence) = self.fence {
             unsafe { device.shared.raw.destroy_fence(fence, None) }
         }
+
+        // The device is idle, so no pending work uses the views or their framebuffers.
+        unsafe { device.shared.release_swapchain_views(&self.images) };
 
         // We cannot take this by value, as the function returns `self`.
         for semaphore in self.acquire_semaphores.drain(..) {
@@ -544,6 +548,7 @@ impl Swapchain for NativeSwapchain {
                     depth: 1,
                 },
                 identity,
+                swapchain_image: true,
             },
             metadata: Box::new(NativeSurfaceTextureMetadata {
                 acquire_semaphores: acquire_semaphore_arc,

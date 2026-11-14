@@ -263,6 +263,29 @@ fn render_passes_share_device_framebuffers_until_a_view_is_destroyed() {
         device.destroy_texture_view(volume_view);
         device.destroy_texture(volume);
 
+        // A swapchain image gets a new view every acquisition; each hands back the kept view,
+        // so its framebuffer outlives the views, until the swapchain is released.
+        let (mut image, unused) = target(&device, wgt::TextureDimension::D2);
+        device.destroy_texture_view(unused);
+        image.swapchain_image = true;
+        let view_desc = crate::TextureViewDescriptor {
+            label: None,
+            format: wgt::TextureFormat::Rgba8Unorm,
+            dimension: wgt::TextureViewDimension::D2,
+            usage: wgt::TextureUses::COLOR_TARGET,
+            range: wgt::ImageSubresourceRange::default(),
+        };
+        for _ in 0..3 {
+            let acquired = device.create_texture_view(&image, &view_desc).unwrap();
+            render_and_reset(&mut first, &acquired, None);
+            device.destroy_texture_view(acquired);
+        }
+        assert_eq!(counts(), (3, 2), "a swapchain image's pass creates one framebuffer");
+        device.shared.release_swapchain_views(&[image.raw]);
+        assert_eq!(counts(), (3, 3), "releasing the swapchain destroys its framebuffers");
+        image.swapchain_image = false;
+        device.destroy_texture(image);
+
         // Dropping the device destroys framebuffers whose views are still alive.
         let (texture, view) = target(&device, wgt::TextureDimension::D2);
         render_and_reset(&mut first, &view, None);
@@ -278,7 +301,7 @@ fn render_passes_share_device_framebuffers_until_a_view_is_destroyed() {
 
     let created = CREATED.lock().unwrap().clone();
     let mut destroyed = DESTROYED.lock().unwrap().clone();
-    assert_eq!(created.len(), 3);
+    assert_eq!(created.len(), 4);
     let mut created_sorted = created;
     created_sorted.sort_unstable();
     destroyed.sort_unstable();

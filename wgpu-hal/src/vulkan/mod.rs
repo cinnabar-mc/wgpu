@@ -19,6 +19,11 @@ full, render passes use framebuffers owned by their command encoder, destroyed
 when the encoder is reset. Framebuffers attaching the encoder's temporary
 views (slices of 3D textures) are always owned by the encoder.
 
+A swapchain image gets a new texture, and usually a new view, every time it is
+acquired. The device keeps one view per swapchain image and view description
+and hands it back for each of them, so their framebuffers stay cached; the
+views and their framebuffers are destroyed when the swapchain is released.
+
 ## Fences
 
 If timeline semaphores are available, they are used 1:1 with wgpu-hal fences.
@@ -531,6 +536,9 @@ struct DeviceShared {
     features: wgt::Features,
     render_passes: Mutex<FastHashMap<RenderPassKey, vk::RenderPass>>,
     framebuffers: Mutex<framebuffer::FramebufferCache>,
+    /// Views of swapchain images, kept until their swapchain is released so that the
+    /// framebuffers attaching them survive from one acquisition of an image to the next.
+    swapchain_views: Mutex<FastHashMap<SwapchainViewKey, IdentifiedTextureView>>,
     sampler_cache: Mutex<sampler::SamplerCache>,
     /// Held across the calls named by [`Workarounds::SERIALIZE_SHADER_COMPILATION`] on drivers
     /// with unsafe concurrent compiles.
@@ -556,6 +564,9 @@ impl Drop for DeviceShared {
     fn drop(&mut self) {
         for raw in self.framebuffers.get_mut().drain() {
             unsafe { self.raw.destroy_framebuffer(raw, None) };
+        }
+        for (_, view) in self.swapchain_views.get_mut().drain() {
+            unsafe { self.raw.destroy_image_view(view.raw, None) };
         }
         for &raw in self.render_passes.lock().values() {
             unsafe { self.raw.destroy_render_pass(raw, None) };
@@ -839,6 +850,8 @@ pub struct Texture {
     format: wgt::TextureFormat,
     copy_size: crate::CopyExtent,
     identity: ResourceIdentity<vk::Image>,
+    /// Whether this is a swapchain image, whose views [`DeviceShared::swapchain_views`] keeps.
+    swapchain_image: bool,
 
     // The `drop_guard` field must be the last field of this struct so it is dropped last.
     // Do not add new fields after it.
@@ -875,6 +888,8 @@ pub struct TextureView {
     dimension: wgt::TextureViewDimension,
     texture_identity: ResourceIdentity<vk::Image>,
     view_identity: ResourceIdentity<vk::ImageView>,
+    /// Whether [`DeviceShared::swapchain_views`] owns `raw`, so destroying this view leaves it.
+    swapchain_owned: bool,
 }
 
 impl crate::DynTextureView for TextureView {}
@@ -1047,6 +1062,18 @@ impl FramebufferKey {
 struct IdentifiedTextureView {
     raw: vk::ImageView,
     identity: ResourceIdentity<vk::ImageView>,
+}
+
+/// What makes two views of a swapchain image interchangeable.
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+struct SwapchainViewKey {
+    image: vk::Image,
+    view_type: vk::ImageViewType,
+    format: vk::Format,
+    aspect_mask: vk::ImageAspectFlags,
+    mip_levels: (u32, u32),
+    array_layers: (u32, u32),
+    usage: wgt::TextureUses,
 }
 
 #[derive(Clone, Eq, Hash, PartialEq)]
