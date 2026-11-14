@@ -16,6 +16,30 @@ use super::{conv, descriptor::DescriptorCounts, RawTlasInstance};
 use crate::TlasInstance;
 
 impl super::DeviceShared {
+    /// Destroys the kept views of `images` and the framebuffers attaching them.
+    ///
+    /// # Safety
+    ///
+    /// No pending command buffer may use a view of `images`, and no texture view of them may
+    /// be used afterwards.
+    pub(super) unsafe fn release_swapchain_views(&self, images: &[vk::Image]) {
+        let mut released = Vec::new();
+        self.swapchain_views.lock().retain(|key, view| {
+            let keep = !images.contains(&key.image);
+            if !keep {
+                released.push(*view);
+            }
+            keep
+        });
+        for view in released {
+            let framebuffers = self.framebuffers.lock().remove_view(view.identity);
+            for raw in framebuffers {
+                unsafe { self.raw.destroy_framebuffer(raw, None) };
+            }
+            unsafe { self.raw.destroy_image_view(view.raw, None) };
+        }
+    }
+
     /// Creates the framebuffer described by `key`.
     pub(super) fn create_framebuffer(
         &self,
@@ -386,6 +410,7 @@ impl super::Device {
             format: desc.format,
             copy_size: desc.copy_extent(),
             identity,
+            swapchain_image: false,
         }
     }
 
@@ -1348,14 +1373,49 @@ impl crate::Device for super::Device {
             vk_info = vk_info.push_next(&mut image_view_info);
         }
 
-        let raw = unsafe { self.shared.raw.create_image_view(&vk_info, None) }
-            .map_err(|e| super::map_host_device_oom_and_ioca_err(e, "vkCreateImageView"))?;
+        // Swapchain images get a new texture every acquisition and usually a new view with it;
+        // handing back the same view keeps their framebuffers cached.
+        let mut swapchain_views = texture.swapchain_image.then(|| {
+            let key = super::SwapchainViewKey {
+                image: texture.raw,
+                view_type: vk_info.view_type,
+                format: raw_format,
+                aspect_mask: subresource_range.aspect_mask,
+                mip_levels: (
+                    subresource_range.base_mip_level,
+                    subresource_range.level_count,
+                ),
+                array_layers: (
+                    subresource_range.base_array_layer,
+                    subresource_range.layer_count,
+                ),
+                usage: desc.usage,
+            };
+            (key, self.shared.swapchain_views.lock())
+        });
+        let kept = swapchain_views
+            .as_ref()
+            .and_then(|(key, views)| views.get(key).copied());
 
-        if let Some(label) = desc.label {
-            unsafe { self.shared.set_object_name(raw, label) };
-        }
-
-        let identity = self.shared.texture_view_identity_factory.next();
+        let super::IdentifiedTextureView { raw, identity } = match kept {
+            Some(view) => view,
+            None => {
+                let raw = unsafe { self.shared.raw.create_image_view(&vk_info, None) }
+                    .map_err(|e| super::map_host_device_oom_and_ioca_err(e, "vkCreateImageView"))?;
+                if let Some(label) = desc.label {
+                    unsafe { self.shared.set_object_name(raw, label) };
+                }
+                let view = super::IdentifiedTextureView {
+                    raw,
+                    identity: self.shared.texture_view_identity_factory.next(),
+                };
+                if let Some((key, views)) = swapchain_views.as_mut() {
+                    views.insert(*key, view);
+                }
+                view
+            }
+        };
+        drop(swapchain_views);
 
         self.counters.texture_views.add(1);
 
@@ -1369,9 +1429,15 @@ impl crate::Device for super::Device {
             dimension: desc.dimension,
             texture_identity: texture.identity,
             view_identity: identity,
+            swapchain_owned: texture.swapchain_image,
         })
     }
     unsafe fn destroy_texture_view(&self, view: super::TextureView) {
+        if view.swapchain_owned {
+            // Released with its swapchain.
+            self.counters.texture_views.sub(1);
+            return;
+        }
         let framebuffers = self
             .shared
             .framebuffers
