@@ -1,4 +1,4 @@
-use wgpu_test::{fail, gpu_test, GpuTestConfiguration, GpuTestInitializer, TestParameters};
+use wgpu_test::{fail, gpu_test, valid, GpuTestConfiguration, GpuTestInitializer, TestParameters};
 
 pub fn all_tests(vec: &mut Vec<GpuTestInitializer>) {
     vec.extend([
@@ -7,6 +7,7 @@ pub fn all_tests(vec: &mut Vec<GpuTestInitializer>) {
         RENDER_PIPELINE_DEFAULT_LAYOUT_BAD_MODULE,
         RENDER_PIPELINE_DEFAULT_LAYOUT_BAD_BGL_INDEX,
         NO_TARGETLESS_RENDER,
+        RENDER_PIPELINE_FAILED_LATER_STAGE_KEEPS_DEVICE_USABLE,
     ]);
 }
 
@@ -226,3 +227,60 @@ static NO_TARGETLESS_RENDER: GpuTestConfiguration = GpuTestConfiguration::new()
             )),
         )
     });
+
+/// Fail the fragment stage of a render pipeline after its vertex stage compiled, then build
+/// the same pipeline properly.
+///
+/// The fragment stage names a pipeline constant the shader lacks, which only the backend
+/// notices, once it has compiled the vertex stage. Backends that compile a module per stage
+/// (Vulkan) must release what they made for the vertex stage; a validation layer reports the
+/// module as leaked when the device is destroyed. The test itself can only show that the
+/// failure is a validation error and that the device keeps working.
+#[gpu_test]
+static RENDER_PIPELINE_FAILED_LATER_STAGE_KEEPS_DEVICE_USABLE: GpuTestConfiguration =
+    GpuTestConfiguration::new()
+        .parameters(TestParameters::default())
+        .run_sync(|ctx| {
+            let vertex = ctx.device.create_shader_module(TRIVIAL_VERTEX_SHADER_DESC);
+            let fragment = ctx
+                .device
+                .create_shader_module(TRIVIAL_FRAGMENT_SHADER_DESC);
+            let create = |fragment_constants: &[(&str, f64)]| {
+                ctx.device
+                    .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                        label: Some("later stage"),
+                        layout: None,
+                        vertex: wgpu::VertexState {
+                            module: &vertex,
+                            entry_point: Some("main"),
+                            compilation_options: Default::default(),
+                            buffers: &[],
+                        },
+                        primitive: Default::default(),
+                        depth_stencil: None,
+                        multisample: Default::default(),
+                        fragment: Some(wgpu::FragmentState {
+                            module: &fragment,
+                            entry_point: Some("main"),
+                            compilation_options: wgpu::PipelineCompilationOptions {
+                                constants: fragment_constants,
+                                ..Default::default()
+                            },
+                            targets: &[Some(wgpu::TextureFormat::Rgba8Unorm.into())],
+                        }),
+                        multiview_mask: None,
+                        cache: None,
+                    })
+            };
+
+            // Repeated, as an application retrying a pipeline would.
+            for _ in 0..4 {
+                fail(
+                    &ctx.device,
+                    || create(&[("absent", 1.0)]),
+                    Some("pipeline-overridable constant 'absent' not found in the shader"),
+                );
+            }
+
+            valid(&ctx.device, || create(&[]));
+        });
