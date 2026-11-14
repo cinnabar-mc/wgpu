@@ -1970,7 +1970,7 @@ impl Global {
         let device = self.hub.devices.get(device_id);
         wgt::InternalCounters {
             hal: device.get_hal_counters(),
-            core: wgt::CoreCounters {},
+            core: device.counters.clone(),
         }
     }
 

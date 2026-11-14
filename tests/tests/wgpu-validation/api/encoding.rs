@@ -68,3 +68,33 @@ fn encoding_error_contains_label_of_encoder() {
     encoder.copy_buffer_to_buffer(&buffer, 0, &buffer, 0, 10);
     queue.submit([encoder.finish()]);
 }
+
+/// Finishing an encoder counts it and times its passes.
+#[test]
+fn finishing_an_encoder_counts_it_and_times_its_passes() {
+    let (device, queue) = wgpu::Device::noop(&wgpu::DeviceDescriptor::default());
+    let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: None,
+        size: 16,
+        usage: wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
+    let before = device.get_internal_counters().core.encode;
+    let mut encoder = device.create_command_encoder(&Default::default());
+    encoder.clear_buffer(&buffer, 0, None);
+    drop(encoder.begin_compute_pass(&Default::default()));
+    queue.submit([encoder.finish()]);
+    let after = device.get_internal_counters().core.encode;
+
+    let added = |counter: fn(&wgpu::CoreEncodeCounters) -> &wgpu::InternalCounter| {
+        counter(&after).read() - counter(&before).read()
+    };
+    assert_eq!(added(|c| &c.encoders), 1);
+    let finish = added(|c| &c.finish_ns);
+    assert!(finish > 0, "finishing is timed");
+    assert!(
+        added(|c| &c.pass_prepare_ns) + added(|c| &c.pass_replay_ns) <= finish,
+        "the pass phases are part of finishing"
+    );
+}

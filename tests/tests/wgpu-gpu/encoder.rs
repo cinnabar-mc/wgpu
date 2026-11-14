@@ -11,6 +11,7 @@ pub fn all_tests(vec: &mut Vec<GpuTestInitializer>) {
         DROP_QUEUE_BEFORE_CREATING_COMMAND_ENCODER,
         DROP_ENCODER_AFTER_ERROR,
         ENCODER_OPERATIONS_FAIL_WHILE_PASS_ALIVE,
+        VULKAN_ENCODE_COUNTERS,
     ]);
 }
 
@@ -343,3 +344,94 @@ fn encoder_operations_fail_while_pass_alive(ctx: TestingContext) {
         }
     }
 }
+
+/// On Vulkan, the backend counts render passes, framebuffers, copies and barriers, and a pass
+/// repeated in a later submission reuses its framebuffer.
+#[gpu_test]
+static VULKAN_ENCODE_COUNTERS: GpuTestConfiguration = GpuTestConfiguration::new()
+    .parameters(TestParameters::default())
+    .run_async(|ctx| async move {
+        if ctx.adapter_info.backend != wgpu::Backend::Vulkan {
+            return;
+        }
+        let texture = |usage| {
+            ctx.device.create_texture(&wgpu::TextureDescriptor {
+                label: None,
+                size: wgpu::Extent3d {
+                    width: 4,
+                    height: 4,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage,
+                view_formats: &[],
+            })
+        };
+        let target = texture(wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC);
+        let target_view = target.create_view(&Default::default());
+        let copy = texture(wgpu::TextureUsages::COPY_DST);
+
+        let frame = || {
+            let mut encoder = ctx
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+            drop(encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: None,
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &target_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: Default::default(),
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            }));
+            encoder.copy_texture_to_texture(
+                target.as_image_copy(),
+                copy.as_image_copy(),
+                target.size(),
+            );
+            ctx.queue.submit([encoder.finish()]);
+        };
+
+        let before = ctx.device.get_internal_counters().hal.encode;
+        frame();
+        ctx.async_poll(wgpu::PollType::wait_indefinitely())
+            .await
+            .unwrap();
+        frame();
+        ctx.async_poll(wgpu::PollType::wait_indefinitely())
+            .await
+            .unwrap();
+        let after = ctx.device.get_internal_counters().hal.encode;
+
+        let added = |counter: fn(&wgpu::HalEncodeCounters) -> &wgpu::InternalCounter| {
+            counter(&after).read() - counter(&before).read()
+        };
+        assert_eq!(added(|c| &c.render_passes), 2);
+        assert_eq!(
+            added(|c| &c.framebuffers_created),
+            1,
+            "the second frame reuses the first frame's framebuffer"
+        );
+        assert_eq!(added(|c| &c.texture_copies), 2);
+        assert!(added(|c| &c.barriers) >= 2);
+        for timed in [
+            added(|c| &c.render_pass_begin_ns),
+            added(|c| &c.framebuffer_create_ns),
+            added(|c| &c.copy_ns),
+            added(|c| &c.command_buffer_end_ns),
+            added(|c| &c.command_pool_reset_ns),
+        ] {
+            assert!(timed > 0);
+        }
+        assert!(
+            added(|c| &c.render_pass_begin_ns) >= added(|c| &c.framebuffer_create_ns),
+            "beginning a pass includes creating its framebuffer"
+        );
+    });
