@@ -1679,7 +1679,7 @@ enum PipelineCreationError {
 impl PipelineCreationError {
     /// Returns the error for creating the pipeline labelled `label` out of the shader
     /// `stages`. A driver failure becomes [`crate::PipelineError::Linkage`], whose message
-    /// names the command, its `VkResult` and the pipeline.
+    /// names the command, its `VkResult` and the pipeline, and is logged at error level.
     fn into_pipeline_error(
         self,
         stages: wgt::ShaderStages,
@@ -1687,22 +1687,25 @@ impl PipelineCreationError {
     ) -> crate::PipelineError {
         match self {
             Self::Device(error) => crate::PipelineError::Device(error),
-            Self::Driver { call, result } => crate::PipelineError::Linkage(
-                stages,
-                driver_failure_message(call, result, "pipeline", label),
-            ),
+            Self::Driver { call, result } => {
+                let message = driver_failure_message(call, result, "pipeline", label);
+                log::error!("Vulkan: {message} (stages {stages:?})");
+                crate::PipelineError::Linkage(stages, message)
+            }
         }
     }
 
     /// Returns the error for creating the shader module labelled `label`. A driver failure
     /// becomes [`crate::ShaderError::Compilation`], whose message names the command, its
-    /// `VkResult` and the module.
+    /// `VkResult` and the module, and is logged at error level.
     fn into_shader_error(self, label: crate::Label<'_>) -> crate::ShaderError {
         match self {
             Self::Device(error) => crate::ShaderError::Device(error),
-            Self::Driver { call, result } => crate::ShaderError::Compilation(
-                driver_failure_message(call, result, "shader module", label),
-            ),
+            Self::Driver { call, result } => {
+                let message = driver_failure_message(call, result, "shader module", label);
+                log::error!("Vulkan: {message}");
+                crate::ShaderError::Compilation(message)
+            }
         }
     }
 }
@@ -1733,6 +1736,11 @@ fn driver_failure_message(
 /// input. That leaves the device usable, so it becomes [`PipelineCreationError::Driver`]
 /// instead of [`crate::DeviceError::Unexpected`], which would lose the device. Panics on
 /// those codes if the `internal_error_panic` feature flag is enabled.
+///
+/// A GPU that has really faulted may also answer with VK_ERROR_UNKNOWN or
+/// VK_ERROR_INITIALIZATION_FAILED instead of VK_ERROR_DEVICE_LOST. That case is reported as
+/// a failed pipeline too. The device is then lost by a later call that fails, such as the
+/// next queue submission or fence wait.
 fn map_pipeline_err(err: vk::Result, call: &'static str) -> PipelineCreationError {
     match err {
         vk::Result::ERROR_OUT_OF_HOST_MEMORY | vk::Result::ERROR_OUT_OF_DEVICE_MEMORY => {

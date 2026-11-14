@@ -28,10 +28,13 @@ impl super::DeviceShared {
     /// Destroys the temporary modules of `stages`.
     ///
     /// Callers hold [`Self::shader_compilation_guard`], so on drivers that serialize compilation
-    /// the destruction never overlaps another thread's compile.
-    unsafe fn destroy_temp_modules(&self, stages: impl IntoIterator<Item = CompiledStage>) {
-        for module in stages.into_iter().filter_map(|stage| stage.temp_raw_module) {
-            unsafe { self.raw.destroy_shader_module(module, None) };
+    /// the destruction never overlaps another thread's compile. Dropping a [`CompiledStage`]
+    /// instead would take that lock again.
+    unsafe fn destroy_temp_modules<'a>(&self, stages: impl IntoIterator<Item = CompiledStage<'a>>) {
+        for mut stage in stages {
+            if let Some(module) = stage.temp_raw_module.take() {
+                unsafe { self.raw.destroy_shader_module(module, None) };
+            }
         }
     }
 
@@ -268,10 +271,30 @@ impl super::DeviceShared {
     }
 }
 
-struct CompiledStage {
+/// One shader stage of a pipeline that is being created.
+struct CompiledStage<'a> {
     create_info: vk::PipelineShaderStageCreateInfo<'static>,
     _entry_point: CString,
+    /// The module compiled for this stage alone, which only the pipeline creation call needs.
+    /// It is destroyed after that call by [`super::DeviceShared::destroy_temp_modules`], or by
+    /// dropping the stage if the call is never reached.
     temp_raw_module: Option<vk::ShaderModule>,
+    shared: &'a super::DeviceShared,
+}
+
+impl Drop for CompiledStage<'_> {
+    /// Destroys a temporary module that is still owned, which is the case when pipeline
+    /// creation returns early: a later stage failed to compile, or the render pass could not
+    /// be made. The device stays usable after such a failure, so the module would otherwise
+    /// leak on every attempt.
+    ///
+    /// Takes [`super::DeviceShared::shader_compilation_guard`], so the caller must not hold it.
+    fn drop(&mut self) {
+        if let Some(module) = self.temp_raw_module.take() {
+            let _serialized = self.shared.shader_compilation_guard();
+            unsafe { self.shared.raw.destroy_shader_module(module, None) };
+        }
+    }
 }
 
 /// Returns the shader stages that `desc` links into its render pipeline.
@@ -755,7 +778,7 @@ impl super::Device {
         naga_stage: naga::ShaderStage,
         binding_map: &naga::back::spv::BindingMap,
         pipeline_label: crate::Label<'_>,
-    ) -> Result<CompiledStage, crate::PipelineError> {
+    ) -> Result<CompiledStage<'_>, crate::PipelineError> {
         let stage_flags = crate::auxil::map_naga_stage(naga_stage);
         let vk_module = match *stage.module {
             super::ShaderModule::Raw(raw) => raw,
@@ -862,6 +885,7 @@ impl super::Device {
                 super::ShaderModule::Raw(_) => None,
                 super::ShaderModule::Intermediate { .. } => Some(vk_module),
             },
+            shared: &self.shared,
         })
     }
 
