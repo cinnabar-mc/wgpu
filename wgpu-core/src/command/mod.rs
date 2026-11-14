@@ -1077,6 +1077,7 @@ impl CommandEncoder {
         cmd_buf_data: &mut CommandBufferMutable,
     ) -> Result<(), CommandEncoderError> {
         device.check_is_valid()?;
+        let finish_start = wgt::CounterInstant::now();
         let snatch_guard = device.snatchable_lock.read();
         let mut debug_scope_depth = 0;
 
@@ -1312,6 +1313,10 @@ impl CommandEncoder {
 
         // Close the encoder, unless nothing was encoded since it was last closed.
         cmd_buf_data.encoder.close_if_open()?;
+
+        let counters = &device.counters.encode;
+        counters.encoders.add(1);
+        counters.finish_ns.add_elapsed_since(finish_start);
 
         // Note: if we want to stop tracking the swapchain texture view,
         // this is the place to do it.

@@ -925,6 +925,8 @@ pub(super) fn encode_compute_pass(
         ..
     } = state;
 
+    let counters = &device.counters.encode;
+    let prepare_start = wgt::CounterInstant::now();
     let raw = parent_state
         .raw_encoder
         .open_if_closed()
@@ -943,10 +945,14 @@ pub(super) fn encode_compute_pass(
         parent_state.snatch_guard,
     );
 
+    let replay_start = counters.pass_prepare_ns.add_elapsed_since(prepare_start);
+
     // SAFETY: `raw` is open and outside of any pass, which is where the pass
     // was recorded to begin, and everything the recording references is kept
     // alive by the command buffer and the snatch guard.
-    unsafe { recorder.replay(raw) }
+    let replayed = unsafe { recorder.replay(raw) };
+    counters.pass_replay_ns.add_elapsed_since(replay_start);
+    replayed
         .map_err(|e| device.handle_hal_error(e))
         .map_pass_err(pass_scope)?;
 

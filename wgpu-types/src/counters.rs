@@ -81,6 +81,42 @@ impl InternalCounter {
     }
 }
 
+/// A point in time to measure an [`InternalCounter`] duration from.
+///
+/// Reads the clock only with the `counters` and `std` features on a target other than
+/// `wasm32`; otherwise it is empty and every duration is zero.
+#[derive(Clone, Copy, Debug)]
+pub struct CounterInstant {
+    #[cfg(all(feature = "counters", feature = "std", not(target_arch = "wasm32")))]
+    at: std::time::Instant,
+}
+
+impl CounterInstant {
+    /// The current time.
+    #[inline]
+    #[must_use]
+    pub fn now() -> Self {
+        Self {
+            #[cfg(all(feature = "counters", feature = "std", not(target_arch = "wasm32")))]
+            at: std::time::Instant::now(),
+        }
+    }
+}
+
+impl InternalCounter {
+    /// Adds the nanoseconds elapsed since `start` and returns the time it read, so
+    /// consecutive phases cost one clock read each.
+    #[inline]
+    pub fn add_elapsed_since(&self, start: CounterInstant) -> CounterInstant {
+        let now = CounterInstant::now();
+        #[cfg(all(feature = "counters", feature = "std", not(target_arch = "wasm32")))]
+        self.add(isize::try_from(now.at.duration_since(start.at).as_nanos()).unwrap_or(isize::MAX));
+        #[cfg(not(all(feature = "counters", feature = "std", not(target_arch = "wasm32"))))]
+        let _ = start;
+        now
+    }
+}
+
 impl Clone for InternalCounter {
     fn clone(&self) -> Self {
         InternalCounter {
@@ -131,12 +167,69 @@ pub struct HalCounters {
     pub acceleration_structure_memory: InternalCounter,
     /// Number of gpu memory allocations.
     pub memory_allocations: InternalCounter,
+
+    /// Command encoding work.
+    pub encode: HalEncodeCounters,
+}
+
+/// Command encoding work done by a `wgpu-hal` backend, summed since the device was created.
+///
+/// Read two snapshots and subtract them to get the work of an interval, such as one frame.
+/// Fields ending in `_ns` are nanoseconds spent, including the driver calls made. Only the
+/// Vulkan backend sets these.
+#[derive(Clone, Debug, Default)]
+pub struct HalEncodeCounters {
+    /// Render passes begun.
+    pub render_passes: InternalCounter,
+    /// Time beginning render passes, including looking up or creating their render pass and
+    /// framebuffer objects.
+    pub render_pass_begin_ns: InternalCounter,
+    /// Framebuffers created for render passes because none was cached for their attachments.
+    pub framebuffers_created: InternalCounter,
+    /// Time creating those framebuffers, part of `render_pass_begin_ns`.
+    pub framebuffer_create_ns: InternalCounter,
+    /// Texture-to-texture copies encoded.
+    pub texture_copies: InternalCounter,
+    /// Buffer-to-buffer, buffer-to-texture and texture-to-buffer copies encoded.
+    pub other_copies: InternalCounter,
+    /// Time encoding all those copies.
+    pub copy_ns: InternalCounter,
+    /// Buffer and texture barriers encoded.
+    pub barriers: InternalCounter,
+    /// Time encoding barriers.
+    pub barrier_ns: InternalCounter,
+    /// Time ending command buffers.
+    pub command_buffer_end_ns: InternalCounter,
+    /// Time resetting the command pools of finished command encoders for reuse, including
+    /// destroying the framebuffers they owned.
+    pub command_pool_reset_ns: InternalCounter,
 }
 
 /// `wgpu-core`'s part of [`InternalCounters`].
 #[derive(Clone, Debug, Default)]
 pub struct CoreCounters {
-    // TODO    #[cfg(features=)]
+    /// Command encoding work.
+    pub encode: CoreEncodeCounters,
+}
+
+/// Work done by `wgpu-core` to finish command encoders, summed since the device was created.
+///
+/// Finishing an encoder validates the commands recorded into it and encodes them into the
+/// backend. Read two snapshots and subtract them to get the work of an interval, such as one
+/// frame. Fields ending in `_ns` are nanoseconds spent.
+#[derive(Clone, Debug, Default)]
+pub struct CoreEncodeCounters {
+    /// Command encoders finished.
+    pub encoders: InternalCounter,
+    /// Time finishing command encoders, including the two pass phases below.
+    pub finish_ns: InternalCounter,
+    /// Time encoding what must precede each pass: discarded-surface fixups, query resets,
+    /// merging the pass's resource usage into the encoder's tracker, the resulting barriers
+    /// and indirect draw validation.
+    pub pass_prepare_ns: InternalCounter,
+    /// Time replaying recorded passes into the backend, from the start to the end of each
+    /// pass.
+    pub pass_replay_ns: InternalCounter,
 }
 
 /// All internal counters, exposed for debugging purposes.

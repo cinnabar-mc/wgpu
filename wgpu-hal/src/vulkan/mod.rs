@@ -12,10 +12,12 @@ We cope with this requirement by the combination of the following ways:
 
 Render passes are cached on the device and kept forever.
 
-Framebuffers are also cached on the device, but they are removed when
-any of the image views (they have) gets removed.
-If Vulkan supports image-less framebuffers,
-then the actual views are excluded from the framebuffer key.
+Framebuffers are also cached on the device, keyed by render pass, attached
+views and extent. A framebuffer is destroyed with the first of its views, so
+the cache only holds framebuffers of live views; it is also bounded, and once
+full, render passes use framebuffers owned by their command encoder, destroyed
+when the encoder is reset. Framebuffers attaching the encoder's temporary
+views (slices of 3D textures) are always owned by the encoder.
 
 ## Fences
 
@@ -34,6 +36,9 @@ mod device;
 mod drm;
 #[cfg(test)]
 mod error_mapping_tests;
+mod framebuffer;
+#[cfg(test)]
+mod framebuffer_cache_tests;
 mod instance;
 #[cfg(test)]
 mod pipeline_error_tests;
@@ -538,14 +543,15 @@ struct DeviceShared {
     workarounds: Workarounds,
     features: wgt::Features,
     render_passes: Mutex<FastHashMap<RenderPassKey, vk::RenderPass>>,
+    framebuffers: Mutex<framebuffer::FramebufferCache>,
     sampler_cache: Mutex<sampler::SamplerCache>,
     /// Held across the calls named by [`Workarounds::SERIALIZE_SHADER_COMPILATION`] on drivers
     /// with unsafe concurrent compiles.
     shader_compilation: Mutex<()>,
     memory_allocations_counter: InternalCounter,
 
-    /// Because we have cached framebuffers which are not deleted from until
-    /// the device is destroyed, if the implementation of vulkan re-uses handles
+    /// Because we have cached framebuffers which outlive command encoders,
+    /// if the implementation of vulkan re-uses handles
     /// we need some way to differentiate between the old handle and the new handle.
     /// This factory allows us to have a dedicated identity value for each texture.
     texture_identity_factory: ResourceIdentityFactory<vk::Image>,
@@ -561,6 +567,9 @@ struct DeviceShared {
 
 impl Drop for DeviceShared {
     fn drop(&mut self) {
+        for raw in self.framebuffers.get_mut().drain() {
+            unsafe { self.raw.destroy_framebuffer(raw, None) };
+        }
         for &raw in self.render_passes.lock().values() {
             unsafe { self.raw.destroy_render_pass(raw, None) };
         }
@@ -1103,6 +1112,8 @@ pub struct CommandEncoder {
     /// the given pool & location.
     end_of_pass_timer_query: Option<(vk::QueryPool, u32)>,
 
+    /// Framebuffers this encoder owns until it is reset: those attaching its
+    /// temporary views, and those the full device cache did not take.
     framebuffers: FastHashMap<FramebufferKey, vk::Framebuffer>,
     temp_texture_views: FastHashMap<TempTextureViewKey, IdentifiedTextureView>,
 

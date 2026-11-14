@@ -275,6 +275,9 @@ pub struct Device {
     /// Queue-write staging buffers ready for reuse.
     pub(crate) staging_buffers: Mutex<resource::StagingBufferPool>,
     pub(crate) usage_scopes: UsageScopePool,
+
+    /// Work counters reported by `Device::get_internal_counters`.
+    pub(crate) counters: wgt::CoreCounters,
     pub(crate) indirect_validation: Option<crate::indirect_validation::IndirectValidation>,
     // Optional so that we can late-initialize this after the queue is created.
     pub(crate) timestamp_normalizer:
@@ -565,6 +568,7 @@ impl Device {
             deferred_destroy: Mutex::new(rank::DEVICE_DEFERRED_DESTROY, Vec::new()),
             staging_buffers: Mutex::new(rank::STAGING_BUFFER_POOL, Default::default()),
             usage_scopes: Mutex::new(rank::DEVICE_USAGE_SCOPES, Default::default()),
+            counters: Default::default(),
             timestamp_normalizer: OnceCellOrLock::new(),
             indirect_validation,
         })
