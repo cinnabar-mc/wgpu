@@ -16,6 +16,21 @@ use super::{conv, descriptor::DescriptorCounts, RawTlasInstance};
 use crate::TlasInstance;
 
 impl super::DeviceShared {
+    /// Creates the framebuffer described by `key`.
+    pub(super) fn create_framebuffer(
+        &self,
+        key: &super::FramebufferKey,
+    ) -> Result<vk::Framebuffer, crate::DeviceError> {
+        let vk_info = vk::FramebufferCreateInfo::default()
+            .render_pass(key.raw_pass)
+            .width(key.extent.width)
+            .height(key.extent.height)
+            .layers(key.extent.depth_or_array_layers)
+            .attachments(&key.attachment_views);
+        unsafe { self.raw.create_framebuffer(&vk_info, None) }
+            .map_err(super::map_host_device_oom_err)
+    }
+
     /// Locks shader compilation for this device when the driver cannot compile concurrently.
     ///
     /// Hold the guard across shader-module or pipeline creation; it is `None` on other drivers.
@@ -1322,6 +1337,14 @@ impl crate::Device for super::Device {
         })
     }
     unsafe fn destroy_texture_view(&self, view: super::TextureView) {
+        let framebuffers = self
+            .shared
+            .framebuffers
+            .lock()
+            .remove_view(view.view_identity);
+        for raw in framebuffers {
+            unsafe { self.shared.raw.destroy_framebuffer(raw, None) };
+        }
         unsafe { self.shared.raw.destroy_image_view(view.raw, None) };
 
         self.counters.texture_views.sub(1);

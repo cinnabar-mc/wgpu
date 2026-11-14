@@ -52,28 +52,31 @@ impl super::CommandEncoder {
         }
     }
 
+    /// The framebuffer for `key`, from the device's cache when `shareable`, otherwise or when
+    /// that cache is full from this encoder's own, creating it if needed.
+    ///
+    /// Framebuffers attaching this encoder's temporary views are not `shareable`: those views
+    /// are destroyed when the encoder is reset.
     fn make_framebuffer(
         &mut self,
         key: super::FramebufferKey,
+        shareable: bool,
     ) -> Result<vk::Framebuffer, crate::DeviceError> {
+        if shareable {
+            let mut cache = self.device.framebuffers.lock();
+            if let Some(raw) = cache.get(&key) {
+                return Ok(raw);
+            }
+            if !cache.is_full() {
+                let raw = self.device.create_framebuffer(&key)?;
+                cache.insert(key, raw);
+                return Ok(raw);
+            }
+        }
         Ok(match self.framebuffers.entry(key) {
             Entry::Occupied(e) => *e.get(),
             Entry::Vacant(e) => {
-                let super::FramebufferKey {
-                    raw_pass,
-                    ref attachment_views,
-                    attachment_identities: _,
-                    extent,
-                } = *e.key();
-
-                let vk_info = vk::FramebufferCreateInfo::default()
-                    .render_pass(raw_pass)
-                    .width(extent.width)
-                    .height(extent.height)
-                    .layers(extent.depth_or_array_layers)
-                    .attachments(attachment_views);
-
-                let raw = unsafe { self.device.raw.create_framebuffer(&vk_info, None).unwrap() };
+                let raw = self.device.create_framebuffer(e.key())?;
                 *e.insert(raw)
             }
         })
@@ -181,7 +184,7 @@ impl crate::CommandEncoder for super::CommandEncoder {
         self.free
             .extend(cmd_bufs.into_iter().map(|cmd_buf| cmd_buf.raw));
         self.free.append(&mut self.discarded);
-        // Delete framebuffers from the framebuffer cache
+        // Delete the framebuffers this encoder owns; the device's cache keeps its own.
         for (_, framebuffer) in self.framebuffers.drain() {
             unsafe { self.device.raw.destroy_framebuffer(framebuffer, None) };
         }
@@ -798,9 +801,12 @@ impl crate::CommandEncoder for super::CommandEncoder {
             extent: desc.extent,
         };
 
+        let mut shareable_framebuffer = true;
+
         for cat in desc.color_attachments {
             if let Some(cat) = cat.as_ref() {
                 let color_view = if cat.target.view.dimension == wgt::TextureViewDimension::D3 {
+                    shareable_framebuffer = false;
                     let key = super::TempTextureViewKey {
                         texture: cat.target.view.raw_texture,
                         texture_identity: cat.target.view.texture_identity,
@@ -867,7 +873,7 @@ impl crate::CommandEncoder for super::CommandEncoder {
 
         let raw_pass = self.device.make_render_pass(rp_key).unwrap();
         fb_key.raw_pass = raw_pass;
-        let raw_framebuffer = self.make_framebuffer(fb_key).unwrap();
+        let raw_framebuffer = self.make_framebuffer(fb_key, shareable_framebuffer)?;
 
         let vk_info = vk::RenderPassBeginInfo::default()
             .render_pass(raw_pass)
