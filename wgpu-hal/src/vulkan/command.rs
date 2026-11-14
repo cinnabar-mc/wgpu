@@ -52,31 +52,50 @@ impl super::CommandEncoder {
         }
     }
 
+    /// The framebuffer for `key`, from the device's cache when `shareable`, otherwise or when
+    /// that cache is full from this encoder's own, creating it if needed.
+    ///
+    /// Framebuffers attaching this encoder's temporary views are not `shareable`: those views
+    /// are destroyed when the encoder is reset.
     fn make_framebuffer(
         &mut self,
         key: super::FramebufferKey,
+        shareable: bool,
     ) -> Result<vk::Framebuffer, crate::DeviceError> {
+        if shareable {
+            let mut cache = self.device.framebuffers.lock();
+            if let Some(raw) = cache.get(&key) {
+                return Ok(raw);
+            }
+            if !cache.is_full() {
+                let raw = Self::count_framebuffer(&self.counters, &self.device, &key)?;
+                cache.insert(key, raw);
+                return Ok(raw);
+            }
+        }
         Ok(match self.framebuffers.entry(key) {
             Entry::Occupied(e) => *e.get(),
             Entry::Vacant(e) => {
-                let super::FramebufferKey {
-                    raw_pass,
-                    ref attachment_views,
-                    attachment_identities: _,
-                    extent,
-                } = *e.key();
-
-                let vk_info = vk::FramebufferCreateInfo::default()
-                    .render_pass(raw_pass)
-                    .width(extent.width)
-                    .height(extent.height)
-                    .layers(extent.depth_or_array_layers)
-                    .attachments(attachment_views);
-
-                let raw = unsafe { self.device.raw.create_framebuffer(&vk_info, None).unwrap() };
+                let raw = Self::count_framebuffer(&self.counters, &self.device, e.key())?;
                 *e.insert(raw)
             }
         })
+    }
+
+    /// Creates the framebuffer for `key`, counting it and its time in `counters`.
+    fn count_framebuffer(
+        counters: &wgt::HalCounters,
+        device: &super::DeviceShared,
+        key: &super::FramebufferKey,
+    ) -> Result<vk::Framebuffer, crate::DeviceError> {
+        let start = wgt::CounterInstant::now();
+        let raw = device.create_framebuffer(key)?;
+        counters.encode.framebuffers_created.add(1);
+        counters
+            .encode
+            .framebuffer_create_ns
+            .add_elapsed_since(start);
+        Ok(raw)
     }
 
     fn make_temp_texture_view(
@@ -152,9 +171,15 @@ impl crate::CommandEncoder for super::CommandEncoder {
     }
 
     unsafe fn end_encoding(&mut self) -> Result<super::CommandBuffer, crate::DeviceError> {
+        let start = wgt::CounterInstant::now();
         let raw = self.active;
         self.active = vk::CommandBuffer::null();
-        unsafe { self.device.raw.end_command_buffer(raw) }.map_err(map_err)?;
+        let ended = unsafe { self.device.raw.end_command_buffer(raw) };
+        self.counters
+            .encode
+            .command_buffer_end_ns
+            .add_elapsed_since(start);
+        ended.map_err(map_err)?;
         fn map_err(err: vk::Result) -> crate::DeviceError {
             // We don't use VK_KHR_video_encode_queue
             // VK_ERROR_INVALID_VIDEO_STD_PARAMETERS_KHR
@@ -177,11 +202,12 @@ impl crate::CommandEncoder for super::CommandEncoder {
     where
         I: Iterator<Item = super::CommandBuffer>,
     {
+        let start = wgt::CounterInstant::now();
         self.temp.clear();
         self.free
             .extend(cmd_bufs.into_iter().map(|cmd_buf| cmd_buf.raw));
         self.free.append(&mut self.discarded);
-        // Delete framebuffers from the framebuffer cache
+        // Delete the framebuffers this encoder owns; the device's cache keeps its own.
         for (_, framebuffer) in self.framebuffers.drain() {
             unsafe { self.device.raw.destroy_framebuffer(framebuffer, None) };
         }
@@ -190,6 +216,10 @@ impl crate::CommandEncoder for super::CommandEncoder {
                 .raw
                 .reset_command_pool(self.raw, vk::CommandPoolResetFlags::default())
         };
+        self.counters
+            .encode
+            .command_pool_reset_ns
+            .add_elapsed_since(start);
     }
 
     unsafe fn transition_buffers<'a, T>(&mut self, barriers: T)
@@ -218,6 +248,7 @@ impl crate::CommandEncoder for super::CommandEncoder {
         }
 
         if !vk_barriers.is_empty() {
+            let start = wgt::CounterInstant::now();
             unsafe {
                 self.device.raw.cmd_pipeline_barrier(
                     self.active,
@@ -229,6 +260,11 @@ impl crate::CommandEncoder for super::CommandEncoder {
                     &[],
                 )
             };
+            self.counters
+                .encode
+                .barriers
+                .add(vk_barriers.len() as isize);
+            self.counters.encode.barrier_ns.add_elapsed_since(start);
         }
     }
 
@@ -266,6 +302,7 @@ impl crate::CommandEncoder for super::CommandEncoder {
         }
 
         if !vk_barriers.is_empty() {
+            let start = wgt::CounterInstant::now();
             unsafe {
                 self.device.raw.cmd_pipeline_barrier(
                     self.active,
@@ -277,6 +314,11 @@ impl crate::CommandEncoder for super::CommandEncoder {
                     vk_barriers,
                 )
             };
+            self.counters
+                .encode
+                .barriers
+                .add(vk_barriers.len() as isize);
+            self.counters.encode.barrier_ns.add_elapsed_since(start);
         }
     }
 
@@ -335,6 +377,7 @@ impl crate::CommandEncoder for super::CommandEncoder {
             size: r.size.get(),
         });
 
+        let start = wgt::CounterInstant::now();
         unsafe {
             self.device.raw.cmd_copy_buffer(
                 self.active,
@@ -343,6 +386,8 @@ impl crate::CommandEncoder for super::CommandEncoder {
                 &smallvec::SmallVec::<[vk::BufferCopy; 32]>::from_iter(vk_regions_iter),
             )
         };
+        self.counters.encode.other_copies.add(1);
+        self.counters.encode.copy_ns.add_elapsed_since(start);
     }
 
     unsafe fn copy_texture_to_texture<T>(
@@ -372,6 +417,7 @@ impl crate::CommandEncoder for super::CommandEncoder {
             }
         });
 
+        let start = wgt::CounterInstant::now();
         unsafe {
             self.device.raw.cmd_copy_image(
                 self.active,
@@ -382,6 +428,8 @@ impl crate::CommandEncoder for super::CommandEncoder {
                 &smallvec::SmallVec::<[vk::ImageCopy; 32]>::from_iter(vk_regions_iter),
             )
         };
+        self.counters.encode.texture_copies.add(1);
+        self.counters.encode.copy_ns.add_elapsed_since(start);
     }
 
     unsafe fn copy_buffer_to_texture<T>(
@@ -394,6 +442,7 @@ impl crate::CommandEncoder for super::CommandEncoder {
     {
         let vk_regions_iter = dst.map_buffer_copies(regions);
 
+        let start = wgt::CounterInstant::now();
         unsafe {
             self.device.raw.cmd_copy_buffer_to_image(
                 self.active,
@@ -403,6 +452,8 @@ impl crate::CommandEncoder for super::CommandEncoder {
                 &smallvec::SmallVec::<[vk::BufferImageCopy; 32]>::from_iter(vk_regions_iter),
             )
         };
+        self.counters.encode.other_copies.add(1);
+        self.counters.encode.copy_ns.add_elapsed_since(start);
     }
 
     unsafe fn copy_texture_to_buffer<T>(
@@ -417,6 +468,7 @@ impl crate::CommandEncoder for super::CommandEncoder {
         let src_layout = conv::derive_image_layout(src_usage, src.format);
         let vk_regions_iter = src.map_buffer_copies(regions);
 
+        let start = wgt::CounterInstant::now();
         unsafe {
             self.device.raw.cmd_copy_image_to_buffer(
                 self.active,
@@ -426,6 +478,8 @@ impl crate::CommandEncoder for super::CommandEncoder {
                 &smallvec::SmallVec::<[vk::BufferImageCopy; 32]>::from_iter(vk_regions_iter),
             )
         };
+        self.counters.encode.other_copies.add(1);
+        self.counters.encode.copy_ns.add_elapsed_since(start);
     }
 
     unsafe fn begin_query(&mut self, set: &super::QuerySet, index: u32) {
@@ -783,6 +837,7 @@ impl crate::CommandEncoder for super::CommandEncoder {
         &mut self,
         desc: &crate::RenderPassDescriptor<super::QuerySet, super::TextureView>,
     ) -> Result<(), crate::DeviceError> {
+        let start = wgt::CounterInstant::now();
         let mut vk_clear_values =
             ArrayVec::<vk::ClearValue, { super::MAX_TOTAL_ATTACHMENTS }>::new();
         let mut rp_key = super::RenderPassKey {
@@ -798,9 +853,12 @@ impl crate::CommandEncoder for super::CommandEncoder {
             extent: desc.extent,
         };
 
+        let mut shareable_framebuffer = true;
+
         for cat in desc.color_attachments {
             if let Some(cat) = cat.as_ref() {
                 let color_view = if cat.target.view.dimension == wgt::TextureViewDimension::D3 {
+                    shareable_framebuffer = false;
                     let key = super::TempTextureViewKey {
                         texture: cat.target.view.raw_texture,
                         texture_identity: cat.target.view.texture_identity,
@@ -867,7 +925,7 @@ impl crate::CommandEncoder for super::CommandEncoder {
 
         let raw_pass = self.device.make_render_pass(rp_key).unwrap();
         fb_key.raw_pass = raw_pass;
-        let raw_framebuffer = self.make_framebuffer(fb_key).unwrap();
+        let raw_framebuffer = self.make_framebuffer(fb_key, shareable_framebuffer)?;
 
         let vk_info = vk::RenderPassBeginInfo::default()
             .render_pass(raw_pass)
@@ -907,6 +965,11 @@ impl crate::CommandEncoder for super::CommandEncoder {
         };
 
         self.bind_point = vk::PipelineBindPoint::GRAPHICS;
+        self.counters.encode.render_passes.add(1);
+        self.counters
+            .encode
+            .render_pass_begin_ns
+            .add_elapsed_since(start);
 
         Ok(())
     }

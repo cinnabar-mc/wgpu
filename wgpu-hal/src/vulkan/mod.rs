@@ -12,10 +12,17 @@ We cope with this requirement by the combination of the following ways:
 
 Render passes are cached on the device and kept forever.
 
-Framebuffers are also cached on the device, but they are removed when
-any of the image views (they have) gets removed.
-If Vulkan supports image-less framebuffers,
-then the actual views are excluded from the framebuffer key.
+Framebuffers are also cached on the device, keyed by render pass, attached
+views and extent. A framebuffer is destroyed with the first of its views, so
+the cache only holds framebuffers of live views; it is also bounded, and once
+full, render passes use framebuffers owned by their command encoder, destroyed
+when the encoder is reset. Framebuffers attaching the encoder's temporary
+views (slices of 3D textures) are always owned by the encoder.
+
+A swapchain image gets a new texture, and usually a new view, every time it is
+acquired. The device keeps one view per swapchain image and view description
+and hands it back for each of them, so their framebuffers stay cached; the
+views and their framebuffers are destroyed when the swapchain is released.
 
 ## Fences
 
@@ -32,6 +39,9 @@ pub mod conv;
 mod descriptor;
 mod device;
 mod drm;
+mod framebuffer;
+#[cfg(test)]
+mod framebuffer_cache_tests;
 mod instance;
 mod sampler;
 mod semaphore_list;
@@ -525,14 +535,18 @@ struct DeviceShared {
     workarounds: Workarounds,
     features: wgt::Features,
     render_passes: Mutex<FastHashMap<RenderPassKey, vk::RenderPass>>,
+    framebuffers: Mutex<framebuffer::FramebufferCache>,
+    /// Views of swapchain images, kept until their swapchain is released so that the
+    /// framebuffers attaching them survive from one acquisition of an image to the next.
+    swapchain_views: Mutex<FastHashMap<SwapchainViewKey, IdentifiedTextureView>>,
     sampler_cache: Mutex<sampler::SamplerCache>,
     /// Held across the calls named by [`Workarounds::SERIALIZE_SHADER_COMPILATION`] on drivers
     /// with unsafe concurrent compiles.
     shader_compilation: Mutex<()>,
     memory_allocations_counter: InternalCounter,
 
-    /// Because we have cached framebuffers which are not deleted from until
-    /// the device is destroyed, if the implementation of vulkan re-uses handles
+    /// Because we have cached framebuffers which outlive command encoders,
+    /// if the implementation of vulkan re-uses handles
     /// we need some way to differentiate between the old handle and the new handle.
     /// This factory allows us to have a dedicated identity value for each texture.
     texture_identity_factory: ResourceIdentityFactory<vk::Image>,
@@ -548,6 +562,12 @@ struct DeviceShared {
 
 impl Drop for DeviceShared {
     fn drop(&mut self) {
+        for raw in self.framebuffers.get_mut().drain() {
+            unsafe { self.raw.destroy_framebuffer(raw, None) };
+        }
+        for (_, view) in self.swapchain_views.get_mut().drain() {
+            unsafe { self.raw.destroy_image_view(view.raw, None) };
+        }
         for &raw in self.render_passes.lock().values() {
             unsafe { self.raw.destroy_render_pass(raw, None) };
         }
@@ -830,6 +850,8 @@ pub struct Texture {
     format: wgt::TextureFormat,
     copy_size: crate::CopyExtent,
     identity: ResourceIdentity<vk::Image>,
+    /// Whether this is a swapchain image, whose views [`DeviceShared::swapchain_views`] keeps.
+    swapchain_image: bool,
 
     // The `drop_guard` field must be the last field of this struct so it is dropped last.
     // Do not add new fields after it.
@@ -866,6 +888,8 @@ pub struct TextureView {
     dimension: wgt::TextureViewDimension,
     texture_identity: ResourceIdentity<vk::Image>,
     view_identity: ResourceIdentity<vk::ImageView>,
+    /// Whether [`DeviceShared::swapchain_views`] owns `raw`, so destroying this view leaves it.
+    swapchain_owned: bool,
 }
 
 impl crate::DynTextureView for TextureView {}
@@ -1040,6 +1064,18 @@ struct IdentifiedTextureView {
     identity: ResourceIdentity<vk::ImageView>,
 }
 
+/// What makes two views of a swapchain image interchangeable.
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+struct SwapchainViewKey {
+    image: vk::Image,
+    view_type: vk::ImageViewType,
+    format: vk::Format,
+    aspect_mask: vk::ImageAspectFlags,
+    mip_levels: (u32, u32),
+    array_layers: (u32, u32),
+    usage: wgt::TextureUses,
+}
+
 #[derive(Clone, Eq, Hash, PartialEq)]
 struct TempTextureViewKey {
     texture: vk::Image,
@@ -1090,6 +1126,8 @@ pub struct CommandEncoder {
     /// the given pool & location.
     end_of_pass_timer_query: Option<(vk::QueryPool, u32)>,
 
+    /// Framebuffers this encoder owns until it is reset: those attaching its
+    /// temporary views, and those the full device cache did not take.
     framebuffers: FastHashMap<FramebufferKey, vk::Framebuffer>,
     temp_texture_views: FastHashMap<TempTextureViewKey, IdentifiedTextureView>,
 
