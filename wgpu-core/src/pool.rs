@@ -38,7 +38,8 @@ impl<K: Clone + Eq + Hash, V> ResourcePool<K, V> {
         'race: loop {
             let mut map_guard = self.inner.lock();
 
-            let entry = match map_guard.entry(key.clone().unwrap()) {
+            let slot_key = key.clone().unwrap();
+            let entry = match map_guard.entry(slot_key.clone()) {
                 // An entry exists for this resource.
                 //
                 // We know that either:
@@ -60,12 +61,25 @@ impl<K: Clone + Eq + Hash, V> ResourcePool<K, V> {
             //
             // We pass the strong reference outside of the closure to keep it alive while we're the only one keeping a reference to it.
             let mut strong = None;
-            let weak = entry.get_or_try_init(|| {
+            let weak = match entry.get_or_try_init(|| {
                 let strong_inner = constructor.take().unwrap()(key.take().unwrap())?;
                 let weak = Arc::downgrade(&strong_inner);
                 strong = Some(strong_inner);
                 Ok(weak)
-            })?;
+            }) {
+                Ok(weak) => weak,
+                Err(error) => {
+                    // Drop the empty slot unless another caller already holds it and may still
+                    // initialize it; slots are only cloned under the lock.
+                    let mut map_guard = self.inner.lock();
+                    if map_guard.get(&slot_key).is_some_and(|slot| {
+                        Arc::ptr_eq(slot, &entry) && Arc::strong_count(&entry) == 2
+                    }) {
+                        map_guard.remove(&slot_key);
+                    }
+                    return Err(error);
+                }
+            };
 
             // If strong is Some, that means we just initialized the entry, so we can just return it.
             if let Some(strong) = strong {
@@ -112,6 +126,17 @@ mod tests {
     use std::{eprintln, sync::Barrier, thread};
 
     use super::*;
+
+    #[test]
+    fn failed_construction_leaves_no_slot() {
+        let pool = ResourcePool::<u32, u32>::new();
+        assert_eq!(pool.get_or_init(0, |_| Err(())), Err(()));
+        assert!(pool.inner.lock().is_empty());
+        let arc = pool
+            .get_or_init::<_, ()>(0, |key| Ok(Arc::new(key)))
+            .unwrap();
+        assert_eq!(*arc, 0);
+    }
 
     #[test]
     fn deduplication() {

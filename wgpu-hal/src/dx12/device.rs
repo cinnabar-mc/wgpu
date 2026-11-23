@@ -862,20 +862,21 @@ impl crate::Device for super::Device {
             num_views += 1;
         }
 
+        let cpu_heap_views = if num_views != 0 {
+            Some(descriptor::CpuHeap::new(
+                &self.raw,
+                Direct3D12::D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                num_views,
+            )?)
+        } else {
+            None
+        };
+
         self.counters.bind_group_layouts.add(1);
 
         Ok(super::BindGroupLayout {
             entries: desc.entries.to_vec(),
-            cpu_heap_views: if num_views != 0 {
-                let heap = descriptor::CpuHeap::new(
-                    &self.raw,
-                    Direct3D12::D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                    num_views,
-                )?;
-                Some(heap)
-            } else {
-                None
-            },
+            cpu_heap_views,
             copy_counts: vec![1; num_views as usize],
         })
     }
@@ -1780,7 +1781,13 @@ impl crate::Device for super::Device {
                 suballocation::DeviceAllocationContext::from(self).create_buffer(&buffer_desc)?;
 
             let mut mapping = ptr::null_mut::<ffi::c_void>();
-            unsafe { buffer.Map(0, None, Some(&mut mapping)) }.into_device_result("Map")?;
+            if let Err(err) =
+                unsafe { buffer.Map(0, None, Some(&mut mapping)) }.into_device_result("Map")
+            {
+                suballocation::DeviceAllocationContext::from(self)
+                    .free_resource(buffer, allocation);
+                return Err(err);
+            }
 
             assert!(!mapping.is_null());
             assert_eq!(mapping as usize % 4, 0);
@@ -1828,15 +1835,24 @@ impl crate::Device for super::Device {
 
         let handle_views = match cpu_views {
             Some(inner) => {
-                let dual = unsafe {
+                let upload = unsafe {
                     descriptor::upload(
                         &self.raw,
                         &inner,
                         &self.shared.heap_views,
                         &desc.layout.copy_counts,
                     )
-                }?;
-                Some(dual)
+                };
+                match upload {
+                    Ok(dual) => Some(dual),
+                    Err(err) => {
+                        if let Some(sampler_buffer) = sampler_index_buffer {
+                            suballocation::DeviceAllocationContext::from(self)
+                                .free_resource(sampler_buffer.buffer, sampler_buffer.allocation);
+                        }
+                        return Err(err);
+                    }
+                }
             }
             None => None,
         };
