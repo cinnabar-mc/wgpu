@@ -69,11 +69,16 @@ impl<K: Clone + Eq + Hash, V> ResourcePool<K, V> {
             }) {
                 Ok(weak) => weak,
                 Err(error) => {
-                    // Drop the empty slot unless another caller already holds it and may still
-                    // initialize it; slots are only cloned under the lock.
+                    // Every failing caller drops its clone before locking, and clones are only
+                    // taken under the lock, so the last one to lock sees the map's copy alone.
+                    // A slot another caller has since initialized stays.
+                    let slot = Arc::downgrade(&entry);
+                    drop(entry);
                     let mut map_guard = self.inner.lock();
-                    if map_guard.get(&slot_key).is_some_and(|slot| {
-                        Arc::ptr_eq(slot, &entry) && Arc::strong_count(&entry) == 2
+                    if map_guard.get(&slot_key).is_some_and(|current| {
+                        Weak::ptr_eq(&slot, &Arc::downgrade(current))
+                            && Arc::strong_count(current) == 1
+                            && current.get().is_none()
                     }) {
                         map_guard.remove(&slot_key);
                     }
@@ -136,6 +141,33 @@ mod tests {
             .get_or_init::<_, ()>(0, |key| Ok(Arc::new(key)))
             .unwrap();
         assert_eq!(*arc, 0);
+    }
+
+    #[test]
+    fn two_failed_constructions_leave_no_slot() {
+        let pool = Arc::new(ResourcePool::<u32, u32>::new());
+        let slot_holders =
+            |pool: &ResourcePool<u32, u32>| pool.inner.lock().get(&0).map_or(0, Arc::strong_count);
+        let second = {
+            let pool = Arc::clone(&pool);
+            thread::spawn(move || {
+                // Wait until the first caller is constructing, then join the same slot.
+                while slot_holders(&pool) < 2 {
+                    thread::yield_now();
+                }
+                pool.get_or_init(0, |_| Err(()))
+            })
+        };
+        let first = pool.get_or_init(0, |_| {
+            // Fail only once both callers hold the slot: the map, this caller and the second.
+            while slot_holders(&pool) < 3 {
+                thread::yield_now();
+            }
+            Err(())
+        });
+        assert_eq!(first, Err(()));
+        assert_eq!(second.join().unwrap(), Err(()));
+        assert!(pool.inner.lock().is_empty());
     }
 
     #[test]
