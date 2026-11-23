@@ -706,21 +706,17 @@ impl Device {
     }
 
     pub fn handle_hal_error(&self, error: hal::DeviceError) -> DeviceError {
-        match error {
-            hal::DeviceError::OutOfMemory
-            | hal::DeviceError::Lost
-            | hal::DeviceError::Unexpected => {
-                self.lose(&error.to_string());
-            }
+        if hal_error_loses_device(&error, false) {
+            self.lose(&error.to_string());
         }
         DeviceError::from_hal(error)
     }
 
     pub fn handle_hal_error_with_nonfatal_oom(&self, error: hal::DeviceError) -> DeviceError {
-        match error {
-            hal::DeviceError::OutOfMemory => DeviceError::from_hal(error),
-            error => self.handle_hal_error(error),
+        if hal_error_loses_device(&error, true) {
+            self.lose(&error.to_string());
         }
+        DeviceError::from_hal(error)
     }
 
     /// Run some destroy operations that were deferred.
@@ -2966,7 +2962,7 @@ impl Device {
         count_validator.validate_binding_arrays()?;
 
         let raw = unsafe { self.raw().create_bind_group_layout(&hal_desc) }
-            .map_err(|e| self.handle_hal_error(e))?;
+            .map_err(|e| self.handle_hal_error_with_nonfatal_oom(e))?;
 
         let bgl = BindGroupLayout {
             state: ResourceState::Valid(BindGroupLayoutState {
@@ -3595,7 +3591,7 @@ impl Device {
             external_textures: &hal_external_textures,
         };
         let raw = unsafe { self.raw().create_bind_group(&hal_desc) }
-            .map_err(|e| self.handle_hal_error(e))?;
+            .map_err(|e| self.handle_hal_error_with_nonfatal_oom(e))?;
 
         // collect in the order of BGL iteration
         let late_buffer_binding_infos = layout
@@ -5484,3 +5480,39 @@ impl Device {
 crate::impl_resource_type!(Device);
 crate::impl_labeled!(Device);
 crate::impl_storage_item!(Device);
+
+/// Whether `error` from a HAL call loses the device. Running out of memory while creating one
+/// resource (`nonfatal_oom`) leaves the device usable, and the error reaches error scopes.
+fn hal_error_loses_device(error: &hal::DeviceError, nonfatal_oom: bool) -> bool {
+    match error {
+        hal::DeviceError::OutOfMemory => !nonfatal_oom,
+        hal::DeviceError::Lost | hal::DeviceError::Unexpected => true,
+    }
+}
+
+#[cfg(test)]
+mod hal_error_tests {
+    use super::hal_error_loses_device;
+
+    #[test]
+    fn only_lost_and_unexpected_errors_lose_the_device_when_oom_is_nonfatal() {
+        assert!(!hal_error_loses_device(
+            &hal::DeviceError::OutOfMemory,
+            true
+        ));
+        assert!(hal_error_loses_device(
+            &hal::DeviceError::OutOfMemory,
+            false
+        ));
+        for nonfatal_oom in [false, true] {
+            assert!(hal_error_loses_device(
+                &hal::DeviceError::Lost,
+                nonfatal_oom
+            ));
+            assert!(hal_error_loses_device(
+                &hal::DeviceError::Unexpected,
+                nonfatal_oom
+            ));
+        }
+    }
+}
