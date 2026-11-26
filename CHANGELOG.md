@@ -50,6 +50,10 @@ Bottom level categories:
 
 ### Bug Fixes
 
+#### General
+
+- Report out-of-memory failures of bind group and bind group layout creation to `OutOfMemory` error scopes without losing the device, as buffer and texture creation already do.
+
 #### Metal
 
 - Make texture atomics visible to later passes on drivers that otherwise read the value from before them, such as Apple's paravirtual GPU.
