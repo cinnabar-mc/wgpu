@@ -1381,7 +1381,13 @@ impl crate::Device for super::Device {
             .and_then(|(key, views)| views.get(key).copied());
 
         let super::IdentifiedTextureView { raw, identity } = match kept {
-            Some(view) => view,
+            Some(view) => {
+                // The kept view carries the label of whichever view named it last.
+                if let Some(label) = desc.label {
+                    unsafe { self.shared.set_object_name(view.raw, label) };
+                }
+                view
+            }
             None => {
                 let raw = unsafe { self.shared.raw.create_image_view(&vk_info, None) }
                     .map_err(super::map_host_device_oom_and_ioca_err)?;
