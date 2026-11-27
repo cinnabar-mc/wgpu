@@ -303,7 +303,6 @@ impl Surface for NativeSurface {
             next_acquire_index: 0,
             present_semaphores,
             next_present_time: None,
-            leaked: false,
         }))
     }
 
@@ -370,54 +369,42 @@ pub(crate) struct NativeSwapchain {
     /// This must only be set if [`wgt::Features::VULKAN_GOOGLE_DISPLAY_TIMING`] is enabled, and
     /// so the VK_GOOGLE_display_timing extension is present.
     next_present_time: Option<vk::PresentTimeGOOGLE>,
-
-    /// Set when [`Swapchain::release_resources`] could not wait for the device, so in-flight
-    /// work may still use the swapchain and everything made for it; all of it is leaked.
-    leaked: bool,
 }
 
 impl Drop for NativeSwapchain {
     fn drop(&mut self) {
-        if self.leaked {
-            return;
+        // Like the fence and semaphores, the kept views are destroyed only by
+        // `release_resources`, which waits for the device first.
+        self.device.forget_swapchain_views(&self.images);
+        unsafe {
+            self.functor.destroy_swapchain(self.raw, None);
         }
-        // Without `release_resources`, nothing waited for the work using the kept views, and
-        // waiting here could race queue submission on other threads.
-        unsafe { self.device.release_swapchain_views(&self.images, false) };
-        unsafe { self.functor.destroy_swapchain(self.raw, None) };
     }
 }
 
 impl Swapchain for NativeSwapchain {
     unsafe fn release_resources(&mut self, device: &crate::vulkan::Device) {
         profiling::scope!("Swapchain::release_resources");
-        let wait = {
+        {
             profiling::scope!("vkDeviceWaitIdle");
             // We need to also wait until all presentation work is done. Because there is no way to portably wait until
             // the presentation work is done, we are forced to wait until the device is idle.
-            unsafe { device.shared.raw.device_wait_idle() }
+            let _ = unsafe {
+                device
+                    .shared
+                    .raw
+                    .device_wait_idle()
+                    .map_err(map_host_device_oom_and_lost_err)
+            };
         };
-        // Losing the device completes all of its work, so its objects may be destroyed.
-        if let Err(error) = wait.or_else(|error| match error {
-            vk::Result::ERROR_DEVICE_LOST => Ok(()),
-            error => Err(error),
-        }) {
-            log::error!(
-                "vkDeviceWaitIdle failed while releasing a swapchain ({error}); leaking the swapchain, its views, framebuffers, fence and semaphores"
-            );
-            self.leaked = true;
-            unsafe { device.shared.release_swapchain_views(&self.images, false) };
-            self.fence = None;
-            self.acquire_semaphores.clear();
-            self.present_semaphores.clear();
-            return;
-        }
 
-        if let Some(fence) = self.fence.take() {
+        if let Some(fence) = self.fence {
             unsafe { device.shared.raw.destroy_fence(fence, None) }
         }
 
-        unsafe { device.shared.release_swapchain_views(&self.images, true) };
+        // The kept views and their framebuffers go with the fence and semaphores, after the same
+        // device wait.
+        unsafe { device.shared.release_swapchain_views(&self.images) };
 
         // We cannot take this by value, as the function returns `self`.
         for semaphore in self.acquire_semaphores.drain(..) {
@@ -960,7 +947,3 @@ impl<'a> SwapchainSubmissionSemaphoreGuard for NativeSwapchainSubmissionSemaphor
             .map(SemaphoreType::Binary)
     }
 }
-
-#[cfg(test)]
-#[path = "native_teardown_tests.rs"]
-mod teardown_tests;

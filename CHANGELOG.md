@@ -61,7 +61,6 @@ Bottom level categories:
 
 #### Vulkan
 
-- Count update-after-bind descriptor pools against `maxUpdateAfterBindDescriptorsInAllPools` by their full capacity, and destroy empty ones when a new bind group would not fit.
 - Serialize shader-module and pipeline creation on PowerVR Rogue and BXM-8-256 GPUs to avoid concurrent compiler crashes.
 - Serialize shader-module and pipeline creation on Qualcomm's proprietary Adreno driver to avoid concurrent compiler crashes.
 - On drivers that serialize shader compilation, also destroy shader modules and create, read and destroy pipeline caches under the same lock, and destroy a pipeline's temporary shader modules when its creation fails.

@@ -75,59 +75,19 @@ impl Bucket {
         device: &ash::Device,
         key: &BucketKey,
         capacity_hint: u32,
-        min_capacity: u32,
-        max_capacity: u32,
-    ) -> Result<(usize, &mut Pool), vk::Result> {
-        let pool = create_descriptor_pool(device, key, capacity_hint, min_capacity, max_capacity)?;
+    ) -> Result<(usize, &mut Pool), crate::DeviceError> {
+        let index = self.pools.len();
+        let pool = create_descriptor_pool(device, key, capacity_hint)?;
         self.available_sets += pool.capacity;
-        // Reuse the slot of a destroyed pool, so the indices of live sets stay valid.
-        let index = match self.pools.iter().position(|pool| pool.capacity == 0) {
-            Some(index) => {
-                self.pools[index] = pool;
-                index
-            }
-            None => {
-                self.pools.push(pool);
-                self.pools.len() - 1
-            }
-        };
-        Ok((index, &mut self.pools[index]))
+        self.pools.push(pool);
+        Ok((index, self.pools.last_mut().unwrap()))
     }
-
-    /// Destroys this bucket's empty pools, keeping the slots of those in the middle so the
-    /// indices of live sets stay valid. Returns the capacity, in sets, they held.
-    fn destroy_empty_pools(&mut self, device: &ash::Device) -> u32 {
-        let mut released = 0;
-        for pool in &mut self.pools {
-            if pool.capacity != 0 && pool.available == pool.capacity {
-                unsafe { device.destroy_descriptor_pool(pool.raw, None) };
-                released += pool.capacity;
-                *pool = Pool::DESTROYED;
-            }
-        }
-        while self.pools.last().is_some_and(|pool| pool.capacity == 0) {
-            self.pools.pop();
-        }
-        self.available_sets -= released;
-        released
-    }
-}
-
-impl Pool {
-    /// The slot of a destroyed pool; it has no sets to allocate.
-    const DESTROYED: Pool = Pool {
-        raw: vk::DescriptorPool::null(),
-        capacity: 0,
-        available: 0,
-    };
 }
 
 pub struct DescriptorAllocator {
     buckets: HashMap<BucketKey, Bucket>,
     max_update_after_bind_descriptors_in_all_pools: u32,
-    /// Descriptors that the update-after-bind pools hold, counted by pool capacity, since
-    /// `maxUpdateAfterBindDescriptorsInAllPools` limits what the pools are created with.
-    update_after_bind_descriptors_in_all_pools: u64,
+    update_after_bind_descriptors_in_all_pools: u32,
 }
 
 impl super::BindGroupLayout {
@@ -160,20 +120,9 @@ impl DescriptorAllocator {
             hashbrown::hash_map::Entry::Occupied(occupied_entry) => occupied_entry.into_mut(),
             hashbrown::hash_map::Entry::Vacant(vacant_entry) => {
                 let mut bucket = Bucket::default();
-                // Create at least 1 pool upfront instead of doing this when creating the
-                // first bind group. Update-after-bind pools are created on demand instead, so
-                // a layout does not hold part of the shared limit before it allocates.
-                if !vacant_entry.key().update_after_bind {
-                    bucket
-                        .create_pool(
-                            device,
-                            vacant_entry.key(),
-                            POOL_MIN_SETS,
-                            POOL_MIN_SETS,
-                            u32::MAX,
-                        )
-                        .map_err(super::map_host_device_oom_and_fragmentation_err)?;
-                }
+                // Create at least 1 pool upfront instead of doing this when
+                // creating the first bind group.
+                bucket.create_pool(device, vacant_entry.key(), POOL_MIN_SETS)?;
                 vacant_entry.insert(bucket)
             }
         };
@@ -198,7 +147,6 @@ impl DescriptorAllocator {
                     "pool is not empty, at least one DescriptorSet has not been freed"
                 );
                 unsafe { device.destroy_descriptor_pool(pool.raw, None) };
-                self.release_capacity(&key, pool.capacity);
             }
         }
     }
@@ -208,9 +156,35 @@ impl DescriptorAllocator {
         device: &ash::Device,
         layout: &super::BindGroupLayout,
     ) -> Result<DescriptorSet, crate::DeviceError> {
+        let update_after_bind = layout.contains_binding_arrays;
+        let total_descriptors = layout.desc_count.total();
+
+        if update_after_bind
+            && self.max_update_after_bind_descriptors_in_all_pools
+                - self.update_after_bind_descriptors_in_all_pools
+                < total_descriptors
+        {
+            return Err(crate::DeviceError::OutOfMemory);
+        }
+
         let key = layout.bucket_key();
-        let pool_index = self.pool_with_room(device, &key)?;
-        let pool = &mut self.buckets.get_mut(&key).unwrap().pools[pool_index];
+        let bucket = self.buckets.get_mut(&key).unwrap();
+
+        // Prefer smaller/older/fuller pools for new allocations to prevent
+        // fragmentation and possibly fragmentation of hardware resources
+        // (VK_ERROR_FRAGMENTATION)
+        let pool = bucket
+            .pools
+            .iter_mut()
+            .enumerate()
+            .find(|(_, pool)| pool.available != 0);
+
+        let (pool_index, pool) = if let Some(pool) = pool {
+            pool
+        } else {
+            let capacity_hint = bucket.allocated_sets;
+            bucket.create_pool(device, &key, capacity_hint)?
+        };
 
         let vk_info = vk::DescriptorSetAllocateInfo::default()
             .descriptor_pool(pool.raw)
@@ -236,9 +210,11 @@ impl DescriptorAllocator {
         }?;
 
         pool.available -= 1;
-        let bucket = self.buckets.get_mut(&key).unwrap();
         bucket.available_sets -= 1;
         bucket.allocated_sets += 1;
+        if update_after_bind {
+            self.update_after_bind_descriptors_in_all_pools += total_descriptors;
+        }
 
         Ok(DescriptorSet {
             raw,
@@ -266,6 +242,9 @@ impl DescriptorAllocator {
         pool.available += 1;
         bucket.available_sets += 1;
         bucket.allocated_sets -= 1;
+        if set.bucket_key.update_after_bind {
+            self.update_after_bind_descriptors_in_all_pools -= set.bucket_key.counts.total();
+        }
 
         // Do not immediately destroy empty pools since they might have
         // been recently created.
@@ -279,114 +258,6 @@ impl DescriptorAllocator {
             let pool = bucket.pools.pop().unwrap();
             unsafe { device.destroy_descriptor_pool(pool.raw, None) };
             bucket.available_sets -= pool.capacity;
-            self.release_capacity(&set.bucket_key, pool.capacity);
-        }
-    }
-
-    /// Returns the index of a pool of `key`'s bucket with room for a set, creating one if needed.
-    fn pool_with_room(
-        &mut self,
-        device: &ash::Device,
-        key: &BucketKey,
-    ) -> Result<usize, crate::DeviceError> {
-        // Prefer smaller/older/fuller pools for new allocations to prevent
-        // fragmentation and possibly fragmentation of hardware resources
-        // (VK_ERROR_FRAGMENTATION)
-        if let Some(index) = self.buckets[key]
-            .pools
-            .iter()
-            .position(|pool| pool.available != 0)
-        {
-            return Ok(index);
-        }
-        let max_capacity = self.pool_capacity_limit(device, key)?;
-        let min_capacity = self.min_pool_capacity(key);
-        let capacity_hint = self.buckets[key].allocated_sets;
-        let created = self.buckets.get_mut(key).unwrap().create_pool(
-            device,
-            key,
-            capacity_hint,
-            min_capacity,
-            max_capacity,
-        );
-        let created = match created {
-            // Empty update-after-bind pools may hold the memory a new one needs.
-            Err(vk::Result::ERROR_FRAGMENTATION) if key.update_after_bind => {
-                self.destroy_empty_update_after_bind_pools(device);
-                self.buckets
-                    .get_mut(key)
-                    .unwrap()
-                    .create_pool(device, key, 1, 1, max_capacity)
-            }
-            created => created,
-        };
-        let (index, pool) = created.map_err(super::map_host_device_oom_and_fragmentation_err)?;
-        let capacity = pool.capacity;
-        if key.update_after_bind {
-            self.update_after_bind_descriptors_in_all_pools +=
-                u64::from(capacity) * u64::from(key.counts.total());
-        }
-        Ok(index)
-    }
-
-    /// The fewest sets a new pool of `key` holds. Update-after-bind pools start from a single set
-    /// when a pool of [`POOL_MIN_SETS`] would take more than an eighth of the limit, so one live
-    /// set cannot hold a large share of it, and grow with demand from there.
-    fn min_pool_capacity(&self, key: &BucketKey) -> u32 {
-        let full = u64::from(POOL_MIN_SETS) * u64::from(key.counts.total());
-        if key.update_after_bind
-            && full > u64::from(self.max_update_after_bind_descriptors_in_all_pools) / 8
-        {
-            1
-        } else {
-            POOL_MIN_SETS
-        }
-    }
-
-    /// Destroys the empty pools of every update-after-bind bucket.
-    fn destroy_empty_update_after_bind_pools(&mut self, device: &ash::Device) {
-        for (key, bucket) in &mut self.buckets {
-            if key.update_after_bind {
-                let released = bucket.destroy_empty_pools(device);
-                self.update_after_bind_descriptors_in_all_pools -=
-                    u64::from(released) * u64::from(key.counts.total());
-            }
-        }
-    }
-
-    /// Returns how many sets a new pool for `key` may hold. Update-after-bind pools are bounded
-    /// by what is left of `maxUpdateAfterBindDescriptorsInAllPools`; when not even one set fits,
-    /// the empty update-after-bind pools of every bucket are destroyed first.
-    fn pool_capacity_limit(
-        &mut self,
-        device: &ash::Device,
-        key: &BucketKey,
-    ) -> Result<u32, crate::DeviceError> {
-        if !key.update_after_bind {
-            return Ok(u32::MAX);
-        }
-        let per_set = u64::from(key.counts.total().max(1));
-        let mut fitting = self.remaining_update_after_bind_descriptors() / per_set;
-        if fitting == 0 {
-            self.destroy_empty_update_after_bind_pools(device);
-            fitting = self.remaining_update_after_bind_descriptors() / per_set;
-        }
-        if fitting == 0 {
-            return Err(crate::DeviceError::OutOfMemory);
-        }
-        Ok(u32::try_from(fitting).unwrap_or(u32::MAX))
-    }
-
-    fn remaining_update_after_bind_descriptors(&self) -> u64 {
-        u64::from(self.max_update_after_bind_descriptors_in_all_pools)
-            .saturating_sub(self.update_after_bind_descriptors_in_all_pools)
-    }
-
-    /// Returns the share of the update-after-bind limit held by a destroyed pool of `key`.
-    fn release_capacity(&mut self, key: &BucketKey, capacity: u32) {
-        if key.update_after_bind {
-            self.update_after_bind_descriptors_in_all_pools -=
-                u64::from(capacity) * u64::from(key.counts.total());
         }
     }
 }
@@ -406,9 +277,7 @@ fn create_descriptor_pool(
     device: &ash::Device,
     key: &BucketKey,
     capacity_hint: u32,
-    min_capacity: u32,
-    max_capacity: u32,
-) -> Result<Pool, vk::Result> {
+) -> Result<Pool, crate::DeviceError> {
     let counts = &key.counts;
 
     const NR_OF_DESCRIPTOR_TYPES: usize = 8;
@@ -430,9 +299,8 @@ fn create_descriptor_pool(
 
     // bounded doubling growth strategy
     let mut capacity = capacity_hint
-        .clamp(min_capacity, POOL_MAX_SETS)
-        .next_power_of_two()
-        .min(max_capacity);
+        .clamp(POOL_MIN_SETS, POOL_MAX_SETS)
+        .next_power_of_two();
 
     // Lower capacity to avoid overflowing `count * capacity` calculations
     // below. The resulting `capacity` might not be a power of 2 but that's
@@ -470,7 +338,8 @@ fn create_descriptor_pool(
         .max_sets(capacity)
         .pool_sizes(&pool_sizes);
 
-    let raw = unsafe { device.create_descriptor_pool(&vk_info, None) }?;
+    let raw = unsafe { device.create_descriptor_pool(&vk_info, None) }
+        .map_err(super::map_host_device_oom_and_fragmentation_err)?;
 
     Ok(Pool {
         raw,
@@ -478,7 +347,3 @@ fn create_descriptor_pool(
         available: capacity,
     })
 }
-
-#[cfg(test)]
-#[path = "descriptor_tests.rs"]
-mod tests;

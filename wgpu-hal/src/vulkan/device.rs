@@ -16,23 +16,32 @@ use super::{conv, descriptor::DescriptorCounts, RawTlasInstance};
 use crate::TlasInstance;
 
 impl super::DeviceShared {
-    /// Whether views of any of `images` are kept.
-    #[cfg(test)]
-    pub(super) fn has_swapchain_views(&self, images: &[vk::Image]) -> bool {
-        self.swapchain_views
-            .lock()
-            .keys()
-            .any(|key| images.contains(&key.image))
-    }
-
-    /// Forgets the kept views of `images` and the framebuffers attaching them, destroying them
-    /// when `idle`. Otherwise they are leaked, since in-flight work may still use them.
+    /// Destroys the kept views of `images` and the framebuffers attaching them.
     ///
     /// # Safety
     ///
-    /// If `idle`, no pending command buffer may use a view of `images`. No texture view of
-    /// them may be used afterwards.
-    pub(super) unsafe fn release_swapchain_views(&self, images: &[vk::Image], idle: bool) {
+    /// No pending command buffer may use a view of `images`, and no texture view of them may
+    /// be used afterwards.
+    pub(super) unsafe fn release_swapchain_views(&self, images: &[vk::Image]) {
+        for (view, framebuffers) in self.take_swapchain_views(images) {
+            for raw in framebuffers {
+                unsafe { self.raw.destroy_framebuffer(raw, None) };
+            }
+            unsafe { self.raw.destroy_image_view(view.raw, None) };
+        }
+    }
+
+    /// Stops handing out the kept views of `images` without destroying them or their
+    /// framebuffers, which are leaked, so a later image with a reused handle gets new views.
+    pub(super) fn forget_swapchain_views(&self, images: &[vk::Image]) {
+        drop(self.take_swapchain_views(images));
+    }
+
+    /// Removes the kept views of `images` and the cached framebuffers attaching them.
+    fn take_swapchain_views(
+        &self,
+        images: &[vk::Image],
+    ) -> Vec<(super::IdentifiedTextureView, Vec<vk::Framebuffer>)> {
         let mut released = Vec::new();
         self.swapchain_views.lock().retain(|key, view| {
             let keep = !images.contains(&key.image);
@@ -41,22 +50,10 @@ impl super::DeviceShared {
             }
             keep
         });
-        if !idle && !released.is_empty() {
-            log::error!(
-                "Leaking {} swapchain image views and their framebuffers, which in-flight work may still use",
-                released.len()
-            );
-        }
-        for view in released {
-            let framebuffers = self.framebuffers.lock().remove_view(view.identity);
-            if !idle {
-                continue;
-            }
-            for raw in framebuffers {
-                unsafe { self.raw.destroy_framebuffer(raw, None) };
-            }
-            unsafe { self.raw.destroy_image_view(view.raw, None) };
-        }
+        released
+            .into_iter()
+            .map(|view| (view, self.framebuffers.lock().remove_view(view.identity)))
+            .collect()
     }
 
     /// Creates the framebuffer described by `key`.
@@ -1382,13 +1379,7 @@ impl crate::Device for super::Device {
             .and_then(|(key, views)| views.get(key).copied());
 
         let super::IdentifiedTextureView { raw, identity } = match kept {
-            Some(view) => {
-                // The kept view carries the label of whichever view named it last.
-                if let Some(label) = desc.label {
-                    unsafe { self.shared.set_object_name(view.raw, label) };
-                }
-                view
-            }
+            Some(view) => view,
             None => {
                 let raw = unsafe { self.shared.raw.create_image_view(&vk_info, None) }
                     .map_err(super::map_host_device_oom_and_ioca_err)?;
