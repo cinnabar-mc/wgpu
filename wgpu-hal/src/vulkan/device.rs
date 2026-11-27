@@ -16,13 +16,22 @@ use super::{conv, descriptor::DescriptorCounts, RawTlasInstance};
 use crate::TlasInstance;
 
 impl super::DeviceShared {
-    /// Destroys the kept views of `images` and the framebuffers attaching them.
+    /// Whether views of any of `images` are kept.
+    pub(super) fn has_swapchain_views(&self, images: &[vk::Image]) -> bool {
+        self.swapchain_views
+            .lock()
+            .keys()
+            .any(|key| images.contains(&key.image))
+    }
+
+    /// Forgets the kept views of `images` and the framebuffers attaching them, destroying them
+    /// when `idle`. Otherwise they are leaked, since in-flight work may still use them.
     ///
     /// # Safety
     ///
-    /// No pending command buffer may use a view of `images`, and no texture view of them may
-    /// be used afterwards.
-    pub(super) unsafe fn release_swapchain_views(&self, images: &[vk::Image]) {
+    /// If `idle`, no pending command buffer may use a view of `images`. No texture view of
+    /// them may be used afterwards.
+    pub(super) unsafe fn release_swapchain_views(&self, images: &[vk::Image], idle: bool) {
         let mut released = Vec::new();
         self.swapchain_views.lock().retain(|key, view| {
             let keep = !images.contains(&key.image);
@@ -31,8 +40,17 @@ impl super::DeviceShared {
             }
             keep
         });
+        if !idle && !released.is_empty() {
+            log::error!(
+                "Leaking {} swapchain image views and their framebuffers: the device did not become idle",
+                released.len()
+            );
+        }
         for view in released {
             let framebuffers = self.framebuffers.lock().remove_view(view.identity);
+            if !idle {
+                continue;
+            }
             for raw in framebuffers {
                 unsafe { self.raw.destroy_framebuffer(raw, None) };
             }

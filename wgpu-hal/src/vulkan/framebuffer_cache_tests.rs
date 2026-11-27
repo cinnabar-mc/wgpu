@@ -280,9 +280,37 @@ fn render_passes_share_device_framebuffers_until_a_view_is_destroyed() {
             render_and_reset(&mut first, &acquired, None);
             device.destroy_texture_view(acquired);
         }
-        assert_eq!(counts(), (3, 2), "a swapchain image's pass creates one framebuffer");
-        device.shared.release_swapchain_views(&[image.raw]);
-        assert_eq!(counts(), (3, 3), "releasing the swapchain destroys its framebuffers");
+        assert_eq!(
+            counts(),
+            (3, 2),
+            "a swapchain image's pass creates one framebuffer"
+        );
+        device.shared.release_swapchain_views(&[image.raw], true);
+        assert_eq!(
+            counts(),
+            (3, 3),
+            "releasing the swapchain destroys its framebuffers"
+        );
+        image.swapchain_image = false;
+        device.destroy_texture(image);
+
+        // A release that could not wait for the device leaks the views and their framebuffers,
+        // which in-flight work may still use, and forgets them so nothing destroys them later.
+        let (mut image, unused) = target(&device, wgt::TextureDimension::D2);
+        device.destroy_texture_view(unused);
+        image.swapchain_image = true;
+        let acquired = device.create_texture_view(&image, &view_desc).unwrap();
+        render_and_reset(&mut first, &acquired, None);
+        device.destroy_texture_view(acquired);
+        assert_eq!(counts(), (4, 3));
+        assert!(device.shared.has_swapchain_views(&[image.raw]));
+        device.shared.release_swapchain_views(&[image.raw], false);
+        assert!(!device.shared.has_swapchain_views(&[image.raw]));
+        assert_eq!(
+            counts(),
+            (4, 3),
+            "a release without an idle device destroys nothing"
+        );
         image.swapchain_image = false;
         device.destroy_texture(image);
 
@@ -292,21 +320,23 @@ fn render_passes_share_device_framebuffers_until_a_view_is_destroyed() {
         drop(first);
         drop(second);
         device.destroy_texture(texture);
-        // The view is left alive on purpose, so only dropping the device can destroy its
-        // framebuffer. The view itself leaks with the device.
-        core::mem::forget(view);
+        // The view is never destroyed, so only dropping the device can destroy its
+        // framebuffer. The Vulkan view itself leaks with the device.
+        let _never_destroyed = view;
     }
     drop(open.queue);
     drop(device);
 
     let created = CREATED.lock().unwrap().clone();
     let mut destroyed = DESTROYED.lock().unwrap().clone();
-    assert_eq!(created.len(), 4);
+    assert_eq!(created.len(), 5);
+    // The driver may reuse handles, so the leaked framebuffer is dropped by position.
     let mut created_sorted = created;
+    created_sorted.remove(3);
     created_sorted.sort_unstable();
     destroyed.sort_unstable();
     assert_eq!(
         created_sorted, destroyed,
-        "every framebuffer is destroyed exactly once by the time the device is dropped"
+        "every framebuffer but the leaked one is destroyed exactly once by the time the device is dropped"
     );
 }

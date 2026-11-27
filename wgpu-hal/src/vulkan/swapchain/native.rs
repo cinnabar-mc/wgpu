@@ -373,35 +373,44 @@ pub(crate) struct NativeSwapchain {
 
 impl Drop for NativeSwapchain {
     fn drop(&mut self) {
-        unsafe {
-            self.device.release_swapchain_views(&self.images);
-            self.functor.destroy_swapchain(self.raw, None);
+        // Without `release_resources`, nothing has waited for work using the kept views.
+        if self.device.has_swapchain_views(&self.images) {
+            let idle = unsafe { self.device.raw.device_wait_idle() };
+            if let Err(error) = idle {
+                log::error!("vkDeviceWaitIdle failed while dropping a swapchain: {error}");
+            }
+            unsafe {
+                self.device
+                    .release_swapchain_views(&self.images, idle.is_ok())
+            };
         }
+        unsafe { self.functor.destroy_swapchain(self.raw, None) };
     }
 }
 
 impl Swapchain for NativeSwapchain {
     unsafe fn release_resources(&mut self, device: &crate::vulkan::Device) {
         profiling::scope!("Swapchain::release_resources");
-        {
+        let idle = {
             profiling::scope!("vkDeviceWaitIdle");
             // We need to also wait until all presentation work is done. Because there is no way to portably wait until
             // the presentation work is done, we are forced to wait until the device is idle.
-            let _ = unsafe {
-                device
-                    .shared
-                    .raw
-                    .device_wait_idle()
-                    .map_err(map_host_device_oom_and_lost_err)
-            };
+            unsafe { device.shared.raw.device_wait_idle() }
         };
+        if let Err(error) = idle {
+            log::error!("vkDeviceWaitIdle failed while releasing swapchain resources: {error}");
+        }
 
         if let Some(fence) = self.fence {
             unsafe { device.shared.raw.destroy_fence(fence, None) }
         }
 
-        // The device is idle, so no pending work uses the views or their framebuffers.
-        unsafe { device.shared.release_swapchain_views(&self.images) };
+        // Once the device is idle, no pending work uses the views or their framebuffers.
+        unsafe {
+            device
+                .shared
+                .release_swapchain_views(&self.images, idle.is_ok())
+        };
 
         // We cannot take this by value, as the function returns `self`.
         for semaphore in self.acquire_semaphores.drain(..) {
