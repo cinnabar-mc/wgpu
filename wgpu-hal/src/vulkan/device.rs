@@ -17,6 +17,7 @@ use crate::TlasInstance;
 
 impl super::DeviceShared {
     /// Whether views of any of `images` are kept.
+    #[cfg(test)]
     pub(super) fn has_swapchain_views(&self, images: &[vk::Image]) -> bool {
         self.swapchain_views
             .lock()
@@ -42,7 +43,7 @@ impl super::DeviceShared {
         });
         if !idle && !released.is_empty() {
             log::error!(
-                "Leaking {} swapchain image views and their framebuffers: the device did not become idle",
+                "Leaking {} swapchain image views and their framebuffers, which in-flight work may still use",
                 released.len()
             );
         }
