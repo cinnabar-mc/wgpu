@@ -385,6 +385,10 @@ impl Drop for NativeSwapchain {
 impl Swapchain for NativeSwapchain {
     unsafe fn release_resources(&mut self, device: &crate::vulkan::Device) {
         profiling::scope!("Swapchain::release_resources");
+        // Only a wait on the device that owns this swapchain completes the work using its kept
+        // views. Views retired after this point wait for the owner's next release.
+        let owner = Arc::ptr_eq(&self.device, &device.shared);
+        let retired = owner.then(|| self.device.take_retired_swapchain_views());
         {
             profiling::scope!("vkDeviceWaitIdle");
             // We need to also wait until all presentation work is done. Because there is no way to portably wait until
@@ -403,8 +407,11 @@ impl Swapchain for NativeSwapchain {
         }
 
         // The kept views and their framebuffers go with the fence and semaphores, after the same
-        // device wait. They are kept by the device that owns this swapchain.
-        unsafe { self.device.release_swapchain_views(&self.images) };
+        // device wait, when that wait was on their device; otherwise they are retired there.
+        match retired {
+            Some(retired) => unsafe { self.device.release_swapchain_views(&self.images, retired) },
+            None => self.device.retire_swapchain_views(&self.images),
+        }
 
         // We cannot take this by value, as the function returns `self`.
         for semaphore in self.acquire_semaphores.drain(..) {

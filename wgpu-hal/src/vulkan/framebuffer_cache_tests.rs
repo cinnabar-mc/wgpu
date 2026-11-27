@@ -285,7 +285,9 @@ fn render_passes_share_device_framebuffers_until_a_view_is_destroyed() {
             (3, 2),
             "a swapchain image's pass creates one framebuffer"
         );
-        device.shared.release_swapchain_views(&[image.raw]);
+        device
+            .shared
+            .release_swapchain_views(&[image.raw], device.shared.take_retired_swapchain_views());
         assert_eq!(
             counts(),
             (3, 3),
@@ -307,7 +309,9 @@ fn render_passes_share_device_framebuffers_until_a_view_is_destroyed() {
         assert_eq!(counts(), (4, 3), "retiring destroys nothing");
         assert!(device.shared.swapchain_views.lock().is_empty());
         assert_eq!(device.shared.retired_swapchain_views.lock().len(), 1);
-        device.shared.release_swapchain_views(&[]);
+        device
+            .shared
+            .release_swapchain_views(&[], device.shared.take_retired_swapchain_views());
         assert_eq!(
             counts(),
             (4, 4),

@@ -1,6 +1,7 @@
-//! Checks that releasing a swapchain retires kept views only on the device that owns the
-//! swapchain, even when `release_resources` is given another device whose cache holds a view
-//! keyed by the same raw image handle.
+//! Checks that releasing a swapchain touches kept views only on the device that owns it. A
+//! release given another device, whose wait proves nothing about the owner's work, retires the
+//! owner's views for the owner's next release and leaves the other device's view under the same
+//! raw image handle alone.
 
 use alloc::{sync::Arc, vec, vec::Vec};
 
@@ -50,8 +51,41 @@ fn keep_view(device: &crate::vulkan::Device, image: &mut crate::vulkan::Texture)
     image.swapchain_image = false;
 }
 
+/// A swapchain of `device` over `images`, with a null handle and no fence or semaphores.
+fn swapchain(
+    device: &crate::vulkan::Device,
+    functor: &ash::khr::swapchain::Device,
+    images: Vec<vk::Image>,
+) -> NativeSwapchain {
+    NativeSwapchain {
+        raw: vk::SwapchainKHR::null(),
+        functor: functor.clone(),
+        device: Arc::clone(&device.shared),
+        images,
+        fence: None,
+        config: crate::SurfaceConfiguration {
+            maximum_frame_latency: 2,
+            present_mode: wgt::PresentMode::Fifo,
+            composite_alpha_mode: wgt::CompositeAlphaMode::Opaque,
+            format: wgt::TextureFormat::Rgba8Unorm,
+            color_space: wgt::SurfaceColorSpace::Srgb,
+            extent: wgt::Extent3d {
+                width: 4,
+                height: 4,
+                depth_or_array_layers: 1,
+            },
+            usage: wgt::TextureUses::COLOR_TARGET,
+            view_formats: Vec::new(),
+        },
+        acquire_semaphores: Vec::new(),
+        next_acquire_index: 0,
+        present_semaphores: Vec::new(),
+        next_present_time: None,
+    }
+}
+
 #[test]
-fn releasing_a_swapchain_retires_views_only_on_its_own_device() {
+fn releasing_through_another_device_retires_views_for_the_owners_next_release() {
     let instance = match unsafe {
         crate::vulkan::Instance::init(&crate::InstanceDescriptor {
             name: "swapchain owner test",
@@ -105,55 +139,40 @@ fn releasing_a_swapchain_retires_views_only_on_its_own_device() {
         );
     }
 
-    let mut swapchain = NativeSwapchain {
-        raw: vk::SwapchainKHR::null(),
-        functor: ash::khr::swapchain::Device::new(
-            &exposed.adapter.instance.raw,
-            &owner.device.shared.raw,
-        ),
-        device: Arc::clone(&owner.device.shared),
-        images: vec![owned_image.raw],
-        fence: None,
-        config: crate::SurfaceConfiguration {
-            maximum_frame_latency: 2,
-            present_mode: wgt::PresentMode::Fifo,
-            composite_alpha_mode: wgt::CompositeAlphaMode::Opaque,
-            format: wgt::TextureFormat::Rgba8Unorm,
-            color_space: wgt::SurfaceColorSpace::Srgb,
-            extent: wgt::Extent3d {
-                width: 4,
-                height: 4,
-                depth_or_array_layers: 1,
-            },
-            usage: wgt::TextureUses::COLOR_TARGET,
-            view_formats: Vec::new(),
-        },
-        acquire_semaphores: Vec::new(),
-        next_acquire_index: 0,
-        present_semaphores: Vec::new(),
-        next_present_time: None,
-    };
+    let functor =
+        ash::khr::swapchain::Device::new(&exposed.adapter.instance.raw, &owner.device.shared.raw);
     unsafe {
         use crate::vulkan::swapchain::Swapchain as _;
+        let mut swapchain = swapchain(&owner.device, &functor, vec![owned_image.raw]);
         swapchain.release_resources(&other.device);
     }
-    drop(swapchain);
-
     assert!(
         owner.device.shared.swapchain_views.lock().is_empty(),
-        "the owning device's kept view is released"
+        "the owning device stops handing out the kept view"
     );
+    assert_eq!(
+        owner.device.shared.retired_swapchain_views.lock().len(),
+        1,
+        "a release through another device retires the view instead of destroying it"
+    );
+    assert_eq!(
+        other.device.shared.swapchain_views.lock().len(),
+        1,
+        "the other device keeps its view"
+    );
+
+    // The owner's next release waits on the owner and destroys what was retired, once.
+    unsafe {
+        use crate::vulkan::swapchain::Swapchain as _;
+        let mut swapchain = swapchain(&owner.device, &functor, Vec::new());
+        swapchain.release_resources(&owner.device);
+    }
     assert!(owner
         .device
         .shared
         .retired_swapchain_views
         .lock()
         .is_empty());
-    assert_eq!(
-        other.device.shared.swapchain_views.lock().len(),
-        1,
-        "the other device keeps its view"
-    );
 
     unsafe {
         owner.device.destroy_texture(owned_image);

@@ -16,15 +16,25 @@ use super::{conv, descriptor::DescriptorCounts, RawTlasInstance};
 use crate::TlasInstance;
 
 impl super::DeviceShared {
-    /// Destroys the kept views of `images` and the framebuffers attaching them, along with
-    /// those retired by [`Self::retire_swapchain_views`].
+    /// Takes the views retired so far, for [`Self::release_swapchain_views`] to destroy once
+    /// their work is known to be complete.
+    pub(super) fn take_retired_swapchain_views(&self) -> Vec<super::RetiredSwapchainView> {
+        mem::take(&mut *self.retired_swapchain_views.lock())
+    }
+
+    /// Destroys the kept views of `images` and the framebuffers attaching them, along with the
+    /// `retired` ones taken by [`Self::take_retired_swapchain_views`].
     ///
     /// # Safety
     ///
-    /// No pending command buffer may use a view of `images` or a retired view, and no texture
+    /// No pending command buffer may use a view of `images` or of `retired`, and no texture
     /// view of them may be used afterwards.
-    pub(super) unsafe fn release_swapchain_views(&self, images: &[vk::Image]) {
-        let mut released = mem::take(&mut *self.retired_swapchain_views.lock());
+    pub(super) unsafe fn release_swapchain_views(
+        &self,
+        images: &[vk::Image],
+        retired: Vec<super::RetiredSwapchainView>,
+    ) {
+        let mut released = retired;
         released.extend(self.take_swapchain_views(images));
         for (view, framebuffers) in released {
             for raw in framebuffers {
@@ -35,7 +45,7 @@ impl super::DeviceShared {
     }
 
     /// Stops handing out the kept views of `images`, so a later image with a reused handle gets
-    /// new views, and keeps them and their framebuffers for the next
+    /// new views, and keeps them and their framebuffers for a later
     /// [`Self::release_swapchain_views`] or the device's drop to destroy.
     pub(super) fn retire_swapchain_views(&self, images: &[vk::Image]) {
         let retired = self.take_swapchain_views(images);
