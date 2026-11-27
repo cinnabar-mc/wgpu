@@ -5,11 +5,11 @@
 //! wrapped to return a chosen result and `vkDestroyImageView` wrapped to count calls.
 
 use alloc::{vec, vec::Vec};
-use core::ffi::{c_void, CStr};
-use std::sync::{
-    atomic::{AtomicUsize, Ordering},
-    Mutex as StdMutex, OnceLock,
+use core::{
+    ffi::{c_void, CStr},
+    sync::atomic::{AtomicUsize, Ordering},
 };
+use std::sync::{Mutex as StdMutex, OnceLock};
 
 use ash::vk;
 
