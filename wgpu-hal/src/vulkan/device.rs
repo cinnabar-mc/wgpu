@@ -22,6 +22,15 @@ impl super::DeviceShared {
         mem::take(&mut *self.retired_swapchain_views.lock())
     }
 
+    /// Returns views taken by [`Self::take_retired_swapchain_views`] that could not be destroyed
+    /// to the retired list.
+    pub(super) fn restore_retired_swapchain_views(
+        &self,
+        retired: Vec<super::RetiredSwapchainView>,
+    ) {
+        self.retired_swapchain_views.lock().extend(retired);
+    }
+
     /// Destroys the kept views of `images` and the framebuffers attaching them, along with the
     /// `retired` ones taken by [`Self::take_retired_swapchain_views`].
     ///

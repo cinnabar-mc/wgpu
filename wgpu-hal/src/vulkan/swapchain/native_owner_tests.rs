@@ -10,7 +10,7 @@ use ash::vk;
 use super::NativeSwapchain;
 use crate::{Adapter as _, Device as _, Instance as _};
 
-fn image(device: &crate::vulkan::Device) -> crate::vulkan::Texture {
+pub(super) fn image(device: &crate::vulkan::Device) -> crate::vulkan::Texture {
     unsafe {
         device.create_texture(&crate::TextureDescriptor {
             label: None,
@@ -32,7 +32,7 @@ fn image(device: &crate::vulkan::Device) -> crate::vulkan::Texture {
 }
 
 /// Gives `image` a kept swapchain view on `device`.
-fn keep_view(device: &crate::vulkan::Device, image: &mut crate::vulkan::Texture) {
+pub(super) fn keep_view(device: &crate::vulkan::Device, image: &mut crate::vulkan::Texture) {
     image.swapchain_image = true;
     let view = unsafe {
         device.create_texture_view(
@@ -52,7 +52,7 @@ fn keep_view(device: &crate::vulkan::Device, image: &mut crate::vulkan::Texture)
 }
 
 /// A swapchain of `device` over `images`, with a null handle and no fence or semaphores.
-fn swapchain(
+pub(super) fn swapchain(
     device: &crate::vulkan::Device,
     functor: &ash::khr::swapchain::Device,
     images: Vec<vk::Image>,
