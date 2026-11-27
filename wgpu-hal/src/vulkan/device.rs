@@ -16,32 +16,34 @@ use super::{conv, descriptor::DescriptorCounts, RawTlasInstance};
 use crate::TlasInstance;
 
 impl super::DeviceShared {
-    /// Destroys the kept views of `images` and the framebuffers attaching them.
+    /// Destroys the kept views of `images` and the framebuffers attaching them, along with
+    /// those retired by [`Self::retire_swapchain_views`].
     ///
     /// # Safety
     ///
-    /// No pending command buffer may use a view of `images`, and no texture view of them may
-    /// be used afterwards.
+    /// No pending command buffer may use a view of `images` or a retired view, and no texture
+    /// view of them may be used afterwards.
     pub(super) unsafe fn release_swapchain_views(&self, images: &[vk::Image]) {
-        for (view, framebuffers) in self.take_swapchain_views(images) {
+        let mut released = mem::take(&mut *self.retired_swapchain_views.lock());
+        released.extend(self.take_swapchain_views(images));
+        for (view, framebuffers) in released {
             for raw in framebuffers {
                 unsafe { self.raw.destroy_framebuffer(raw, None) };
             }
-            unsafe { self.raw.destroy_image_view(view.raw, None) };
+            unsafe { self.raw.destroy_image_view(view, None) };
         }
     }
 
-    /// Stops handing out the kept views of `images` without destroying them or their
-    /// framebuffers, which are leaked, so a later image with a reused handle gets new views.
-    pub(super) fn forget_swapchain_views(&self, images: &[vk::Image]) {
-        drop(self.take_swapchain_views(images));
+    /// Stops handing out the kept views of `images`, so a later image with a reused handle gets
+    /// new views, and keeps them and their framebuffers for the next
+    /// [`Self::release_swapchain_views`] or the device's drop to destroy.
+    pub(super) fn retire_swapchain_views(&self, images: &[vk::Image]) {
+        let retired = self.take_swapchain_views(images);
+        self.retired_swapchain_views.lock().extend(retired);
     }
 
     /// Removes the kept views of `images` and the cached framebuffers attaching them.
-    fn take_swapchain_views(
-        &self,
-        images: &[vk::Image],
-    ) -> Vec<(super::IdentifiedTextureView, Vec<vk::Framebuffer>)> {
+    fn take_swapchain_views(&self, images: &[vk::Image]) -> Vec<super::RetiredSwapchainView> {
         let mut released = Vec::new();
         self.swapchain_views.lock().retain(|key, view| {
             let keep = !images.contains(&key.image);
@@ -52,7 +54,12 @@ impl super::DeviceShared {
         });
         released
             .into_iter()
-            .map(|view| (view, self.framebuffers.lock().remove_view(view.identity)))
+            .map(|view| {
+                (
+                    view.raw,
+                    self.framebuffers.lock().remove_view(view.identity),
+                )
+            })
             .collect()
     }
 

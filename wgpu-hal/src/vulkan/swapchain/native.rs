@@ -373,9 +373,9 @@ pub(crate) struct NativeSwapchain {
 
 impl Drop for NativeSwapchain {
     fn drop(&mut self) {
-        // Like the fence and semaphores, the kept views are destroyed only by
-        // `release_resources`, which waits for the device first.
-        self.device.forget_swapchain_views(&self.images);
+        // Like the fence and semaphores, the kept views are destroyed only after the wait in
+        // `release_resources`; the device keeps them until its next one.
+        self.device.retire_swapchain_views(&self.images);
         unsafe {
             self.functor.destroy_swapchain(self.raw, None);
         }
@@ -403,8 +403,8 @@ impl Swapchain for NativeSwapchain {
         }
 
         // The kept views and their framebuffers go with the fence and semaphores, after the same
-        // device wait.
-        unsafe { device.shared.release_swapchain_views(&self.images) };
+        // device wait. They are kept by the device that owns this swapchain.
+        unsafe { self.device.release_swapchain_views(&self.images) };
 
         // We cannot take this by value, as the function returns `self`.
         for semaphore in self.acquire_semaphores.drain(..) {
@@ -947,3 +947,7 @@ impl<'a> SwapchainSubmissionSemaphoreGuard for NativeSwapchainSubmissionSemaphor
             .map(SemaphoreType::Binary)
     }
 }
+
+#[cfg(test)]
+#[path = "native_owner_tests.rs"]
+mod owner_tests;

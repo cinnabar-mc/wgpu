@@ -539,6 +539,9 @@ struct DeviceShared {
     /// Views of swapchain images, kept until their swapchain is released so that the
     /// framebuffers attaching them survive from one acquisition of an image to the next.
     swapchain_views: Mutex<FastHashMap<SwapchainViewKey, IdentifiedTextureView>>,
+    /// Views of released swapchain images, and their framebuffers, that a dropped swapchain
+    /// could not destroy; the next release on this device or the device's drop destroys them.
+    retired_swapchain_views: Mutex<Vec<RetiredSwapchainView>>,
     sampler_cache: Mutex<sampler::SamplerCache>,
     /// Held across the calls named by [`Workarounds::SERIALIZE_SHADER_COMPILATION`] on drivers
     /// with unsafe concurrent compiles.
@@ -567,6 +570,12 @@ impl Drop for DeviceShared {
         }
         for (_, view) in self.swapchain_views.get_mut().drain() {
             unsafe { self.raw.destroy_image_view(view.raw, None) };
+        }
+        for (view, framebuffers) in self.retired_swapchain_views.get_mut().drain(..) {
+            for raw in framebuffers {
+                unsafe { self.raw.destroy_framebuffer(raw, None) };
+            }
+            unsafe { self.raw.destroy_image_view(view, None) };
         }
         for &raw in self.render_passes.lock().values() {
             unsafe { self.raw.destroy_render_pass(raw, None) };
@@ -1063,6 +1072,9 @@ struct IdentifiedTextureView {
     raw: vk::ImageView,
     identity: ResourceIdentity<vk::ImageView>,
 }
+
+/// A swapchain image view taken out of the cache, with the framebuffers attaching it.
+type RetiredSwapchainView = (vk::ImageView, Vec<vk::Framebuffer>);
 
 /// What makes two views of a swapchain image interchangeable.
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]

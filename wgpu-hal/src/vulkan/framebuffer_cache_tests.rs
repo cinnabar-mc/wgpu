@@ -294,8 +294,8 @@ fn render_passes_share_device_framebuffers_until_a_view_is_destroyed() {
         image.swapchain_image = false;
         device.destroy_texture(image);
 
-        // A swapchain dropped without a release forgets its kept views and framebuffers but
-        // leaves them, as it leaves its fence and semaphores.
+        // A swapchain dropped without a release retires its kept view and framebuffer; the
+        // next release on the device destroys them.
         let (mut image, unused) = target(&device, wgt::TextureDimension::D2);
         device.destroy_texture_view(unused);
         image.swapchain_image = true;
@@ -303,9 +303,24 @@ fn render_passes_share_device_framebuffers_until_a_view_is_destroyed() {
         render_and_reset(&mut first, &acquired, None);
         device.destroy_texture_view(acquired);
         assert_eq!(counts(), (4, 3));
-        device.shared.forget_swapchain_views(&[image.raw]);
-        assert_eq!(counts(), (4, 3), "forgetting destroys nothing");
+        device.shared.retire_swapchain_views(&[image.raw]);
+        assert_eq!(counts(), (4, 3), "retiring destroys nothing");
         assert!(device.shared.swapchain_views.lock().is_empty());
+        assert_eq!(device.shared.retired_swapchain_views.lock().len(), 1);
+        device.shared.release_swapchain_views(&[]);
+        assert_eq!(
+            counts(),
+            (4, 4),
+            "the next release destroys what was retired"
+        );
+        assert!(device.shared.retired_swapchain_views.lock().is_empty());
+
+        // What is still retired when the device is dropped goes with it.
+        let acquired = device.create_texture_view(&image, &view_desc).unwrap();
+        render_and_reset(&mut first, &acquired, None);
+        device.destroy_texture_view(acquired);
+        device.shared.retire_swapchain_views(&[image.raw]);
+        assert_eq!(counts(), (5, 4));
         image.swapchain_image = false;
         device.destroy_texture(image);
 
@@ -324,14 +339,12 @@ fn render_passes_share_device_framebuffers_until_a_view_is_destroyed() {
 
     let created = CREATED.lock().unwrap().clone();
     let mut destroyed = DESTROYED.lock().unwrap().clone();
-    assert_eq!(created.len(), 5);
-    // The driver may reuse handles, so the forgotten framebuffer is dropped by position.
+    assert_eq!(created.len(), 6);
     let mut created_sorted = created;
-    created_sorted.remove(3);
     created_sorted.sort_unstable();
     destroyed.sort_unstable();
     assert_eq!(
         created_sorted, destroyed,
-        "every framebuffer but the forgotten one is destroyed exactly once by the time the device is dropped"
+        "every framebuffer is destroyed exactly once by the time the device is dropped"
     );
 }
