@@ -3,6 +3,8 @@
 //! another layout under pressure.
 
 use super::{DescriptorAllocator, POOL_MIN_SETS};
+use alloc::vec;
+
 use crate::{Adapter as _, Device as _, Instance as _};
 
 /// Opens a device with update-after-bind binding arrays, or `None` without one.
@@ -62,7 +64,7 @@ fn layout(device: &super::super::Device, count: u32) -> super::super::BindGroupL
     unsafe {
         device.create_bind_group_layout(&crate::BindGroupLayoutDescriptor {
             label: None,
-            flags: crate::BindGroupLayoutFlags::PARTIALLY_BOUND,
+            flags: crate::BindGroupLayoutFlags::empty(),
             entries: &entries,
         })
     }
@@ -80,47 +82,58 @@ fn update_after_bind_pools_fit_the_limit_and_yield_when_empty() {
     let large = layout(device, 16);
     let oversized = layout(device, 600);
     assert!(small.contains_binding_arrays);
-    // One full-size pool of the small layout, plus a little.
+    // A pool of the minimum size for the small layout would hold almost all of it.
     let budget = POOL_MIN_SETS * 8 + 8;
     let mut allocator = DescriptorAllocator::new(budget);
+    let reserved =
+        |allocator: &DescriptorAllocator| allocator.update_after_bind_descriptors_in_all_pools;
 
     unsafe {
         allocator.register_layout(raw, &small).unwrap();
         allocator.register_layout(raw, &large).unwrap();
         allocator.register_layout(raw, &oversized).unwrap();
         assert_eq!(
-            allocator.update_after_bind_descriptors_in_all_pools, 0,
+            reserved(&allocator),
+            0,
             "registering a layout reserves nothing"
         );
 
-        let set = allocator.alloc(raw, &small).unwrap();
-        assert_eq!(
-            allocator.update_after_bind_descriptors_in_all_pools,
-            u64::from(POOL_MIN_SETS * 8),
-            "a pool counts all the sets it can hold"
-        );
-        allocator.free(raw, set);
+        // One live set holds a pool of one set, so another layout still fits.
+        let mut smalls = vec![allocator.alloc(raw, &small).unwrap()];
+        assert_eq!(reserved(&allocator), 8);
+        let mut larges = vec![allocator.alloc(raw, &large).unwrap()];
+        assert_eq!(reserved(&allocator), 8 + 16);
 
-        // The small layout's empty pool is kept, and leaves no room for a large set until
-        // it is destroyed.
-        let large_set = allocator.alloc(raw, &large).unwrap();
-        assert!(allocator.update_after_bind_descriptors_in_all_pools <= u64::from(budget));
+        // Pools grow with demand: eight sets take four pools.
+        for _ in 1..8 {
+            smalls.push(allocator.alloc(raw, &small).unwrap());
+        }
+        assert_eq!(allocator.buckets[&small.bucket_key()].pools.len(), 4);
+        assert_eq!(reserved(&allocator), 8 * 8 + 16);
 
-        // What is left still holds a pool sized to fit it.
-        let small_set = allocator.alloc(raw, &small).unwrap();
-        assert!(allocator.update_after_bind_descriptors_in_all_pools <= u64::from(budget));
+        // Empty pools the small layout keeps give way, so the large layout can use the whole
+        // limit.
+        for set in smalls.drain(..) {
+            allocator.free(raw, set);
+        }
+        while let Ok(set) = allocator.alloc(raw, &large) {
+            larges.push(set);
+            assert!(reserved(&allocator) <= u64::from(budget));
+        }
+        assert_eq!(larges.len() as u32, budget / 16);
 
         assert!(matches!(
             allocator.alloc(raw, &oversized),
             Err(crate::DeviceError::OutOfMemory)
         ));
 
-        allocator.free(raw, large_set);
-        allocator.free(raw, small_set);
+        for set in larges {
+            allocator.free(raw, set);
+        }
         allocator.unregister_layout(raw, &small);
         allocator.unregister_layout(raw, &large);
         allocator.unregister_layout(raw, &oversized);
-        assert_eq!(allocator.update_after_bind_descriptors_in_all_pools, 0);
+        assert_eq!(reserved(&allocator), 0);
 
         device.destroy_bind_group_layout(small);
         device.destroy_bind_group_layout(large);

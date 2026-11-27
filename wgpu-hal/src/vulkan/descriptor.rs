@@ -75,9 +75,10 @@ impl Bucket {
         device: &ash::Device,
         key: &BucketKey,
         capacity_hint: u32,
+        min_capacity: u32,
         max_capacity: u32,
-    ) -> Result<(usize, &mut Pool), crate::DeviceError> {
-        let pool = create_descriptor_pool(device, key, capacity_hint, max_capacity)?;
+    ) -> Result<(usize, &mut Pool), vk::Result> {
+        let pool = create_descriptor_pool(device, key, capacity_hint, min_capacity, max_capacity)?;
         self.available_sets += pool.capacity;
         // Reuse the slot of a destroyed pool, so the indices of live sets stay valid.
         let index = match self.pools.iter().position(|pool| pool.capacity == 0) {
@@ -163,7 +164,15 @@ impl DescriptorAllocator {
                 // first bind group. Update-after-bind pools are created on demand instead, so
                 // a layout does not hold part of the shared limit before it allocates.
                 if !vacant_entry.key().update_after_bind {
-                    bucket.create_pool(device, vacant_entry.key(), POOL_MIN_SETS, u32::MAX)?;
+                    bucket
+                        .create_pool(
+                            device,
+                            vacant_entry.key(),
+                            POOL_MIN_SETS,
+                            POOL_MIN_SETS,
+                            u32::MAX,
+                        )
+                        .map_err(super::map_host_device_oom_and_fragmentation_err)?;
                 }
                 vacant_entry.insert(bucket)
             }
@@ -200,38 +209,8 @@ impl DescriptorAllocator {
         layout: &super::BindGroupLayout,
     ) -> Result<DescriptorSet, crate::DeviceError> {
         let key = layout.bucket_key();
-
-        // Prefer smaller/older/fuller pools for new allocations to prevent
-        // fragmentation and possibly fragmentation of hardware resources
-        // (VK_ERROR_FRAGMENTATION)
-        let has_room = self.buckets[&key]
-            .pools
-            .iter()
-            .any(|pool| pool.available != 0);
-        let max_capacity = if has_room {
-            u32::MAX
-        } else {
-            self.pool_capacity_limit(device, &key)?
-        };
-
-        let bucket = self.buckets.get_mut(&key).unwrap();
-        let pool = bucket
-            .pools
-            .iter_mut()
-            .enumerate()
-            .find(|(_, pool)| pool.available != 0);
-
-        let (pool_index, pool) = if let Some(pool) = pool {
-            pool
-        } else {
-            let capacity_hint = bucket.allocated_sets;
-            let (index, pool) = bucket.create_pool(device, &key, capacity_hint, max_capacity)?;
-            if key.update_after_bind {
-                self.update_after_bind_descriptors_in_all_pools +=
-                    u64::from(pool.capacity) * u64::from(key.counts.total());
-            }
-            (index, pool)
-        };
+        let pool_index = self.pool_with_room(device, &key)?;
+        let pool = &mut self.buckets.get_mut(&key).unwrap().pools[pool_index];
 
         let vk_info = vk::DescriptorSetAllocateInfo::default()
             .descriptor_pool(pool.raw)
@@ -304,6 +283,77 @@ impl DescriptorAllocator {
         }
     }
 
+    /// Returns the index of a pool of `key`'s bucket with room for a set, creating one if needed.
+    fn pool_with_room(
+        &mut self,
+        device: &ash::Device,
+        key: &BucketKey,
+    ) -> Result<usize, crate::DeviceError> {
+        // Prefer smaller/older/fuller pools for new allocations to prevent
+        // fragmentation and possibly fragmentation of hardware resources
+        // (VK_ERROR_FRAGMENTATION)
+        if let Some(index) = self.buckets[key]
+            .pools
+            .iter()
+            .position(|pool| pool.available != 0)
+        {
+            return Ok(index);
+        }
+        let max_capacity = self.pool_capacity_limit(device, key)?;
+        let min_capacity = self.min_pool_capacity(key);
+        let capacity_hint = self.buckets[key].allocated_sets;
+        let created = self.buckets.get_mut(key).unwrap().create_pool(
+            device,
+            key,
+            capacity_hint,
+            min_capacity,
+            max_capacity,
+        );
+        let created = match created {
+            // Empty update-after-bind pools may hold the memory a new one needs.
+            Err(vk::Result::ERROR_FRAGMENTATION) if key.update_after_bind => {
+                self.destroy_empty_update_after_bind_pools(device);
+                self.buckets
+                    .get_mut(key)
+                    .unwrap()
+                    .create_pool(device, key, 1, 1, max_capacity)
+            }
+            created => created,
+        };
+        let (index, pool) = created.map_err(super::map_host_device_oom_and_fragmentation_err)?;
+        let capacity = pool.capacity;
+        if key.update_after_bind {
+            self.update_after_bind_descriptors_in_all_pools +=
+                u64::from(capacity) * u64::from(key.counts.total());
+        }
+        Ok(index)
+    }
+
+    /// The fewest sets a new pool of `key` holds. Update-after-bind pools start from a single set
+    /// when a pool of [`POOL_MIN_SETS`] would take more than an eighth of the limit, so one live
+    /// set cannot hold a large share of it, and grow with demand from there.
+    fn min_pool_capacity(&self, key: &BucketKey) -> u32 {
+        let full = u64::from(POOL_MIN_SETS) * u64::from(key.counts.total());
+        if key.update_after_bind
+            && full > u64::from(self.max_update_after_bind_descriptors_in_all_pools) / 8
+        {
+            1
+        } else {
+            POOL_MIN_SETS
+        }
+    }
+
+    /// Destroys the empty pools of every update-after-bind bucket.
+    fn destroy_empty_update_after_bind_pools(&mut self, device: &ash::Device) {
+        for (key, bucket) in &mut self.buckets {
+            if key.update_after_bind {
+                let released = bucket.destroy_empty_pools(device);
+                self.update_after_bind_descriptors_in_all_pools -=
+                    u64::from(released) * u64::from(key.counts.total());
+            }
+        }
+    }
+
     /// Returns how many sets a new pool for `key` may hold. Update-after-bind pools are bounded
     /// by what is left of `maxUpdateAfterBindDescriptorsInAllPools`; when not even one set fits,
     /// the empty update-after-bind pools of every bucket are destroyed first.
@@ -318,13 +368,7 @@ impl DescriptorAllocator {
         let per_set = u64::from(key.counts.total().max(1));
         let mut fitting = self.remaining_update_after_bind_descriptors() / per_set;
         if fitting == 0 {
-            for (other, bucket) in &mut self.buckets {
-                if other.update_after_bind {
-                    let released = bucket.destroy_empty_pools(device);
-                    self.update_after_bind_descriptors_in_all_pools -=
-                        u64::from(released) * u64::from(other.counts.total());
-                }
-            }
+            self.destroy_empty_update_after_bind_pools(device);
             fitting = self.remaining_update_after_bind_descriptors() / per_set;
         }
         if fitting == 0 {
@@ -362,8 +406,9 @@ fn create_descriptor_pool(
     device: &ash::Device,
     key: &BucketKey,
     capacity_hint: u32,
+    min_capacity: u32,
     max_capacity: u32,
-) -> Result<Pool, crate::DeviceError> {
+) -> Result<Pool, vk::Result> {
     let counts = &key.counts;
 
     const NR_OF_DESCRIPTOR_TYPES: usize = 8;
@@ -385,7 +430,7 @@ fn create_descriptor_pool(
 
     // bounded doubling growth strategy
     let mut capacity = capacity_hint
-        .clamp(POOL_MIN_SETS, POOL_MAX_SETS)
+        .clamp(min_capacity, POOL_MAX_SETS)
         .next_power_of_two()
         .min(max_capacity);
 
@@ -425,8 +470,7 @@ fn create_descriptor_pool(
         .max_sets(capacity)
         .pool_sizes(&pool_sizes);
 
-    let raw = unsafe { device.create_descriptor_pool(&vk_info, None) }
-        .map_err(super::map_host_device_oom_and_fragmentation_err)?;
+    let raw = unsafe { device.create_descriptor_pool(&vk_info, None) }?;
 
     Ok(Pool {
         raw,
