@@ -189,11 +189,14 @@ impl<'a> DeviceAllocationContext<'a> {
             self.create_committed_buffer(raw_desc, location)?
         };
 
-        if let Some(label) = desc.label {
-            resource.set_name(label)?;
-        }
-
         self.counters.buffer_memory.add(allocation.size() as isize);
+
+        if let Some(label) = desc.label {
+            if let Err(err) = resource.set_name(label) {
+                self.free_resource(resource, allocation);
+                return Err(err);
+            }
+        }
 
         Ok((resource, allocation))
     }
@@ -213,11 +216,14 @@ impl<'a> DeviceAllocationContext<'a> {
             self.create_committed_texture(desc, raw_desc)?
         };
 
-        if let Some(label) = desc.label {
-            resource.set_name(label)?;
-        }
-
         self.counters.texture_memory.add(allocation.size() as isize);
+
+        if let Some(label) = desc.label {
+            if let Err(err) = resource.set_name(label) {
+                self.free_resource(resource, allocation);
+                return Err(err);
+            }
+        }
 
         Ok((resource, allocation))
     }
@@ -237,13 +243,16 @@ impl<'a> DeviceAllocationContext<'a> {
             self.create_committed_acceleration_structure(desc, raw_desc)?
         };
 
-        if let Some(label) = desc.label {
-            resource.set_name(label)?;
-        }
-
         self.counters
             .acceleration_structure_memory
             .add(allocation.size() as isize);
+
+        if let Some(label) = desc.label {
+            if let Err(err) = resource.set_name(label) {
+                self.free_resource(resource, allocation);
+                return Err(err);
+            }
+        }
 
         Ok((resource, allocation))
     }
@@ -301,7 +310,7 @@ impl<'a> DeviceAllocationContext<'a> {
 
         let allocation = allocator.allocate(&allocation_desc)?;
         let mut resource = None;
-        unsafe {
+        let created = unsafe {
             self.raw.CreatePlacedResource(
                 allocation.heap(),
                 allocation.offset(),
@@ -311,9 +320,15 @@ impl<'a> DeviceAllocationContext<'a> {
                 &mut resource,
             )
         }
-        .into_device_result("Placed buffer creation")?;
-
-        let resource = resource.ok_or(crate::DeviceError::Unexpected)?;
+        .into_device_result("Placed buffer creation")
+        .and_then(|()| resource.ok_or(crate::DeviceError::Unexpected));
+        let resource = match created {
+            Ok(resource) => resource,
+            Err(err) => {
+                free_failed_placement(&mut allocator, allocation);
+                return Err(err);
+            }
+        };
         let wrapped_allocation = Allocation::placed(allocation, AllocationType::Buffer);
 
         Ok((resource, wrapped_allocation))
@@ -340,7 +355,7 @@ impl<'a> DeviceAllocationContext<'a> {
 
         let allocation = allocator.allocate(&allocation_desc)?;
         let mut resource = None;
-        unsafe {
+        let created = unsafe {
             self.raw.CreatePlacedResource(
                 allocation.heap(),
                 allocation.offset(),
@@ -350,9 +365,15 @@ impl<'a> DeviceAllocationContext<'a> {
                 &mut resource,
             )
         }
-        .into_device_result("Placed texture creation")?;
-
-        let resource = resource.ok_or(crate::DeviceError::Unexpected)?;
+        .into_device_result("Placed texture creation")
+        .and_then(|()| resource.ok_or(crate::DeviceError::Unexpected));
+        let resource = match created {
+            Ok(resource) => resource,
+            Err(err) => {
+                free_failed_placement(&mut allocator, allocation);
+                return Err(err);
+            }
+        };
         let wrapped_allocation = Allocation::placed(allocation, AllocationType::Texture);
 
         Ok((resource, wrapped_allocation))
@@ -379,7 +400,7 @@ impl<'a> DeviceAllocationContext<'a> {
 
         let allocation = allocator.allocate(&allocation_desc)?;
         let mut resource = None;
-        unsafe {
+        let created = unsafe {
             self.raw.CreatePlacedResource(
                 allocation.heap(),
                 allocation.offset(),
@@ -389,9 +410,15 @@ impl<'a> DeviceAllocationContext<'a> {
                 &mut resource,
             )
         }
-        .into_device_result("Placed acceleration structure creation")?;
-
-        let resource = resource.ok_or(crate::DeviceError::Unexpected)?;
+        .into_device_result("Placed acceleration structure creation")
+        .and_then(|()| resource.ok_or(crate::DeviceError::Unexpected));
+        let resource = match created {
+            Ok(resource) => resource,
+            Err(err) => {
+                free_failed_placement(&mut allocator, allocation);
+                return Err(err);
+            }
+        };
         let wrapped_allocation =
             Allocation::placed(allocation, AllocationType::AccelerationStructure);
 
@@ -599,5 +626,15 @@ impl<'a> DeviceAllocationContext<'a> {
         }
 
         Ok(allocation_info)
+    }
+}
+
+/// Returns a heap range reserved for a placed resource that could not be created.
+fn free_failed_placement(
+    allocator: &mut gpu_allocator::d3d12::Allocator,
+    allocation: gpu_allocator::d3d12::Allocation,
+) {
+    if let Err(err) = allocator.free(allocation) {
+        log::error!("Failed to free the allocation of a failed placed resource: {err}");
     }
 }

@@ -373,6 +373,9 @@ pub(crate) struct NativeSwapchain {
 
 impl Drop for NativeSwapchain {
     fn drop(&mut self) {
+        // Like the fence and semaphores, the kept views are destroyed only after the wait in
+        // `release_resources`; the device keeps them until its next one.
+        self.device.retire_swapchain_views(&self.images);
         unsafe {
             self.functor.destroy_swapchain(self.raw, None);
         }
@@ -382,21 +385,40 @@ impl Drop for NativeSwapchain {
 impl Swapchain for NativeSwapchain {
     unsafe fn release_resources(&mut self, device: &crate::vulkan::Device) {
         profiling::scope!("Swapchain::release_resources");
-        {
+        // Only a wait on the device that owns this swapchain completes the work using its kept
+        // views. Views retired after this point wait for the owner's next release.
+        let owner = Arc::ptr_eq(&self.device, &device.shared);
+        let retired = owner.then(|| self.device.take_retired_swapchain_views());
+        let wait = {
             profiling::scope!("vkDeviceWaitIdle");
             // We need to also wait until all presentation work is done. Because there is no way to portably wait until
             // the presentation work is done, we are forced to wait until the device is idle.
-            let _ = unsafe {
+            unsafe {
                 device
                     .shared
                     .raw
                     .device_wait_idle()
                     .map_err(map_host_device_oom_and_lost_err)
-            };
+            }
         };
 
         if let Some(fence) = self.fence {
             unsafe { device.shared.raw.destroy_fence(fence, None) }
+        }
+
+        // The kept views and their framebuffers go with the fence and semaphores when the same
+        // wait completed the work on their device: it succeeded, or the device was lost, which
+        // completes all of its work. Otherwise they stay retired on their device.
+        let completed = matches!(wait, Ok(()) | Err(crate::DeviceError::Lost));
+        match retired {
+            Some(retired) if completed => unsafe {
+                self.device.release_swapchain_views(&self.images, retired)
+            },
+            Some(retired) => {
+                self.device.restore_retired_swapchain_views(retired);
+                self.device.retire_swapchain_views(&self.images);
+            }
+            None => self.device.retire_swapchain_views(&self.images),
         }
 
         // We cannot take this by value, as the function returns `self`.
@@ -544,6 +566,7 @@ impl Swapchain for NativeSwapchain {
                     depth: 1,
                 },
                 identity,
+                swapchain_image: true,
             },
             metadata: Box::new(NativeSurfaceTextureMetadata {
                 acquire_semaphores: acquire_semaphore_arc,
@@ -939,3 +962,11 @@ impl<'a> SwapchainSubmissionSemaphoreGuard for NativeSwapchainSubmissionSemaphor
             .map(SemaphoreType::Binary)
     }
 }
+
+#[cfg(test)]
+#[path = "native_owner_tests.rs"]
+mod owner_tests;
+
+#[cfg(test)]
+#[path = "native_wait_tests.rs"]
+mod wait_tests;
