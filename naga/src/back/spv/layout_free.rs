@@ -126,7 +126,15 @@ fn main() {
             shader_stage: crate::ShaderStage::Compute,
             entry_point: "main".into(),
         };
-        for version in [(1, 3), (1, 6)] {
+        // SPIR-V 1.3 and 1.4 on Vulkan 1.3 are what a device gets when its driver must not
+        // be given `OpCopyLogical`.
+        for (version, environment) in [
+            ((1, 3), "vulkan1.1"),
+            ((1, 3), "vulkan1.3"),
+            ((1, 4), "vulkan1.3"),
+            ((1, 5), "vulkan1.2"),
+            ((1, 6), "vulkan1.3"),
+        ] {
             let options = Options {
                 lang_version: version,
                 ..Default::default()
@@ -137,7 +145,15 @@ fn main() {
                 .write(&module, &info, Some(&pipeline), &None, &mut words)
                 .unwrap();
             assert_eq!(words.remove(0), 0x12345678);
-            rspirv::dr::load_words(&words).unwrap();
+            let copies_logically = rspirv::dr::load_words(&words)
+                .unwrap()
+                .all_inst_iter()
+                .any(|instruction| instruction.class.opcode as Word == Op::CopyLogical as Word);
+            assert_eq!(
+                copies_logically,
+                version >= crate::back::spv::COPY_LOGICAL_MIN_LANG_VERSION,
+                "SPIR-V {version:?}"
+            );
             let validator = std::env::var_os("SPIRV_VAL").unwrap_or_else(|| "spirv-val".into());
             if std::process::Command::new(&validator)
                 .arg("--version")
@@ -148,14 +164,7 @@ fn main() {
                 continue;
             }
             let mut child = std::process::Command::new(&validator)
-                .args([
-                    "--target-env",
-                    if version == (1, 3) {
-                        "vulkan1.1"
-                    } else {
-                        "vulkan1.3"
-                    },
-                ])
+                .args(["--target-env", environment])
                 .stdin(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
                 .spawn()
@@ -175,7 +184,7 @@ fn main() {
             let result = child.wait_with_output().unwrap();
             assert!(
                 result.status.success(),
-                "{}",
+                "SPIR-V {version:?} for {environment}: {}",
                 String::from_utf8_lossy(&result.stderr)
             );
         }
@@ -184,8 +193,12 @@ fn main() {
 
 /// SPIR-V 1.5+ forbids explicit memory layouts on Function and Private variables.
 /// Keep interface types intact and convert whole values at allocation boundaries.
+///
+/// Modules below [`COPY_LOGICAL_MIN_LANG_VERSION`](super::COPY_LOGICAL_MIN_LANG_VERSION)
+/// are left as written.
 pub(super) fn legalize(words: &mut Vec<Word>) -> Result<(), Error> {
-    if words[1] < 0x0001_0500 {
+    let lang_version = ((words[1] >> 16) as u8, (words[1] >> 8) as u8);
+    if lang_version < super::COPY_LOGICAL_MIN_LANG_VERSION {
         return Ok(());
     }
     let mut instructions = Vec::new();

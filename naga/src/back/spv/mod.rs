@@ -1052,6 +1052,15 @@ pub enum ZeroInitializeWorkgroupMemoryMode {
     None,
 }
 
+/// The lowest [`Options::lang_version`] whose output can contain `OpCopyLogical`.
+///
+/// From this version on, Vulkan forbids explicit memory layouts on `Function` and `Private`
+/// variables, so the writer gives them layout-free types and converts whole values to and
+/// from the laid-out interface types with `OpCopyLogical`. Lower versions keep the laid-out
+/// types, which they allow, and never contain the instruction. Callers that must avoid it,
+/// for example on drivers that mishandle it, can target a lower version.
+pub const COPY_LOGICAL_MIN_LANG_VERSION: (u8, u8) = (1, 5);
+
 #[derive(Debug, Clone)]
 pub struct Options<'a> {
     /// (Major, Minor) target version of the SPIR-V.
